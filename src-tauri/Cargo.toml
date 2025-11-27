@@ -22,6 +22,8 @@ rand = "0.8"
 zeroize = "1.7"
 base64 = "0.22"
 serde_with = "3.11.0"
+ndarray = "0.15"
+ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
 
 [build-dependencies]
 tauri-build = { version = "2.5.2", features = [] }

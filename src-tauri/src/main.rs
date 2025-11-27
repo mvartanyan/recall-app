@@ -15,11 +15,11 @@ use cpal::{
     SampleFormat, StreamConfig,
 };
 mod db;
+mod embedding;
 mod config;
 mod state;
-use config::AppConfig;
 use state::AppState;
-use db::{Crypto, Db};
+use db::Crypto;
 use reqwest::blocking::{multipart, Client};
 use reqwest::Url;
 use tauri::{
@@ -233,8 +233,19 @@ fn transcribe_file(
     app_state: State<AppState>,
 ) -> Result<String, String> {
     let api_base = api_base
-        .or_else(|| std::env::var("RECALL_API_BASE").ok())
+        .or_else(|| {
+            let cfg = app_state.config.lock().ok()?.clone();
+            cfg.api_base
+        })
         .unwrap_or_else(|| "http://localhost:8000".to_string());
+
+    // ensure embedder is loaded if encryption disabled or already unlocked
+    {
+        let embedder_loaded = app_state.embedder.lock().map_err(|_| "embedder lock")?.is_some();
+        if !embedder_loaded {
+            let _ = app_state.load_embedder();
+        }
+    }
 
     let url = Url::parse(&api_base)
         .map_err(|e| format!("Invalid API base: {e}"))?

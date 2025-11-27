@@ -9,6 +9,7 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub config: Arc<Mutex<AppConfig>>,
+    pub embedder: Arc<Mutex<Option<crate::embedding::Embedder>>>,
 }
 
 impl AppState {
@@ -20,6 +21,7 @@ impl AppState {
             data_dir,
             config_path,
             config: Arc::new(Mutex::new(config)),
+            embedder: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -34,6 +36,17 @@ impl AppState {
         let db = Db::open(db_path, crypto)?;
         let mut guard = self.db.lock().map_err(|_| "db lock".to_string())?;
         *guard = Some(db);
+        Ok(())
+    }
+
+    pub fn load_embedder(&self) -> Result<(), String> {
+        let model_path = self.data_dir.join("models").join("spkrec-ecapa-voxceleb.onnx");
+        if !model_path.exists() {
+            return Err("ONNX model missing".into());
+        }
+        let embedder = crate::embedding::Embedder::new(model_path.to_string_lossy().as_ref())?;
+        let mut guard = self.embedder.lock().map_err(|_| "embedder lock".to_string())?;
+        *guard = Some(embedder);
         Ok(())
     }
 }
