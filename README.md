@@ -45,6 +45,8 @@ Model export (one-time):
 - ONNX model vendored; Azure STT not yet integrated.
 - Transcription command `transcribe_file` posts last recording to API base (default `http://localhost:8000/v1/transcribe-local`); returns transcript string.
 - SQLite-based storage added (encrypted columns if password supplied later; currently opens without password). Stores sessions/transcripts; API call results persisted and audio file deleted afterward.
+- Embedding/voice matching scaffold present (ONNX via `ort`), but diarization → embeddings → matching not wired yet.
+- API call currently uses dev stub; switch to `/v1/transcribe` once Azure flow is connected.
 
 ## API usage from app
 - Default API base: `http://localhost:8000`. The UI has an input to override, or set `RECALL_API_BASE`.
