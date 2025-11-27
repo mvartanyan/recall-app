@@ -44,6 +44,7 @@ Model export (one-time):
 - Tray wired via Tauri 2 tray API (open/start/stop/quit).
 - ONNX model vendored; Azure STT not yet integrated.
 - Transcription command `transcribe_file` posts last recording to API base (default `http://localhost:8000/v1/transcribe-local`); returns transcript string.
+- SQLite-based storage added (encrypted columns if password supplied later; currently opens without password). Stores sessions/transcripts; API call results persisted and audio file deleted afterward.
 
 ## API usage from app
 - Default API base: `http://localhost:8000`. The UI has an input to override, or set `RECALL_API_BASE`.

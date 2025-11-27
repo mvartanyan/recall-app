@@ -14,6 +14,8 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     SampleFormat, StreamConfig,
 };
+mod db;
+use db::{Crypto, Db};
 use reqwest::blocking::{multipart, Client};
 use reqwest::Url;
 use tauri::{
@@ -38,6 +40,10 @@ struct Recorder {
 #[derive(Default)]
 struct RecordingManager {
     current: Mutex<Option<Recorder>>,
+}
+
+struct AppState {
+    db: std::sync::Arc<Mutex<Db>>,
 }
 
 impl RecordingManager {
@@ -221,7 +227,11 @@ fn stop_recording(state: State<RecordingManager>) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn transcribe_file(path: String, api_base: Option<String>) -> Result<String, String> {
+fn transcribe_file(
+    path: String,
+    api_base: Option<String>,
+    app_state: State<AppState>,
+) -> Result<String, String> {
     let api_base = api_base
         .or_else(|| std::env::var("RECALL_API_BASE").ok())
         .unwrap_or_else(|| "http://localhost:8000".to_string());
@@ -251,11 +261,20 @@ fn transcribe_file(path: String, api_base: Option<String>) -> Result<String, Str
     }
 
     let json: serde_json::Value = res.json().map_err(|e| format!("Decode error: {e}"))?;
-    Ok(json
+    let transcript = json
         .get("transcript")
         .and_then(|v| v.as_str())
         .unwrap_or("(no transcript)")
-        .to_string())
+        .to_string();
+
+    // Persist session with transcript and delete audio file.
+    let db = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let _session_id = db
+        .insert_session(&transcript)
+        .map_err(|e| format!("DB error: {e}"))?;
+    let _ = std::fs::remove_file(&path);
+
+    Ok(transcript)
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -321,6 +340,18 @@ fn main() {
         ])
         .manage(RecordingManager::default())
         .setup(|app| {
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("recall"));
+            std::fs::create_dir_all(&data_dir).ok();
+            let db_path = data_dir.join("recall.db");
+            let crypto = Crypto::new(None, None);
+            let db = Db::open(db_path, crypto).map_err(|e| e.to_string())?;
+            app.manage(AppState {
+                db: std::sync::Arc::new(std::sync::Mutex::new(db)),
+            });
+
             build_tray(app)?;
             Ok(())
         })

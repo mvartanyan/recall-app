@@ -13,6 +13,14 @@ cpal = { version = "0.15", features = ["jack"] }
 hound = "3.5"
 tempfile = "3.10"
 reqwest = { version = "0.11", features = ["json", "multipart", "blocking"] }
+rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+zeroize = "1.7"
+base64 = "0.22"
 
 [build-dependencies]
 tauri-build = { version = "2.5.2", features = [] }
