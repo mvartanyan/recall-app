@@ -15,6 +15,10 @@ use cpal::{
     SampleFormat, StreamConfig,
 };
 mod db;
+mod config;
+mod state;
+use config::AppConfig;
+use state::AppState;
 use db::{Crypto, Db};
 use reqwest::blocking::{multipart, Client};
 use reqwest::Url;
@@ -40,10 +44,6 @@ struct Recorder {
 #[derive(Default)]
 struct RecordingManager {
     current: Mutex<Option<Recorder>>,
-}
-
-struct AppState {
-    db: std::sync::Arc<Mutex<Db>>,
 }
 
 impl RecordingManager {
@@ -268,13 +268,39 @@ fn transcribe_file(
         .to_string();
 
     // Persist session with transcript and delete audio file.
-    let db = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
     let _session_id = db
         .insert_session(&transcript)
         .map_err(|e| format!("DB error: {e}"))?;
     let _ = std::fs::remove_file(&path);
 
     Ok(transcript)
+}
+
+#[tauri::command]
+fn unlock_db(password: String, app_state: State<AppState>) -> Result<(), String> {
+    let cfg = app_state.config.lock().map_err(|_| "config lock")?.clone();
+    if !cfg.encryption_enabled {
+        return Err("Encryption is not enabled".into());
+    }
+    let salt = None; // salt handled internally
+    let crypto = Crypto::new(Some(&password), salt);
+    app_state.open_db(crypto)
+}
+
+#[tauri::command]
+fn enable_encryption(password: String, app_state: State<AppState>) -> Result<(), String> {
+    {
+        let mut cfg = app_state.config.lock().map_err(|_| "config lock")?;
+        cfg.encryption_enabled = true;
+        cfg.save(&app_state.config_path)?;
+    }
+    // Recreate DB encrypted (note: existing plaintext data not migrated).
+    let db_path = app_state.data_dir.join("recall.db");
+    let _ = std::fs::remove_file(&db_path);
+    let crypto = Crypto::new(Some(&password), None);
+    app_state.open_db(crypto)
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
@@ -336,7 +362,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             start_recording,
             stop_recording,
-            transcribe_file
+            transcribe_file,
+            unlock_db,
+            enable_encryption
         ])
         .manage(RecordingManager::default())
         .setup(|app| {
@@ -345,12 +373,14 @@ fn main() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir().join("recall"));
             std::fs::create_dir_all(&data_dir).ok();
-            let db_path = data_dir.join("recall.db");
-            let crypto = Crypto::new(None, None);
-            let db = Db::open(db_path, crypto).map_err(|e| e.to_string())?;
-            app.manage(AppState {
-                db: std::sync::Arc::new(std::sync::Mutex::new(db)),
-            });
+            let app_state = AppState::new(data_dir);
+            {
+                let cfg = app_state.config.lock().unwrap().clone();
+                if !cfg.encryption_enabled {
+                    let _ = app_state.open_db(Crypto::new(None, None));
+                }
+            }
+            app.manage(app_state);
 
             build_tray(app)?;
             Ok(())

@@ -83,6 +83,7 @@ impl Crypto {
 pub struct Db {
     conn: std::sync::Mutex<Connection>,
     crypto: Crypto,
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -95,9 +96,11 @@ pub struct Session {
 impl Db {
     pub fn open(path: impl AsRef<Path>, crypto: Crypto) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        let encrypted = crypto.key.is_some();
         let db = Db {
             conn: std::sync::Mutex::new(conn),
             crypto,
+            encrypted,
         };
         db.init_schema()?;
         if let Some(salt) = db.crypto.salt() {
