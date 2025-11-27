@@ -1,0 +1,102 @@
+:root {
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  background: #0c1626;
+  color: #e9edf5;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  gap: 16px;
+  background: radial-gradient(circle at 20% 20%, rgba(68, 124, 235, 0.2), transparent 35%),
+    radial-gradient(circle at 80% 10%, rgba(144, 94, 255, 0.2), transparent 30%),
+    #0c1626;
+}
+
+header h1 {
+  margin: 0 0 4px;
+  letter-spacing: 0.02em;
+}
+
+.tagline {
+  margin: 0;
+  opacity: 0.8;
+}
+
+main {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.panel {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(6px);
+}
+
+.controls {
+  display: flex;
+  gap: 12px;
+}
+
+.config {
+  margin-top: 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.config input {
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #e9edf5;
+}
+
+button {
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: linear-gradient(135deg, #1f8efa, #7c5af5);
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+  transition: transform 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+
+.status {
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+textarea {
+  width: 100%;
+  min-height: 200px;
+  border-radius: 8px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.35);
+  color: #e9edf5;
+  resize: vertical;
+  font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+}

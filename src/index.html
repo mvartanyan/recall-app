@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Recall</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Recall</h1>
+      <p class="tagline">Desktop-first meeting recorder with Azure STT and local speaker profiles.</p>
+    </header>
+
+    <main>
+      <section class="panel">
+        <div class="controls">
+          <button id="start">Start recording</button>
+          <button id="stop" disabled>Stop recording</button>
+        </div>
+        <div class="config">
+          <label for="apiBase">API base URL</label>
+          <input id="apiBase" type="text" placeholder="http://localhost:8000" />
+        </div>
+        <div class="status" id="status">Idle</div>
+      </section>
+
+      <section class="panel">
+        <h2>Notes</h2>
+    <textarea id="notes" placeholder="Transcripts and summaries will appear here." readonly></textarea>
+  </section>
+    </main>
+
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

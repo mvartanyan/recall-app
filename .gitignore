@@ -1,0 +1,10 @@
+node_modules/
+target/
+.DS_Store
+.vscode/
+dist/
+src-tauri/target/
+src-tauri/.fingerprint/
+src-tauri/.cargo/
+.venv*
+models/cache/

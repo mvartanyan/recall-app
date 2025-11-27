@@ -1,0 +1,18 @@
+[package]
+name = "recall"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tauri = { version = "2.5.2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+cpal = { version = "0.15", features = ["jack"] }
+hound = "3.5"
+tempfile = "3.10"
+reqwest = { version = "0.11", features = ["json", "multipart", "blocking"] }
+
+[build-dependencies]
+tauri-build = { version = "2.5.2", features = [] }

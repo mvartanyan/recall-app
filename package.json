@@ -1,0 +1,17 @@
+{
+  "name": "recall",
+  "version": "0.1.0",
+  "description": "Recall desktop app (Tauri + Rust).",
+  "main": "src/main.js",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "lint": "echo 'No lint configured yet'"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^1.6.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.6.0"
+  }
+}
