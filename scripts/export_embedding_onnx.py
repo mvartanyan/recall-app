@@ -2,10 +2,14 @@
 Export SpeechBrain ECAPA (spkrec-ecapa-voxceleb) to ONNX for embedding inference.
 Outputs models/spkrec-ecapa-voxceleb.onnx and stores downloaded weights under models/cache.
 """
+import sys
 import os
 import pathlib
 import torch
 from speechbrain.pretrained import EncoderClassifier
+
+if sys.version_info[:2] != (3, 11):
+    raise SystemExit("Use Python 3.11 for export; torch/onnx export path is unstable on 3.12/3.13")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MODEL_DIR = ROOT / "models"

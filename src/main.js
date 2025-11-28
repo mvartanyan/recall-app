@@ -40,7 +40,7 @@ async function stopRecording() {
 }
 
 async function sendToApi(path) {
-  const apiBase = apiInput.value || "http://localhost:8000";
+  const apiBase = apiInput.value || "http://localhost:8787";
   try {
     const result = await invoke("transcribe_file", { path, apiBase });
     appendNote(result);

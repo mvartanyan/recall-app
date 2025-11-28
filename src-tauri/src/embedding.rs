@@ -1,4 +1,3 @@
-use ndarray::ArrayD;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::Tensor;

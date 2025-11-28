@@ -1,0 +1,4 @@
+torch==2.1.2
+torchaudio==2.1.2
+speechbrain==0.5.16
+onnx==1.15.0
