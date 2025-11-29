@@ -72,6 +72,12 @@ struct AudioClip {
     sample_rate: u32,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct ProgressEvent {
+    stage: String,
+    detail: Option<String>,
+}
+
 impl AudioClip {
     fn duration_ms(&self) -> u64 {
         if self.sample_rate == 0 {
@@ -279,6 +285,7 @@ fn transcribe_file(
     api_base: Option<String>,
     app_state: State<AppState>,
 ) -> Result<String, String> {
+    eprintln!("[transcribe] start path={}", path);
     let api_base = api_base
         .or_else(|| {
             let cfg = app_state.config.lock().ok()?.clone();
@@ -309,6 +316,7 @@ fn transcribe_file(
     let part = multipart::Part::bytes(file_bytes).file_name("audio.wav");
     let form = multipart::Form::new().part("file", part);
 
+    eprintln!("[transcribe] posting to Azure STT at {}", api_base);
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(240))
         .build()
@@ -328,6 +336,11 @@ fn transcribe_file(
         .json()
         .map_err(|e| format!("Decode error: {e}"))?;
     let _ = (&api_resp.summary, &api_resp.speakers, &api_resp.audio_url);
+    eprintln!(
+        "[transcribe] STT done, transcript len={}, segments={}",
+        api_resp.transcript.len(),
+        api_resp.segments.as_ref().map(|s| s.len()).unwrap_or(0)
+    );
 
     let audio_clip = read_audio_clip(&path)?;
     let segments = normalize_segments(api_resp.segments.clone(), &api_resp.transcript, &audio_clip);
@@ -336,6 +349,7 @@ fn transcribe_file(
         .insert_session(&api_resp.transcript)
         .map_err(|e| format!("DB error: {e}"))?;
 
+    eprintln!("[transcribe] embedding/matching start");
     {
         let mut embedder_guard = app_state.embedder.lock().map_err(|_| "embedder lock")?;
         let embedder = embedder_guard
@@ -343,6 +357,7 @@ fn transcribe_file(
             .ok_or("Embedder not initialized")?;
         process_segments(&audio_clip, &segments, &session_id, db, embedder)?;
     }
+    eprintln!("[transcribe] embedding/matching done");
 
     let _ = std::fs::remove_file(&path);
 
