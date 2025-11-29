@@ -33,6 +33,26 @@ Rust: `cd src-tauri && cargo check`
 
 Tests: `cd src-tauri && cargo test` (unit-less, but ensures build).
 
+## Local dev notes (macOS)
+- First-run reset: `rm -rf "$HOME/Library/Application Support/com.example.recall"` to wipe config/DB and trigger first-run flow again.
+- API dev (default port 8787):
+  ```
+  cd ../api
+  . .venv/bin/activate
+  export AZURE_SPEECH_REGION=germanywestcentral
+  export AZURE_SPEECH_KEY=...
+  export AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=recall1;AccountKey=...;EndpointSuffix=core.windows.net"
+  export RECALL_STORAGE_CONTAINER=recall1
+  uvicorn app.main:app --port 8787
+  ```
+- App dev:
+  ```
+  cd app
+  npm install   # safe: node_modules is gitignored
+  npm run dev   # or cd src-tauri && cargo run
+  ```
+- Default API base: `http://localhost:8787` (override via UI input if needed).
+
 Model export (one-time):
 ```
 # already vendored ONNX in models/, no action required
