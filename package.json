@@ -4,7 +4,9 @@
   "description": "Recall desktop app (Tauri + Rust).",
   "main": "src/main.js",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "npm-run-all -p serve tauri:dev",
+    "serve": "http-server ./src -p 1420 -c-1",
+    "tauri:dev": "tauri dev",
     "build": "tauri build",
     "lint": "echo 'No lint configured yet'"
   },
@@ -12,6 +14,8 @@
     "@tauri-apps/api": "^2.0.0"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.0.0"
+    "@tauri-apps/cli": "^2.0.0",
+    "http-server": "^14.1.1",
+    "npm-run-all": "^4.1.5"
   }
 }
