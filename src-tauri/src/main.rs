@@ -491,37 +491,48 @@ fn process_segments(
         if pcm.is_empty() {
             continue;
         }
-        let embedding_vec = embedder.embed(&pcm)?;
-        let (speaker_id, speaker_label) = if let Some((matched, _score)) = best_match(&embedding_vec, &known_embeddings) {
-            let label = matched
-                .speaker_label
-                .clone()
-                .unwrap_or_else(|| {
-                    let generated = format!("Speaker {}", next_label_index);
-                    next_label_index += 1;
-                    generated
-                });
-            if matched.speaker_label.is_none() {
-                db.rename_speaker(&matched.speaker_id, &label)?;
+        let embedding_vec = match embedder.embed(&pcm) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("embedding error for {speaker_key}: {e}");
+                None
             }
-            (matched.speaker_id.clone(), label)
-        } else {
-            let label = format!("Speaker {}", next_label_index);
-            next_label_index += 1;
-            let id = db.insert_speaker(Some(&label))?;
-            (id, label)
         };
+        if let Some(embedding_vec) = embedding_vec {
+            let (speaker_id, speaker_label) = if let Some((matched, _score)) = best_match(&embedding_vec, &known_embeddings) {
+                let label = matched
+                    .speaker_label
+                    .clone()
+                    .unwrap_or_else(|| {
+                        let generated = format!("Speaker {}", next_label_index);
+                        next_label_index += 1;
+                        generated
+                    });
+                if matched.speaker_label.is_none() {
+                    db.rename_speaker(&matched.speaker_id, &label)?;
+                }
+                (matched.speaker_id.clone(), label)
+            } else {
+                let label = format!("Speaker {}", next_label_index);
+                next_label_index += 1;
+                let id = db.insert_speaker(Some(&label))?;
+                (id, label)
+            };
 
-        let embedding_id = db.insert_embedding(&speaker_id, session_id, &embedding_vec)?;
-        known_embeddings.push(StoredEmbedding {
-            id: embedding_id,
-            speaker_id: speaker_id.clone(),
-            speaker_label: Some(speaker_label.clone()),
-            vector: embedding_vec,
-            source_session_id: session_id.to_string(),
-            created_at: Utc::now(),
-        });
-        diarization_to_profile.insert(speaker_key, (speaker_id, speaker_label));
+            let embedding_id = db.insert_embedding(&speaker_id, session_id, &embedding_vec)?;
+            known_embeddings.push(StoredEmbedding {
+                id: embedding_id,
+                speaker_id: speaker_id.clone(),
+                speaker_label: Some(speaker_label.clone()),
+                vector: embedding_vec,
+                source_session_id: session_id.to_string(),
+                created_at: Utc::now(),
+            });
+            diarization_to_profile.insert(speaker_key, (speaker_id, speaker_label));
+        } else {
+            // No embedding; keep diarization speaker label.
+            diarization_to_profile.insert(speaker_key.clone(), (String::new(), speaker_key.clone()));
+        }
     }
 
     for seg in segments {
