@@ -1,11 +1,11 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-
 const startBtn = document.getElementById("start");
 const stopBtn = document.getElementById("stop");
 const statusEl = document.getElementById("status");
 const notesEl = document.getElementById("notes");
 const apiInput = document.getElementById("apiBase");
+
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
 
 // Default API base to local dev port.
 if (!apiInput.value) {
