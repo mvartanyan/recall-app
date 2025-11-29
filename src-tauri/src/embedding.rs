@@ -18,7 +18,8 @@ impl Embedder {
     }
 
     pub fn embed(&mut self, pcm: &[f32]) -> Result<Vec<f32>, String> {
-        let input = Tensor::from_array(([1, pcm.len() as i64], pcm.to_vec()))
+        // Some models expect [batch, frames, feat]; use a singleton feature dim.
+        let input = Tensor::from_array(([1, pcm.len() as i64, 1], pcm.to_vec()))
             .map_err(|e| format!("tensor error: {e}"))?;
         let outputs = self
             .session
