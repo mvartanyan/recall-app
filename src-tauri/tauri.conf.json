@@ -27,7 +27,10 @@
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.13",
-      "exceptionDomain": "localhost"
+      "exceptionDomain": "localhost",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Recall needs microphone access to record audio."
+      }
     }
   }
 }
