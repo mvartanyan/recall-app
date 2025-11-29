@@ -285,6 +285,25 @@ fn transcribe_file(
     api_base: Option<String>,
     app_state: State<AppState>,
 ) -> Result<String, String> {
+    transcribe_file_inner(path, api_base, &app_state, None)
+}
+
+fn emit_progress(handle: &tauri::AppHandle, stage: &str, detail: Option<String>) {
+    let _ = handle.emit(
+        "transcription:progress",
+        ProgressEvent {
+            stage: stage.to_string(),
+            detail,
+        },
+    );
+}
+
+fn transcribe_file_inner(
+    path: String,
+    api_base: Option<String>,
+    app_state: &AppState,
+    app_handle: Option<&tauri::AppHandle>,
+) -> Result<String, String> {
     eprintln!("[transcribe] start path={}", path);
     let api_base = api_base
         .or_else(|| {
@@ -316,6 +335,9 @@ fn transcribe_file(
     let part = multipart::Part::bytes(file_bytes).file_name("audio.wav");
     let form = multipart::Form::new().part("file", part);
 
+    if let Some(handle) = app_handle {
+        emit_progress(handle, "azure:start", Some("uploading and starting STT".into()));
+    }
     eprintln!("[transcribe] posting to Azure STT at {}", api_base);
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(240))
@@ -341,6 +363,9 @@ fn transcribe_file(
         api_resp.transcript.len(),
         api_resp.segments.as_ref().map(|s| s.len()).unwrap_or(0)
     );
+    if let Some(handle) = app_handle {
+        emit_progress(handle, "azure:done", Some("STT finished".into()));
+    }
 
     let audio_clip = read_audio_clip(&path)?;
     let segments = normalize_segments(api_resp.segments.clone(), &api_resp.transcript, &audio_clip);
@@ -350,6 +375,9 @@ fn transcribe_file(
         .map_err(|e| format!("DB error: {e}"))?;
 
     eprintln!("[transcribe] embedding/matching start");
+    if let Some(handle) = app_handle {
+        emit_progress(handle, "onnx:start", Some("embedding and matching".into()));
+    }
     {
         let mut embedder_guard = app_state.embedder.lock().map_err(|_| "embedder lock")?;
         let embedder = embedder_guard
@@ -358,10 +386,29 @@ fn transcribe_file(
         process_segments(&audio_clip, &segments, &session_id, db, embedder)?;
     }
     eprintln!("[transcribe] embedding/matching done");
+    if let Some(handle) = app_handle {
+        emit_progress(handle, "onnx:done", Some("embedding/matching done".into()));
+        emit_progress(handle, "complete", Some(api_resp.transcript.clone()));
+    }
 
     let _ = std::fs::remove_file(&path);
 
     Ok(api_resp.transcript)
+}
+
+#[tauri::command]
+fn transcribe_file_async(
+    path: String,
+    api_base: Option<String>,
+    app_state: State<AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let state = app_state.inner().clone();
+    let handle = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = transcribe_file_inner(path, api_base, &state, Some(&handle));
+    });
+    Ok(())
 }
 
 fn read_audio_clip(path: &str) -> Result<AudioClip, String> {
@@ -733,14 +780,15 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            start_recording,
-            stop_recording,
-            transcribe_file,
-            unlock_db,
-            enable_encryption,
-            app_status,
-            list_sessions,
-            list_segments,
+        start_recording,
+        stop_recording,
+        transcribe_file,
+        transcribe_file_async,
+        unlock_db,
+        enable_encryption,
+        app_status,
+        list_sessions,
+        list_segments,
             update_transcript,
             delete_session,
             list_speakers,
