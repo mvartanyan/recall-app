@@ -111,12 +111,14 @@ listen("recording:stop", () => {
         startBtn.disabled = false;
         stopBtn.disabled = true;
         if (run_id) activeRuns.delete(run_id);
+        loadSpeakers();
         break;
       case "error":
         setStatus(`Error: ${detail || "unknown"}`);
         startBtn.disabled = false;
         stopBtn.disabled = true;
         if (run_id) activeRuns.delete(run_id);
+        loadSpeakers();
         break;
       case "queued":
         setStatus(prefix + message);
