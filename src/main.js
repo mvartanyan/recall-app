@@ -46,6 +46,8 @@ async function stopRecording() {
     // Kick off async transcription (non-blocking) and get run id.
     const runId = await invoke("transcribe_file_async", { path, apiBase: apiInput.value });
     appendNote(`[${runId.slice(0, 8)}] queued`);
+    // Poll for progress in case live events drop.
+    pollProgress(runId);
   } catch (err) {
     console.error("stop_recording error", err);
     appendNote(`Stop error: ${err}`);
@@ -115,5 +117,20 @@ listen("recording:stop", () => {
   });
   // Optional: window.addEventListener("beforeunload", unlisten);
 })();
+
+async function pollProgress(runId) {
+  try {
+    const events = await invoke("get_progress", { runId });
+    if (events && events.length) {
+      for (const ev of events) {
+        const prefix = ev.run_id ? `[${ev.run_id.slice(0, 8)}] ` : "";
+        const message = ev.detail ? `${ev.stage}: ${ev.detail}` : ev.stage;
+        appendNote(prefix + message);
+      }
+    }
+  } catch (e) {
+    console.error("pollProgress error", e);
+  }
+}
 
 appendNote("Ready.");

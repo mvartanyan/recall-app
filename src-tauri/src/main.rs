@@ -480,6 +480,15 @@ fn transcribe_file_async(
     Ok(run_id_clone)
 }
 
+#[tauri::command]
+fn get_progress(run_id: String, app_state: State<AppState>) -> Result<Vec<ProgressEvent>, String> {
+    let guard = app_state
+        .progress
+        .lock()
+        .map_err(|_| "progress lock")?;
+    Ok(guard.get(&run_id).cloned().unwrap_or_default())
+}
+
 fn read_audio_clip(path: &str) -> Result<AudioClip, String> {
     let mut reader = hound::WavReader::open(path)
         .map_err(|e| format!("Failed to open audio for embeddings: {e}"))?;
@@ -879,6 +888,7 @@ fn main() {
         stop_recording,
         transcribe_file,
         transcribe_file_async,
+        get_progress,
         unlock_db,
         enable_encryption,
         app_status,
