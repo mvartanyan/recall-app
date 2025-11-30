@@ -440,6 +440,12 @@ fn transcribe_file_async(
     let state = app_state.inner().clone();
     let handle = app_handle.clone();
     let run_id = uuid::Uuid::new_v4().to_string();
+    emit_progress(
+        &handle,
+        "queued",
+        Some("queued transcription".to_string()),
+        Some(&run_id),
+    );
     tauri::async_runtime::spawn_blocking(move || {
         match transcribe_file_inner(path, api_base, &state, Some(&handle), Some(&run_id)) {
             Ok(_) => {}

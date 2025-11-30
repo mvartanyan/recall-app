@@ -43,7 +43,6 @@ async function stopRecording() {
   try {
     const path = await invoke("stop_recording");
     setStatus(`Stopped. Saved at ${path}. Processing…`);
-    startBtn.disabled = true;
     // Kick off async transcription (non-blocking).
     await invoke("transcribe_file_async", { path, apiBase: apiInput.value });
   } catch (err) {
@@ -52,6 +51,8 @@ async function stopRecording() {
     setStatus("Failed to stop: " + err);
   }
   stopBtn.disabled = true;
+  // Keep start enabled for another recording while processing happens.
+  startBtn.disabled = false;
 }
 
 async function sendToApi(path) {
@@ -95,9 +96,9 @@ listen("recording:stop", () => {
         // Show transcript if available in detail.
         if (detail && detail !== "failed") {
           appendNote(prefix + `Transcript: ${detail}`);
-          setStatus("Done");
+          setStatus(prefix + "Done");
         } else {
-          setStatus("Failed");
+          setStatus(prefix + "Failed");
         }
         startBtn.disabled = false;
         stopBtn.disabled = true;
@@ -106,6 +107,9 @@ listen("recording:stop", () => {
         setStatus(`Error: ${detail || "unknown"}`);
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        break;
+      case "queued":
+        setStatus(prefix + message);
         break;
       default:
         setStatus(message);
