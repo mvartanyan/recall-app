@@ -89,7 +89,7 @@ listen("recording:stop", () => {
     const { stage, detail, run_id } = event.payload;
     const prefix = run_id ? `[${run_id.slice(0, 8)}] ` : "";
     const message = detail ? `${stage}: ${detail}` : stage;
-    console.log("progress", message);
+    console.log("progress", prefix + message);
     appendNote(prefix + message);
 
     switch (stage) {

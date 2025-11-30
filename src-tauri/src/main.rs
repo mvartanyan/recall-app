@@ -85,14 +85,21 @@ fn emit_progress(
     detail: Option<String>,
     run_id: Option<&String>,
 ) {
-    let _ = handle.emit(
-        "transcription:progress",
-        ProgressEvent {
-            stage: stage.to_string(),
-            detail,
-            run_id: run_id.cloned(),
-        },
-    );
+    if let Some(id) = run_id {
+        eprintln!("[progress {id}] {stage} {:?}", detail);
+    } else {
+        eprintln!("[progress] {stage} {:?}", detail);
+    }
+
+    let payload = ProgressEvent {
+        stage: stage.to_string(),
+        detail,
+        run_id: run_id.cloned(),
+    };
+    let _ = handle.emit("transcription:progress", payload.clone());
+    if let Some(win) = handle.get_webview_window("main") {
+        let _ = win.emit("transcription:progress", payload);
+    }
 }
 
 impl AudioClip {
