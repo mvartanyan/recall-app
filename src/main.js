@@ -43,8 +43,9 @@ async function stopRecording() {
   try {
     const path = await invoke("stop_recording");
     setStatus(`Stopped. Saved at ${path}. Processing…`);
-    // Kick off async transcription (non-blocking).
-    await invoke("transcribe_file_async", { path, apiBase: apiInput.value });
+    // Kick off async transcription (non-blocking) and get run id.
+    const runId = await invoke("transcribe_file_async", { path, apiBase: apiInput.value });
+    appendNote(`[${runId.slice(0, 8)}] queued`);
   } catch (err) {
     console.error("stop_recording error", err);
     appendNote(`Stop error: ${err}`);

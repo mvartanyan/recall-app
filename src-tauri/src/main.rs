@@ -96,6 +96,17 @@ fn emit_progress(
         detail,
         run_id: run_id.cloned(),
     };
+    if let Some(id) = run_id {
+        if let Ok(mut guard) = handle
+            .state::<AppState>()
+            .inner()
+            .progress
+            .lock()
+        {
+            let entry = guard.entry(id.clone()).or_insert_with(Vec::new);
+            entry.push(payload.clone());
+        }
+    }
     let _ = handle.emit("transcription:progress", payload.clone());
     if let Some(win) = handle.get_webview_window("main") {
         let _ = win.emit("transcription:progress", payload);
@@ -437,16 +448,23 @@ fn transcribe_file_async(
     api_base: Option<String>,
     app_state: State<AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let state = app_state.inner().clone();
     let handle = app_handle.clone();
     let run_id = uuid::Uuid::new_v4().to_string();
+    // Initialize log.
+    {
+        if let Ok(mut guard) = handle.state::<AppState>().inner().progress.lock() {
+            guard.entry(run_id.clone()).or_insert_with(Vec::new);
+        }
+    }
     emit_progress(
         &handle,
         "queued",
         Some("queued transcription".to_string()),
         Some(&run_id),
     );
+    let run_id_clone = run_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
         match transcribe_file_inner(path, api_base, &state, Some(&handle), Some(&run_id)) {
             Ok(transcript) => {
@@ -459,7 +477,7 @@ fn transcribe_file_async(
             }
         }
     });
-    Ok(())
+    Ok(run_id_clone)
 }
 
 fn read_audio_clip(path: &str) -> Result<AudioClip, String> {
