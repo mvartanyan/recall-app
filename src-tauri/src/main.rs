@@ -40,7 +40,7 @@ enum SampleChunk {
 }
 
 const TARGET_SPEAKER_MS: u64 = 10_000;
-const MATCH_THRESHOLD: f32 = 0.78;
+const MATCH_THRESHOLD: f32 = 0.90;
 
 #[derive(Debug, Deserialize, Clone)]
 struct ApiSegment {
@@ -681,7 +681,7 @@ fn process_segments(
             }
         };
         if let Some(embedding_vec) = embedding_vec {
-            let (speaker_id, speaker_label) = if let Some((matched, _score)) = best_match(&embedding_vec, &known_embeddings) {
+            let (speaker_id, speaker_label) = if let Some((matched, score)) = best_match(&embedding_vec, &known_embeddings) {
                 let label = matched
                     .speaker_label
                     .clone()
@@ -697,7 +697,7 @@ fn process_segments(
                     emit_progress(
                         handle,
                         "embedding:matched",
-                        Some(format!("{} -> {}", speaker_key, label)),
+                        Some(format!("{} -> {} (score {:.2})", speaker_key, label, score)),
                         run_id,
                     );
                 }
