@@ -82,18 +82,25 @@ listen("recording:stop", () => {
 });
 
 // Listen for backend progress events from async transcription.
-listen("transcription:progress", (event) => {
-  const { stage, detail } = event.payload;
-  const message = detail ? `${stage}: ${detail}` : stage;
-  console.log("progress", message);
-  appendNote(message);
-  if (stage === "complete") {
-    setStatus("Done");
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-  } else {
-    setStatus(message);
-  }
-});
+(async () => {
+  const unlisten = await listen("transcription:progress", (event) => {
+    const { stage, detail } = event.payload;
+    const message = detail ? `${stage}: ${detail}` : stage;
+    console.log("progress", message);
+    appendNote(message);
+    if (stage === "complete") {
+      setStatus(detail && detail !== "failed" ? "Done" : "Failed");
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    } else if (stage === "error") {
+      setStatus(`Error: ${detail || "unknown"}`);
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+    } else {
+      setStatus(message);
+    }
+  });
+  // Optional: window.addEventListener("beforeunload", unlisten);
+})();
 
 appendNote("Ready.");
