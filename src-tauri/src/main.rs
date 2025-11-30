@@ -714,15 +714,24 @@ fn process_segments(
                         run_id,
                     );
                     // Store a small sample for review.
-                    match encode_wav_base64(&pcm, audio.sample_rate)
-                        .and_then(|b64| db.insert_sample(&id, &b64, audio.sample_rate))
-                    {
-                        Ok(_) => emit_progress(
-                            handle,
-                            "sample:stored",
-                            Some(format!("{} sample stored", label)),
-                            run_id,
-                        ),
+                    match encode_wav_base64(&pcm, audio.sample_rate) {
+                        Ok(b64) => {
+                            if let Err(err) = db.insert_sample(&id, &b64, audio.sample_rate) {
+                                emit_progress(
+                                    handle,
+                                    "sample:error",
+                                    Some(format!("{} sample store failed: {}", label, err)),
+                                    run_id,
+                                );
+                            } else {
+                                emit_progress(
+                                    handle,
+                                    "sample:stored",
+                                    Some(format!("{} sample stored", label)),
+                                    run_id,
+                                );
+                            }
+                        }
                         Err(err) => emit_progress(
                             handle,
                             "sample:error",
