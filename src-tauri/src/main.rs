@@ -31,6 +31,7 @@ use tauri::{
     tray::TrayIconBuilder,
     Emitter, Manager, State,
 };
+use base64::Engine;
 
 #[derive(Debug)]
 enum SampleChunk {
@@ -541,6 +542,26 @@ fn read_audio_clip(path: &str) -> Result<AudioClip, String> {
     })
 }
 
+fn encode_wav_base64(pcm: &[f32], sample_rate: u32) -> Result<String, String> {
+    use std::io::Cursor;
+    let mut buf: Vec<u8> = Vec::new();
+    let cursor = Cursor::new(&mut buf);
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::new(cursor, spec).map_err(|e| e.to_string())?;
+    for sample in pcm {
+        let s = (sample * i16::MAX as f32)
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        writer.write_sample(s).map_err(|e| e.to_string())?;
+    }
+    writer.finalize().map_err(|e| e.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+}
+
 fn normalize_segments(
     segments: Option<Vec<ApiSegment>>,
     transcript: &str,
@@ -665,7 +686,7 @@ fn process_segments(
                     .speaker_label
                     .clone()
                     .unwrap_or_else(|| {
-                        let generated = format!("Speaker {}", next_label_index);
+                        let generated = format!("VOICE{}", next_label_index);
                         next_label_index += 1;
                         generated
                     });
@@ -682,7 +703,7 @@ fn process_segments(
                 }
                 (matched.speaker_id.clone(), label)
             } else {
-                let label = format!("Speaker {}", next_label_index);
+                let label = format!("VOICE{}", next_label_index);
                 next_label_index += 1;
                 let id = db.insert_speaker(Some(&label))?;
                 if let Some(handle) = app_handle {
@@ -690,6 +711,17 @@ fn process_segments(
                         handle,
                         "embedding:new",
                         Some(format!("{} -> {}", speaker_key, label)),
+                        run_id,
+                    );
+                }
+                // Store a small sample for review.
+                if let Some(handle) = app_handle {
+                    let sample_b64 = encode_wav_base64(&pcm, audio.sample_rate)?;
+                    let _ = db.insert_sample(&id, &sample_b64, audio.sample_rate);
+                    emit_progress(
+                        handle,
+                        "sample:stored",
+                        Some(format!("{} sample stored", label)),
                         run_id,
                     );
                 }
@@ -838,6 +870,49 @@ fn delete_speaker(speaker_id: String, app_state: State<AppState>) -> Result<(), 
     db.delete_speaker(&speaker_id)
 }
 
+#[tauri::command]
+fn list_speakers_with_stats(app_state: State<AppState>) -> Result<Vec<db::SpeakerStats>, String> {
+    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    db.list_speakers_with_stats()
+}
+
+#[tauri::command]
+fn get_speaker_samples(
+    speaker_id: String,
+    app_state: State<AppState>,
+) -> Result<Vec<db::SpeakerSample>, String> {
+    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    db.list_samples(&speaker_id)
+}
+
+#[tauri::command]
+fn merge_speakers(
+    target_id: String,
+    source_id: String,
+    replace_embeddings: bool,
+    app_state: State<AppState>,
+) -> Result<(), String> {
+    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
+    let db = db_guard.as_ref().ok_or("Database not initialized")?;
+    if replace_embeddings {
+        db.delete_embeddings_for(&target_id)?;
+    }
+    // Move embeddings
+    db.reassign_embeddings(&source_id, &target_id)?;
+    // Move samples
+    if replace_embeddings {
+        db.delete_samples(&target_id)?;
+    }
+    db.reassign_samples(&source_id, &target_id)?;
+    // Update segments
+    db.reassign_segments(&source_id, &target_id)?;
+    // Delete source speaker
+    db.delete_speaker(&source_id)?;
+    Ok(())
+}
+
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, MenuId::new("open"), "Open", true, None::<&str>)?;
     let start = MenuItem::with_id(
@@ -908,8 +983,11 @@ fn main() {
             update_transcript,
             delete_session,
             list_speakers,
+            list_speakers_with_stats,
             rename_speaker,
-            delete_speaker
+            delete_speaker,
+            get_speaker_samples,
+            merge_speakers
         ])
         .manage(RecordingManager::default())
         .setup(|app| {

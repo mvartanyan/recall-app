@@ -41,6 +41,17 @@ main {
   backdrop-filter: blur(6px);
 }
 
+.panel h2 {
+  margin: 0 0 8px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
 .controls {
   display: flex;
   gap: 12px;
@@ -99,4 +110,36 @@ textarea {
   color: #e9edf5;
   resize: vertical;
   font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.speakers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.speaker-card {
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.speaker-card .title {
+  font-weight: 700;
+  color: #fff;
+}
+
+.speaker-card .meta {
+  color: #9fb4d4;
+  font-size: 0.85rem;
+}
+
+.speaker-card .actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
 }

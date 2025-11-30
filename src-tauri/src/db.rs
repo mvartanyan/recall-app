@@ -95,13 +95,6 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Speaker {
-    pub id: String,
-    pub label: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct SegmentRecord {
     pub id: String,
     pub session_id: String,
@@ -120,6 +113,31 @@ pub struct StoredEmbedding {
     pub vector: Vec<f32>,
     pub source_session_id: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeakerSample {
+    pub id: String,
+    pub speaker_id: String,
+    pub sample_b64: String,
+    pub sample_rate: u32,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Speaker {
+    pub id: String,
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeakerStats {
+    pub id: String,
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub sample_count: usize,
+    pub embedding_count: usize,
 }
 
 impl Db {
@@ -176,6 +194,13 @@ impl Db {
                     vector_nonce TEXT,
                     vector_ct TEXT NOT NULL,
                     source_session_id TEXT,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS speaker_samples (
+                    id TEXT PRIMARY KEY,
+                    speaker_id TEXT NOT NULL,
+                    sample_b64 TEXT NOT NULL,
+                    sample_rate INTEGER NOT NULL,
                     created_at TEXT NOT NULL
                  );
                  CREATE TABLE IF NOT EXISTS segments (
@@ -440,6 +465,45 @@ impl Db {
         Ok(speakers)
     }
 
+    pub fn list_speakers_with_stats(&self) -> Result<Vec<SpeakerStats>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.label, s.created_at,
+                        (SELECT COUNT(1) FROM speaker_samples sm WHERE sm.speaker_id = s.id) as sample_count,
+                        (SELECT COUNT(1) FROM embeddings e WHERE e.speaker_id = s.id) as embedding_count
+                 FROM speakers s
+                 ORDER BY s.created_at ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let label: Option<String> = row.get(1)?;
+                let created_at: String = row.get(2)?;
+                let sample_count: i64 = row.get(3)?;
+                let embedding_count: i64 = row.get(4)?;
+                Ok((id, label, created_at, sample_count, embedding_count))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut speakers = Vec::new();
+        for row in rows {
+            let (id, label, created_at, sample_count, embedding_count) = row.map_err(|e| e.to_string())?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| e.to_string())?
+                .with_timezone(&Utc);
+            speakers.push(SpeakerStats {
+                id,
+                label,
+                created_at,
+                sample_count: sample_count as usize,
+                embedding_count: embedding_count as usize,
+            });
+        }
+        Ok(speakers)
+    }
+
     pub fn rename_speaker(&self, speaker_id: &str, new_label: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         conn.execute(
@@ -452,6 +516,12 @@ impl Db {
             params![new_label, speaker_id],
         )
         .map_err(|e| e.to_string())?;
+        // Discard samples after naming/renaming for privacy.
+        conn.execute(
+            "DELETE FROM speaker_samples WHERE speaker_id=?1",
+            params![speaker_id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -461,7 +531,7 @@ impl Db {
             "DELETE FROM embeddings WHERE speaker_id=?1",
             params![speaker_id],
         )
-        .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
         conn.execute("DELETE FROM speakers WHERE id=?1", params![speaker_id])
             .map_err(|e| e.to_string())?;
         conn.execute(
@@ -469,6 +539,56 @@ impl Db {
             params![speaker_id],
         )
         .map_err(|e| e.to_string())?;
+        conn.execute(
+            "DELETE FROM speaker_samples WHERE speaker_id=?1",
+            params![speaker_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn delete_embeddings_for(&self, speaker_id: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute("DELETE FROM embeddings WHERE speaker_id=?1", params![speaker_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn reassign_embeddings(&self, from: &str, to: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE embeddings SET speaker_id=?1 WHERE speaker_id=?2",
+                params![to, from],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn reassign_segments(&self, from: &str, to: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE segments SET speaker_id=?1 WHERE speaker_id=?2",
+                params![to, from],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub fn reassign_samples(&self, from: &str, to: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE speaker_samples SET speaker_id=?1 WHERE speaker_id=?2",
+                params![to, from],
+            )
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -491,6 +611,66 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    pub fn insert_sample(
+        &self,
+        speaker_id: &str,
+        sample_b64: &str,
+        sample_rate: u32,
+    ) -> Result<String, String> {
+        let id = Uuid::new_v4().to_string();
+        let now: DateTime<Utc> = SystemTime::now().into();
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "INSERT INTO speaker_samples(id, speaker_id, sample_b64, sample_rate, created_at) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![id, speaker_id, sample_b64, sample_rate as i64, now.to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    pub fn list_samples(&self, speaker_id: &str) -> Result<Vec<SpeakerSample>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id, sample_b64, sample_rate, created_at FROM speaker_samples WHERE speaker_id=?1 ORDER BY created_at DESC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![speaker_id], |row| {
+                let id: String = row.get(0)?;
+                let sample_b64: String = row.get(1)?;
+                let sample_rate: i64 = row.get(2)?;
+                let created_at: String = row.get(3)?;
+                Ok((id, sample_b64, sample_rate, created_at))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut samples = Vec::new();
+        for row in rows {
+            let (id, sample_b64, sample_rate, created_at) = row.map_err(|e| e.to_string())?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| e.to_string())?
+                .with_timezone(&Utc);
+            samples.push(SpeakerSample {
+                id,
+                speaker_id: speaker_id.to_string(),
+                sample_b64,
+                sample_rate: sample_rate as u32,
+                created_at,
+            });
+        }
+        Ok(samples)
+    }
+
+    pub fn delete_samples(&self, speaker_id: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute("DELETE FROM speaker_samples WHERE speaker_id=?1", params![speaker_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn list_embeddings(&self) -> Result<Vec<StoredEmbedding>, String> {

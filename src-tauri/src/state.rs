@@ -1,15 +1,19 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crate::config::AppConfig;
 use crate::db::{Crypto, Db};
+use crate::ProgressEvent;
 
+#[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Mutex<Option<Db>>>,
     pub data_dir: PathBuf,
     pub config_path: PathBuf,
     pub config: Arc<Mutex<AppConfig>>,
     pub embedder: Arc<Mutex<Option<crate::embedding::Embedder>>>,
+    pub progress: Arc<Mutex<HashMap<String, Vec<ProgressEvent>>>>,
 }
 
 impl AppState {
@@ -22,6 +26,7 @@ impl AppState {
             config_path,
             config: Arc::new(Mutex::new(config)),
             embedder: Arc::new(Mutex::new(None)),
+            progress: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

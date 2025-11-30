@@ -3,6 +3,8 @@ const stopBtn = document.getElementById("stop");
 const statusEl = document.getElementById("status");
 const notesEl = document.getElementById("notes");
 const apiInput = document.getElementById("apiBase");
+const speakersListEl = document.getElementById("speakersList");
+const refreshSpeakersBtn = document.getElementById("refreshSpeakers");
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -77,6 +79,7 @@ async function sendToApi(path) {
 
 startBtn.addEventListener("click", startRecording);
 stopBtn.addEventListener("click", stopRecording);
+refreshSpeakersBtn.addEventListener("click", loadSpeakers);
 
 listen("recording:start", () => {
   setStatus("Recording (tray)");
@@ -158,4 +161,112 @@ function ensurePolling() {
   pollTimer = setInterval(pollProgressAll, 2000);
 }
 
+async function loadSpeakers() {
+  try {
+    const speakers = await invoke("list_speakers_with_stats");
+    renderSpeakers(speakers);
+  } catch (e) {
+    console.error("loadSpeakers error", e);
+    appendNote(`Speakers load error: ${e}`);
+  }
+}
+
+function renderSpeakers(speakers) {
+  speakersListEl.innerHTML = "";
+  speakers.forEach((sp) => {
+    const card = document.createElement("div");
+    card.className = "speaker-card";
+    const title = document.createElement("div");
+    title.className = "title";
+    title.textContent = sp.label || sp.id || "Unnamed";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `Samples: ${sp.sample_count} • Embeddings: ${sp.embedding_count}`;
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    const previewBtn = document.createElement("button");
+    previewBtn.textContent = "Preview";
+    previewBtn.onclick = () => previewSample(sp.id);
+
+    const renameBtn = document.createElement("button");
+    renameBtn.textContent = "Rename";
+    renameBtn.onclick = () => renameSpeakerPrompt(sp.id, sp.label);
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.textContent = "Delete";
+    deleteBtn.onclick = () => deleteSpeaker(sp.id);
+
+    const mergeBtn = document.createElement("button");
+    mergeBtn.textContent = "Merge…";
+    mergeBtn.onclick = () => mergeSpeakerPrompt(sp.id);
+
+    actions.append(previewBtn, renameBtn, mergeBtn, deleteBtn);
+    card.append(title, meta, actions);
+    speakersListEl.append(card);
+  });
+}
+
+async function previewSample(speakerId) {
+  try {
+    const samples = await invoke("get_speaker_samples", { speakerId });
+    if (!samples.length) {
+      appendNote(`[${speakerId.slice(0, 8)}] No samples`);
+      return;
+    }
+    const sample = samples[0];
+    const audio = new Audio(`data:audio/wav;base64,${sample.sample_b64}`);
+    audio.play();
+    appendNote(`[${speakerId.slice(0, 8)}] Playing sample`);
+  } catch (e) {
+    console.error("previewSample error", e);
+    appendNote(`Preview error: ${e}`);
+  }
+}
+
+async function renameSpeakerPrompt(speakerId, currentLabel) {
+  const name = prompt("New name for speaker", currentLabel || "");
+  if (!name) return;
+  try {
+    await invoke("rename_speaker", { speakerId, newLabel: name });
+    appendNote(`[${speakerId.slice(0, 8)}] Renamed to ${name}`);
+    await loadSpeakers();
+  } catch (e) {
+    console.error("rename error", e);
+    appendNote(`Rename error: ${e}`);
+  }
+}
+
+async function deleteSpeaker(speakerId) {
+  if (!confirm("Delete this speaker and its data?")) return;
+  try {
+    await invoke("delete_speaker", { speakerId });
+    appendNote(`[${speakerId.slice(0, 8)}] Deleted`);
+    await loadSpeakers();
+  } catch (e) {
+    console.error("delete error", e);
+    appendNote(`Delete error: ${e}`);
+  }
+}
+
+async function mergeSpeakerPrompt(sourceId) {
+  const targetId = prompt("Merge into speaker ID:");
+  if (!targetId || targetId === sourceId) return;
+  const replace = confirm("Replace target embeddings with source?");
+  try {
+    await invoke("merge_speakers", {
+      targetId,
+      sourceId,
+      replaceEmbeddings: replace,
+    });
+    appendNote(`[${sourceId.slice(0, 8)}] merged into ${targetId.slice(0, 8)}`);
+    await loadSpeakers();
+  } catch (e) {
+    console.error("merge error", e);
+    appendNote(`Merge error: ${e}`);
+  }
+}
+
+loadSpeakers();
 appendNote("Ready.");
