@@ -84,10 +84,11 @@ listen("recording:stop", () => {
 (async () => {
   appendNote("Progress listener ready.");
   const unlisten = await listen("transcription:progress", (event) => {
-    const { stage, detail } = event.payload;
+    const { stage, detail, run_id } = event.payload;
+    const prefix = run_id ? `[${run_id.slice(0, 8)}] ` : "";
     const message = detail ? `${stage}: ${detail}` : stage;
     console.log("progress", message);
-    appendNote(message);
+    appendNote(prefix + message);
     if (stage === "complete") {
       setStatus(detail && detail !== "failed" ? "Done" : "Failed");
       startBtn.disabled = false;

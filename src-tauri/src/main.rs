@@ -76,14 +76,21 @@ struct AudioClip {
 struct ProgressEvent {
     stage: String,
     detail: Option<String>,
+    run_id: Option<String>,
 }
 
-fn emit_progress(handle: &tauri::AppHandle, stage: &str, detail: Option<String>) {
+fn emit_progress(
+    handle: &tauri::AppHandle,
+    stage: &str,
+    detail: Option<String>,
+    run_id: Option<&String>,
+) {
     let _ = handle.emit(
         "transcription:progress",
         ProgressEvent {
             stage: stage.to_string(),
             detail,
+            run_id: run_id.cloned(),
         },
     );
 }
@@ -295,7 +302,7 @@ fn transcribe_file(
     api_base: Option<String>,
     app_state: State<AppState>,
 ) -> Result<String, String> {
-    transcribe_file_inner(path, api_base, &app_state, None)
+    transcribe_file_inner(path, api_base, &app_state, None, None)
 }
 
 fn transcribe_file_inner(
@@ -303,6 +310,7 @@ fn transcribe_file_inner(
     api_base: Option<String>,
     app_state: &AppState,
     app_handle: Option<&tauri::AppHandle>,
+    run_id: Option<&String>,
 ) -> Result<String, String> {
     eprintln!("[transcribe] start path={}", path);
     let api_base = api_base
@@ -336,7 +344,7 @@ fn transcribe_file_inner(
     let form = multipart::Form::new().part("file", part);
 
     if let Some(handle) = app_handle {
-        emit_progress(handle, "azure:start", Some("uploading and starting STT".into()));
+        emit_progress(handle, "azure:start", Some("uploading and starting STT".into()), run_id);
     }
     eprintln!("[transcribe] posting to Azure STT at {}", api_base);
     let client = Client::builder()
@@ -364,11 +372,19 @@ fn transcribe_file_inner(
         api_resp.segments.as_ref().map(|s| s.len()).unwrap_or(0)
     );
     if let Some(handle) = app_handle {
-        emit_progress(handle, "azure:done", Some("STT finished".into()));
+        emit_progress(handle, "azure:done", Some("STT finished".into()), run_id);
     }
 
     let audio_clip = read_audio_clip(&path)?;
     let segments = normalize_segments(api_resp.segments.clone(), &api_resp.transcript, &audio_clip);
+    if let Some(handle) = app_handle {
+        emit_progress(
+            handle,
+            "segments:normalized",
+            Some(format!("{} segments", segments.len())),
+            run_id,
+        );
+    }
 
     let session_id = db
         .insert_session(&api_resp.transcript)
@@ -376,19 +392,37 @@ fn transcribe_file_inner(
 
     eprintln!("[transcribe] embedding/matching start");
     if let Some(handle) = app_handle {
-        emit_progress(handle, "onnx:start", Some("embedding and matching".into()));
+        emit_progress(handle, "onnx:start", Some("embedding and matching".into()), run_id);
     }
     {
         let mut embedder_guard = app_state.embedder.lock().map_err(|_| "embedder lock")?;
         let embedder = embedder_guard
             .as_mut()
             .ok_or("Embedder not initialized")?;
-        process_segments(&audio_clip, &segments, &session_id, db, embedder, app_handle)?;
+        process_segments(
+            &audio_clip,
+            &segments,
+            &session_id,
+            db,
+            embedder,
+            app_handle,
+            run_id,
+        )?;
     }
     eprintln!("[transcribe] embedding/matching done");
     if let Some(handle) = app_handle {
-        emit_progress(handle, "onnx:done", Some("embedding/matching done".into()));
-        emit_progress(handle, "complete", Some(api_resp.transcript.clone()));
+        emit_progress(
+            handle,
+            "onnx:done",
+            Some("embedding/matching done".into()),
+            run_id,
+        );
+        emit_progress(
+            handle,
+            "complete",
+            Some(api_resp.transcript.clone()),
+            run_id,
+        );
     }
 
     let _ = std::fs::remove_file(&path);
@@ -405,13 +439,14 @@ fn transcribe_file_async(
 ) -> Result<(), String> {
     let state = app_state.inner().clone();
     let handle = app_handle.clone();
+    let run_id = uuid::Uuid::new_v4().to_string();
     tauri::async_runtime::spawn_blocking(move || {
-        match transcribe_file_inner(path, api_base, &state, Some(&handle)) {
+        match transcribe_file_inner(path, api_base, &state, Some(&handle), Some(&run_id)) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[transcribe] error: {e}");
-                emit_progress(&handle, "error", Some(e));
-                emit_progress(&handle, "complete", Some("failed".into()));
+                emit_progress(&handle, "error", Some(e), Some(&run_id));
+                emit_progress(&handle, "complete", Some("failed".into()), Some(&run_id));
             }
         }
     });
@@ -551,6 +586,7 @@ fn process_segments(
     db: &Db,
     embedder: &mut crate::embedding::Embedder,
     app_handle: Option<&tauri::AppHandle>,
+    run_id: Option<&String>,
 ) -> Result<(), String> {
     let mut diarization_to_profile: HashMap<String, (String, String)> = HashMap::new();
     let mut known_embeddings = db.list_embeddings()?;
@@ -570,6 +606,7 @@ fn process_segments(
                         handle,
                         "error",
                         Some(format!("embedding error for {speaker_key}: {e}")),
+                        run_id,
                     );
                 }
                 None
@@ -588,11 +625,27 @@ fn process_segments(
                 if matched.speaker_label.is_none() {
                     db.rename_speaker(&matched.speaker_id, &label)?;
                 }
+                if let Some(handle) = app_handle {
+                    emit_progress(
+                        handle,
+                        "embedding:matched",
+                        Some(format!("{} -> {}", speaker_key, label)),
+                        run_id,
+                    );
+                }
                 (matched.speaker_id.clone(), label)
             } else {
                 let label = format!("Speaker {}", next_label_index);
                 next_label_index += 1;
                 let id = db.insert_speaker(Some(&label))?;
+                if let Some(handle) = app_handle {
+                    emit_progress(
+                        handle,
+                        "embedding:new",
+                        Some(format!("{} -> {}", speaker_key, label)),
+                        run_id,
+                    );
+                }
                 (id, label)
             };
 
