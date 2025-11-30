@@ -78,6 +78,16 @@ struct ProgressEvent {
     detail: Option<String>,
 }
 
+fn emit_progress(handle: &tauri::AppHandle, stage: &str, detail: Option<String>) {
+    let _ = handle.emit(
+        "transcription:progress",
+        ProgressEvent {
+            stage: stage.to_string(),
+            detail,
+        },
+    );
+}
+
 impl AudioClip {
     fn duration_ms(&self) -> u64 {
         if self.sample_rate == 0 {
@@ -288,16 +298,6 @@ fn transcribe_file(
     transcribe_file_inner(path, api_base, &app_state, None)
 }
 
-fn emit_progress(handle: &tauri::AppHandle, stage: &str, detail: Option<String>) {
-    let _ = handle.emit(
-        "transcription:progress",
-        ProgressEvent {
-            stage: stage.to_string(),
-            detail,
-        },
-    );
-}
-
 fn transcribe_file_inner(
     path: String,
     api_base: Option<String>,
@@ -383,7 +383,7 @@ fn transcribe_file_inner(
         let embedder = embedder_guard
             .as_mut()
             .ok_or("Embedder not initialized")?;
-        process_segments(&audio_clip, &segments, &session_id, db, embedder)?;
+        process_segments(&audio_clip, &segments, &session_id, db, embedder, app_handle)?;
     }
     eprintln!("[transcribe] embedding/matching done");
     if let Some(handle) = app_handle {
@@ -543,6 +543,7 @@ fn process_segments(
     session_id: &str,
     db: &Db,
     embedder: &mut crate::embedding::Embedder,
+    app_handle: Option<&tauri::AppHandle>,
 ) -> Result<(), String> {
     let mut diarization_to_profile: HashMap<String, (String, String)> = HashMap::new();
     let mut known_embeddings = db.list_embeddings()?;
@@ -557,6 +558,13 @@ fn process_segments(
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("embedding error for {speaker_key}: {e}");
+                if let Some(handle) = app_handle {
+                    emit_progress(
+                        handle,
+                        "error",
+                        Some(format!("embedding error for {speaker_key}: {e}")),
+                    );
+                }
                 None
             }
         };
