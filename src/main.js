@@ -84,6 +84,7 @@ listen("recording:stop", () => {
 // Listen for backend progress events from async transcription.
 (async () => {
   appendNote("Progress listener ready.");
+  console.log("Progress listener ready.");
   const unlisten = await listen("transcription:progress", (event) => {
     const { stage, detail, run_id } = event.payload;
     const prefix = run_id ? `[${run_id.slice(0, 8)}] ` : "";
