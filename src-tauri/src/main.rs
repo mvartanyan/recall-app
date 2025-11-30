@@ -406,7 +406,14 @@ fn transcribe_file_async(
     let state = app_state.inner().clone();
     let handle = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _ = transcribe_file_inner(path, api_base, &state, Some(&handle));
+        match transcribe_file_inner(path, api_base, &state, Some(&handle)) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[transcribe] error: {e}");
+                emit_progress(&handle, "error", Some(e));
+                emit_progress(&handle, "complete", Some("failed".into()));
+            }
+        }
     });
     Ok(())
 }

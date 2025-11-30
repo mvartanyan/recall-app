@@ -85,6 +85,7 @@ listen("recording:stop", () => {
 listen("transcription:progress", (event) => {
   const { stage, detail } = event.payload;
   const message = detail ? `${stage}: ${detail}` : stage;
+  console.log("progress", message);
   appendNote(message);
   if (stage === "complete") {
     setStatus("Done");
