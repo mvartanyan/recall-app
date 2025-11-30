@@ -42,8 +42,10 @@ async function stopRecording() {
   setStatus("Stopping…");
   try {
     const path = await invoke("stop_recording");
-    setStatus(`Stopped. Saved at ${path}`);
-    await sendToApi(path);
+    setStatus(`Stopped. Saved at ${path}. Processing…`);
+    startBtn.disabled = true;
+    // Kick off async transcription (non-blocking).
+    await invoke("transcribe_file_async", { path, apiBase: apiInput.value });
   } catch (err) {
     console.error("stop_recording error", err);
     appendNote(`Stop error: ${err}`);
@@ -77,6 +79,20 @@ listen("recording:stop", () => {
   setStatus("Stopped (tray)");
   stopBtn.disabled = true;
   startBtn.disabled = false;
+});
+
+// Listen for backend progress events from async transcription.
+listen("transcription:progress", (event) => {
+  const { stage, detail } = event.payload;
+  const message = detail ? `${stage}: ${detail}` : stage;
+  appendNote(message);
+  if (stage === "complete") {
+    setStatus("Done");
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+  } else {
+    setStatus(message);
+  }
 });
 
 appendNote("Ready.");
