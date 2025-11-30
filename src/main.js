@@ -7,6 +7,10 @@ const apiInput = document.getElementById("apiBase");
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+const activeRuns = new Set();
+const progressCounts = new Map();
+let pollTimer = null;
+
 // Default API base to local dev port.
 if (!apiInput.value) {
   apiInput.value = "http://localhost:8787";
@@ -46,8 +50,10 @@ async function stopRecording() {
     // Kick off async transcription (non-blocking) and get run id.
     const runId = await invoke("transcribe_file_async", { path, apiBase: apiInput.value });
     appendNote(`[${runId.slice(0, 8)}] queued`);
-    // Poll for progress in case live events drop.
-    pollProgress(runId);
+    // Track run and start polling fallback.
+    activeRuns.add(runId);
+    progressCounts.set(runId, 0);
+    ensurePolling();
   } catch (err) {
     console.error("stop_recording error", err);
     appendNote(`Stop error: ${err}`);
@@ -101,11 +107,13 @@ listen("recording:stop", () => {
         setStatus(detail && detail !== "failed" ? prefix + "Done" : prefix + "Failed");
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        if (run_id) activeRuns.delete(run_id);
         break;
       case "error":
         setStatus(`Error: ${detail || "unknown"}`);
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        if (run_id) activeRuns.delete(run_id);
         break;
       case "queued":
         setStatus(prefix + message);
@@ -118,19 +126,36 @@ listen("recording:stop", () => {
   // Optional: window.addEventListener("beforeunload", unlisten);
 })();
 
-async function pollProgress(runId) {
-  try {
-    const events = await invoke("get_progress", { runId });
-    if (events && events.length) {
-      for (const ev of events) {
-        const prefix = ev.run_id ? `[${ev.run_id.slice(0, 8)}] ` : "";
-        const message = ev.detail ? `${ev.stage}: ${ev.detail}` : ev.stage;
-        appendNote(prefix + message);
+async function pollProgressAll() {
+  for (const runId of Array.from(activeRuns)) {
+    try {
+      const events = await invoke("get_progress", { runId });
+      const lastCount = progressCounts.get(runId) || 0;
+      if (events && events.length > lastCount) {
+        for (let i = lastCount; i < events.length; i++) {
+          const ev = events[i];
+          const prefix = ev.run_id ? `[${ev.run_id.slice(0, 8)}] ` : "";
+          const message = ev.detail ? `${ev.stage}: ${ev.detail}` : ev.stage;
+          appendNote(prefix + message);
+          if (ev.stage === "complete" || ev.stage === "error") {
+            activeRuns.delete(runId);
+          }
+        }
+        progressCounts.set(runId, events.length);
       }
+    } catch (e) {
+      console.error("pollProgress error", e);
     }
-  } catch (e) {
-    console.error("pollProgress error", e);
   }
+  if (activeRuns.size === 0 && pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+function ensurePolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(pollProgressAll, 2000);
 }
 
 appendNote("Ready.");

@@ -331,6 +331,9 @@ fn transcribe_file_inner(
     run_id: Option<&String>,
 ) -> Result<String, String> {
     eprintln!("[transcribe] start path={}", path);
+    if let Some(handle) = app_handle {
+        emit_progress(handle, "transcribe:start", Some("starting transcription".into()), run_id);
+    }
     let api_base = api_base
         .or_else(|| {
             let cfg = app_state.config.lock().ok()?.clone();
@@ -438,6 +441,14 @@ fn transcribe_file_inner(
     }
 
     let _ = std::fs::remove_file(&path);
+    if let Some(handle) = app_handle {
+        emit_progress(
+            handle,
+            "transcribe:done",
+            Some("finished transcription/embedding".into()),
+            run_id,
+        );
+    }
 
     Ok(api_resp.transcript)
 }
