@@ -417,12 +417,6 @@ fn transcribe_file_inner(
             Some("embedding/matching done".into()),
             run_id,
         );
-        emit_progress(
-            handle,
-            "complete",
-            Some(api_resp.transcript.clone()),
-            run_id,
-        );
     }
 
     let _ = std::fs::remove_file(&path);
@@ -448,7 +442,9 @@ fn transcribe_file_async(
     );
     tauri::async_runtime::spawn_blocking(move || {
         match transcribe_file_inner(path, api_base, &state, Some(&handle), Some(&run_id)) {
-            Ok(_) => {}
+            Ok(transcript) => {
+                emit_progress(&handle, "complete", Some(transcript), Some(&run_id));
+            }
             Err(e) => {
                 eprintln!("[transcribe] error: {e}");
                 emit_progress(&handle, "error", Some(e), Some(&run_id));
