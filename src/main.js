@@ -89,16 +89,27 @@ listen("recording:stop", () => {
     const message = detail ? `${stage}: ${detail}` : stage;
     console.log("progress", message);
     appendNote(prefix + message);
-    if (stage === "complete") {
-      setStatus(detail && detail !== "failed" ? "Done" : "Failed");
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-    } else if (stage === "error") {
-      setStatus(`Error: ${detail || "unknown"}`);
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-    } else {
-      setStatus(message);
+
+    switch (stage) {
+      case "complete":
+        // Show transcript if available in detail.
+        if (detail && detail !== "failed") {
+          appendNote(prefix + `Transcript: ${detail}`);
+          setStatus("Done");
+        } else {
+          setStatus("Failed");
+        }
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        break;
+      case "error":
+        setStatus(`Error: ${detail || "unknown"}`);
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        break;
+      default:
+        setStatus(message);
+        break;
     }
   });
   // Optional: window.addEventListener("beforeunload", unlisten);
