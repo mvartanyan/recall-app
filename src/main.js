@@ -52,7 +52,6 @@ async function stopRecording() {
     setStatus("Failed to stop: " + err);
   }
   stopBtn.disabled = true;
-  startBtn.disabled = false;
 }
 
 async function sendToApi(path) {
@@ -83,6 +82,7 @@ listen("recording:stop", () => {
 
 // Listen for backend progress events from async transcription.
 (async () => {
+  appendNote("Progress listener ready.");
   const unlisten = await listen("transcription:progress", (event) => {
     const { stage, detail } = event.payload;
     const message = detail ? `${stage}: ${detail}` : stage;
