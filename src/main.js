@@ -94,13 +94,8 @@ listen("recording:stop", () => {
 
     switch (stage) {
       case "complete":
-        // Show transcript if available in detail.
-        if (detail && detail !== "failed") {
-          appendNote(prefix + `Transcript: ${detail}`);
-          setStatus(prefix + "Done");
-        } else {
-          setStatus(prefix + "Failed");
-        }
+        appendNote(prefix + `Transcript: ${detail ?? ""}`);
+        setStatus(detail && detail !== "failed" ? prefix + "Done" : prefix + "Failed");
         startBtn.disabled = false;
         stopBtn.disabled = true;
         break;
