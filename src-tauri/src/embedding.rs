@@ -18,8 +18,26 @@ impl Embedder {
     }
 
     pub fn embed(&mut self, pcm: &[f32]) -> Result<Vec<f32>, String> {
-        // Some models expect [batch, frames, feat]; use a singleton feature dim.
-        let input = Tensor::from_array(([1, pcm.len() as i64, 1], pcm.to_vec()))
+        // Produce simple framed features of shape [1, frames, 80] by chunking PCM into 80-sample frames.
+        let feat_dim: usize = 80;
+        let mut frames: Vec<f32> = Vec::new();
+        let mut idx = 0;
+        while idx < pcm.len() {
+            let end = std::cmp::min(idx + feat_dim, pcm.len());
+            let mut frame = Vec::with_capacity(feat_dim);
+            frame.extend_from_slice(&pcm[idx..end]);
+            if frame.len() < feat_dim {
+                frame.resize(feat_dim, 0.0);
+            }
+            frames.extend_from_slice(&frame);
+            idx += feat_dim;
+        }
+        if frames.is_empty() {
+            frames.resize(feat_dim, 0.0);
+        }
+        let num_frames = (frames.len() / feat_dim) as i64;
+
+        let input = Tensor::from_array(([1i64, num_frames, feat_dim as i64], frames))
             .map_err(|e| format!("tensor error: {e}"))?;
         let outputs = self
             .session
