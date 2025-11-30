@@ -673,6 +673,17 @@ impl Db {
         Ok(())
     }
 
+    pub fn sample_count(&self, speaker_id: &str) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT COUNT(1) FROM speaker_samples WHERE speaker_id=?1")
+            .map_err(|e| e.to_string())?;
+        let count: i64 = stmt
+            .query_row(params![speaker_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        Ok(count as usize)
+    }
+
     pub fn list_embeddings(&self) -> Result<Vec<StoredEmbedding>, String> {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let mut stmt = conn

@@ -743,6 +743,37 @@ fn process_segments(
                 (id, label)
             };
 
+            // If no sample exists yet for this speaker, store a quick sample.
+            if let Some(handle) = app_handle {
+                if db.sample_count(&speaker_id).unwrap_or(0) == 0 {
+                    match encode_wav_base64(&pcm, audio.sample_rate) {
+                        Ok(b64) => {
+                            if let Err(err) = db.insert_sample(&speaker_id, &b64, audio.sample_rate) {
+                                emit_progress(
+                                    handle,
+                                    "sample:error",
+                                    Some(format!("{} sample store failed: {}", speaker_label, err)),
+                                    run_id,
+                                );
+                            } else {
+                                emit_progress(
+                                    handle,
+                                    "sample:stored",
+                                    Some(format!("{} sample stored", speaker_label)),
+                                    run_id,
+                                );
+                            }
+                        }
+                        Err(err) => emit_progress(
+                            handle,
+                            "sample:error",
+                            Some(format!("{} sample store failed: {}", speaker_label, err)),
+                            run_id,
+                        ),
+                    }
+                }
+            }
+
             let embedding_id = db.insert_embedding(&speaker_id, session_id, &embedding_vec)?;
             known_embeddings.push(StoredEmbedding {
                 id: embedding_id,
