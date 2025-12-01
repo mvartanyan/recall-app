@@ -657,7 +657,6 @@ fn process_segments(
     run_id: Option<&String>,
 ) -> Result<(), String> {
     let mut diarization_to_profile: HashMap<String, (String, String)> = HashMap::new();
-    let mut known_embeddings = db.list_embeddings()?;
     let speakers = db.list_speakers()?;
     let mut next_label_index = speakers.len() + 1;
 
@@ -665,6 +664,67 @@ fn process_segments(
         if pcm.is_empty() {
             continue;
         }
+
+        // Reuse speaker if this diarization speaker already mapped in this run.
+        if let Some((sid, _label)) = diarization_to_profile.get(&speaker_key) {
+            let embedding_vec = match embedder.embed(&pcm) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("embedding error for {speaker_key}: {e}");
+                    if let Some(handle) = app_handle {
+                        emit_progress(
+                            handle,
+                            "error",
+                            Some(format!("embedding error for {speaker_key}: {e}")),
+                            run_id,
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(embedding_vec) = embedding_vec {
+                let _ = db.insert_embedding(sid, session_id, &embedding_vec);
+            }
+            continue;
+        }
+
+        let label = format!("VOICE{}", next_label_index);
+        next_label_index += 1;
+        let speaker_id = db.insert_speaker(Some(&label))?;
+        if let Some(handle) = app_handle {
+            emit_progress(
+                handle,
+                "embedding:new",
+                Some(format!("{} -> {}", speaker_key, label)),
+                run_id,
+            );
+            match encode_wav_base64(&pcm, audio.sample_rate) {
+                Ok(b64) => {
+                    if let Err(err) = db.insert_sample(&speaker_id, &b64, audio.sample_rate) {
+                        emit_progress(
+                            handle,
+                            "sample:error",
+                            Some(format!("{} sample store failed: {}", label, err)),
+                            run_id,
+                        );
+                    } else {
+                        emit_progress(
+                            handle,
+                            "sample:stored",
+                            Some(format!("{} sample stored", label)),
+                            run_id,
+                        );
+                    }
+                }
+                Err(err) => emit_progress(
+                    handle,
+                    "sample:error",
+                    Some(format!("{} sample store failed: {}", label, err)),
+                    run_id,
+                ),
+            }
+        }
+
         let embedding_vec = match embedder.embed(&pcm) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -681,113 +741,9 @@ fn process_segments(
             }
         };
         if let Some(embedding_vec) = embedding_vec {
-            let (speaker_id, speaker_label) = if let Some((matched, score)) = best_match(&embedding_vec, &known_embeddings) {
-                let label = matched
-                    .speaker_label
-                    .clone()
-                    .unwrap_or_else(|| {
-                        let generated = format!("VOICE{}", next_label_index);
-                        next_label_index += 1;
-                        generated
-                    });
-                if matched.speaker_label.is_none() {
-                    db.rename_speaker(&matched.speaker_id, &label)?;
-                }
-                if let Some(handle) = app_handle {
-                    emit_progress(
-                        handle,
-                        "embedding:matched",
-                        Some(format!("{} -> {} (score {:.2})", speaker_key, label, score)),
-                        run_id,
-                    );
-                }
-                (matched.speaker_id.clone(), label)
-            } else {
-                let label = format!("VOICE{}", next_label_index);
-                next_label_index += 1;
-                let id = db.insert_speaker(Some(&label))?;
-                if let Some(handle) = app_handle {
-                    emit_progress(
-                        handle,
-                        "embedding:new",
-                        Some(format!("{} -> {}", speaker_key, label)),
-                        run_id,
-                    );
-                    // Store a small sample for review.
-                    match encode_wav_base64(&pcm, audio.sample_rate) {
-                        Ok(b64) => {
-                            if let Err(err) = db.insert_sample(&id, &b64, audio.sample_rate) {
-                                emit_progress(
-                                    handle,
-                                    "sample:error",
-                                    Some(format!("{} sample store failed: {}", label, err)),
-                                    run_id,
-                                );
-                            } else {
-                                emit_progress(
-                                    handle,
-                                    "sample:stored",
-                                    Some(format!("{} sample stored", label)),
-                                    run_id,
-                                );
-                            }
-                        }
-                        Err(err) => emit_progress(
-                            handle,
-                            "sample:error",
-                            Some(format!("{} sample store failed: {}", label, err)),
-                            run_id,
-                        ),
-                    }
-                }
-                (id, label)
-            };
-
-            // If no sample exists yet for this speaker, store a quick sample.
-            if let Some(handle) = app_handle {
-                if db.sample_count(&speaker_id).unwrap_or(0) == 0 {
-                    match encode_wav_base64(&pcm, audio.sample_rate) {
-                        Ok(b64) => {
-                            if let Err(err) = db.insert_sample(&speaker_id, &b64, audio.sample_rate) {
-                                emit_progress(
-                                    handle,
-                                    "sample:error",
-                                    Some(format!("{} sample store failed: {}", speaker_label, err)),
-                                    run_id,
-                                );
-                            } else {
-                                emit_progress(
-                                    handle,
-                                    "sample:stored",
-                                    Some(format!("{} sample stored", speaker_label)),
-                                    run_id,
-                                );
-                            }
-                        }
-                        Err(err) => emit_progress(
-                            handle,
-                            "sample:error",
-                            Some(format!("{} sample store failed: {}", speaker_label, err)),
-                            run_id,
-                        ),
-                    }
-                }
-            }
-
-            let embedding_id = db.insert_embedding(&speaker_id, session_id, &embedding_vec)?;
-            known_embeddings.push(StoredEmbedding {
-                id: embedding_id,
-                speaker_id: speaker_id.clone(),
-                speaker_label: Some(speaker_label.clone()),
-                vector: embedding_vec,
-                source_session_id: session_id.to_string(),
-                created_at: Utc::now(),
-            });
-            diarization_to_profile.insert(speaker_key, (speaker_id, speaker_label));
-        } else {
-            // No embedding; keep diarization speaker label.
-            diarization_to_profile.insert(speaker_key.clone(), (String::new(), speaker_key.clone()));
+            let _ = db.insert_embedding(&speaker_id, session_id, &embedding_vec);
         }
+        diarization_to_profile.insert(speaker_key, (speaker_id, label));
     }
 
     for seg in segments {
