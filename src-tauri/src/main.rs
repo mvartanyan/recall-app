@@ -398,7 +398,8 @@ fn transcribe_file_inner(
     }
 
     let audio_clip = read_audio_clip(&path)?;
-    let segments = normalize_segments(api_resp.segments.clone(), &api_resp.transcript, &audio_clip);
+    let mut segments = normalize_segments(api_resp.segments.clone(), &api_resp.transcript, &audio_clip);
+    segments = merge_segments(&segments);
     if let Some(handle) = app_handle {
         emit_progress(
             handle,
@@ -589,6 +590,26 @@ fn normalize_segments(
     }
     segs.sort_by_key(|s| s.start_ms);
     segs
+}
+
+fn merge_segments(segments: &[ApiSegment]) -> Vec<ApiSegment> {
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    let mut merged: Vec<ApiSegment> = Vec::new();
+    let mut current = segments[0].clone();
+    let gap_ms: u64 = 1000;
+    for seg in segments.iter().skip(1) {
+        if seg.speaker == current.speaker && seg.start_ms <= current.end_ms + gap_ms {
+            current.end_ms = current.end_ms.max(seg.end_ms);
+            current.text = format!("{} {}", current.text.trim_end(), seg.text);
+        } else {
+            merged.push(current);
+            current = seg.clone();
+        }
+    }
+    merged.push(current);
+    merged
 }
 
 fn collect_audio_by_speaker(
