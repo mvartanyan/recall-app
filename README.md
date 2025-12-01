@@ -66,9 +66,9 @@ Model export (one-time):
 - App now compiles against Tauri 2.5.x; recording manager runs in a worker thread (cpal/hound/tempfile).
 - Tray wired via Tauri 2 tray API (open/start/stop/quit).
 - ONNX model vendored; Azure STT used when API is configured (stub fallback if not).
-- Transcription command `transcribe_file` posts last recording to API base (`/v1/transcribe`); expects Azure-backed response with diarization segments but falls back to stub when Azure is not configured.
-- SQLite-based storage added (encrypted columns if password supplied later; currently opens without password). Stores sessions/transcripts, diarized segments, speakers, and embeddings; audio file is deleted after persistence.
-- Embedding/voice matching wired: diarized segments are aggregated (~10s per speaker), embeddings computed locally via ONNX, cosine-matched to stored speakers, and new speakers created when no match crosses the threshold.
+- Transcription command `transcribe_file` posts last recording to API base (`/v1/transcribe`); expects Azure-backed response with diarization segments but falls back to stub when Azure is not configured. Diarization hint is `speakers.minCount=1,maxCount=12`.
+- SQLite-based storage added (encrypted columns if password supplied later; currently opens without password). Stores sessions/transcripts, diarized segments, speakers, embeddings, and samples; audio file is deleted after persistence.
+- Embedding/matching now creates per-diarized `VOICE<n>` speakers (no cross-matching), stores samples, and logs progress with run IDs; UI has a Speakers panel (refresh/preview/rename/merge/delete) but refresh reliability still needs work.
 - API upload now flows through `/v1/transcribe`; `/v1/transcribe-local` remains only as a dev stub.
 
 ## API usage from app
