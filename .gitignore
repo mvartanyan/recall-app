@@ -7,4 +7,7 @@ src-tauri/target/
 src-tauri/.fingerprint/
 src-tauri/.cargo/
 .venv*
+.env
+.env.*
+!.env.example
 models/cache/

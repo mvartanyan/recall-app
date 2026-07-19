@@ -1,56 +1,66 @@
-use ort::session::builder::GraphOptimizationLevel;
-use ort::session::Session;
-use ort::value::Tensor;
+use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
+
+pub const EMBEDDING_VERSION: &str = "sherpa-onnx-ecapa-v1";
+const MODEL_SAMPLE_RATE: u32 = 16_000;
 
 pub struct Embedder {
-    session: Session,
+    extractor: SpeakerEmbeddingExtractor,
 }
 
 impl Embedder {
     pub fn new(model_path: &str) -> Result<Self, String> {
-        let session = Session::builder()
-            .map_err(|e| e.to_string())?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| e.to_string())?
-            .commit_from_file(model_path)
-            .map_err(|e| e.to_string())?;
-        Ok(Self { session })
+        let config = SpeakerEmbeddingExtractorConfig {
+            model: Some(model_path.into()),
+            num_threads: 2,
+            debug: false,
+            provider: Some("cpu".into()),
+        };
+        let extractor = SpeakerEmbeddingExtractor::create(&config)
+            .ok_or_else(|| "Failed to initialize the local speaker model".to_string())?;
+        Ok(Self { extractor })
     }
 
-    pub fn embed(&mut self, pcm: &[f32]) -> Result<Vec<f32>, String> {
-        // Produce simple framed features of shape [1, frames, 80] by chunking PCM into 80-sample frames.
-        let feat_dim: usize = 80;
-        let mut frames: Vec<f32> = Vec::new();
-        let mut idx = 0;
-        while idx < pcm.len() {
-            let end = std::cmp::min(idx + feat_dim, pcm.len());
-            let mut frame = Vec::with_capacity(feat_dim);
-            frame.extend_from_slice(&pcm[idx..end]);
-            if frame.len() < feat_dim {
-                frame.resize(feat_dim, 0.0);
-            }
-            frames.extend_from_slice(&frame);
-            idx += feat_dim;
+    pub fn embed(&self, pcm: &[f32], sample_rate: u32) -> Result<Vec<f32>, String> {
+        if pcm.is_empty() || sample_rate == 0 {
+            return Err("Speaker sample is empty".into());
         }
-        if frames.is_empty() {
-            frames.resize(feat_dim, 0.0);
+        let samples = resample_linear(pcm, sample_rate, MODEL_SAMPLE_RATE);
+        let stream = self
+            .extractor
+            .create_stream()
+            .ok_or_else(|| "Failed to create speaker embedding stream".to_string())?;
+        stream.accept_waveform(MODEL_SAMPLE_RATE as i32, &samples);
+        stream.input_finished();
+        if !self.extractor.is_ready(&stream) {
+            return Err("Speaker sample is too short for fingerprinting".into());
         }
-        let num_frames = (frames.len() / feat_dim) as i64;
-
-        let input = Tensor::from_array(([1i64, num_frames, feat_dim as i64], frames))
-            .map_err(|e| format!("tensor error: {e}"))?;
-        let outputs = self
-            .session
-            .run(ort::inputs![input])
-            .map_err(|e| format!("ort run error: {e}"))?;
-        let output = outputs[0]
-            .try_extract_array::<f32>()
-            .map_err(|e| format!("extract error: {e}"))?;
-        Ok(output.iter().cloned().collect())
+        self.extractor
+            .compute(&stream)
+            .ok_or_else(|| "Speaker fingerprint computation failed".to_string())
     }
 }
 
+fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if source_rate == target_rate {
+        return input.to_vec();
+    }
+    let output_len = ((input.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
+    let mut output = Vec::with_capacity(output_len);
+    let ratio = source_rate as f64 / target_rate as f64;
+    for index in 0..output_len {
+        let source_position = index as f64 * ratio;
+        let left = source_position.floor() as usize;
+        let right = (left + 1).min(input.len() - 1);
+        let fraction = (source_position - left as f64) as f32;
+        output.push(input[left] * (1.0 - fraction) + input[right] * fraction);
+    }
+    output
+}
+
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -58,5 +68,23 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         0.0
     } else {
         dot / (norm_a * norm_b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resampler_changes_length_and_preserves_endpoints() {
+        let input = vec![0.0, 0.5, 1.0, 0.5];
+        let output = resample_linear(&input, 4, 8);
+        assert_eq!(output.len(), 8);
+        assert!((output[0] - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_rejects_mismatched_vectors() {
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
     }
 }

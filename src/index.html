@@ -7,38 +7,263 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <header>
-      <h1>Recall</h1>
-      <p class="tagline">Desktop-first meeting recorder with Azure STT and local speaker profiles.</p>
-    </header>
-
-    <main>
-      <section class="panel">
-        <div class="controls">
-          <button id="start">Start recording</button>
-          <button id="stop" disabled>Stop recording</button>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div class="brand-mark" aria-hidden="true">R</div>
+          <div>
+            <h1>Recall</h1>
+            <p>Private meeting memory</p>
+          </div>
         </div>
-        <div class="config">
-          <label for="apiBase">API base URL</label>
-          <input id="apiBase" type="text" placeholder="http://localhost:8000" />
+
+        <button id="recordButton" class="record-button" type="button">
+          <span class="record-dot" aria-hidden="true"></span>
+          <span id="recordButtonLabel">New recording</span>
+        </button>
+
+        <div class="sidebar-section conversations-section">
+          <div class="section-heading">
+            <span>Conversations</span>
+            <button id="refreshSessions" class="icon-button" type="button" title="Refresh conversations" aria-label="Refresh conversations">↻</button>
+          </div>
+          <label class="search-field">
+            <span aria-hidden="true">⌕</span>
+            <input id="conversationSearch" type="search" placeholder="Search conversations" autocomplete="off" />
+          </label>
+          <div id="sessionsList" class="sessions-list" aria-live="polite"></div>
         </div>
-        <div class="status" id="status">Idle</div>
-      </section>
 
-      <section class="panel">
-        <h2>Notes</h2>
-    <textarea id="notes" placeholder="Transcripts and summaries will appear here." readonly></textarea>
-  </section>
-
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Speakers</h2>
-          <button id="refreshSpeakers">Refresh</button>
+        <div class="sidebar-footer">
+          <button id="settingsButton" class="sidebar-action" type="button">
+            <span aria-hidden="true">⚙</span>
+            Settings
+          </button>
+          <button id="activityButton" class="sidebar-action" type="button">
+            <span aria-hidden="true">⌁</span>
+            Activity
+            <span id="activityBadge" class="activity-badge" hidden>0</span>
+          </button>
         </div>
-        <div id="speakersList" class="speakers-list"></div>
-      </section>
-    </main>
+      </aside>
 
+      <main class="workspace">
+        <header class="topbar">
+          <div class="topbar-copy">
+            <input id="conversationTitle" class="conversation-title" value="New conversation" aria-label="Conversation title" disabled />
+            <div id="conversationMeta" class="conversation-meta">Record a conversation to begin</div>
+          </div>
+          <div class="topbar-actions">
+            <span id="serviceBadge" class="service-badge warning">Soniox key needed</span>
+            <button id="deleteSessionButton" class="icon-button danger" type="button" title="Delete conversation" aria-label="Delete conversation" hidden>⌫</button>
+          </div>
+        </header>
+
+        <section id="recordingBanner" class="recording-banner" hidden>
+          <div class="recording-state">
+            <span class="live-dot" aria-hidden="true"></span>
+            <div>
+              <strong>Recording</strong>
+              <span id="recordingTimer">00:00</span>
+            </div>
+          </div>
+          <div class="level-track" aria-label="Microphone level">
+            <span id="levelBar"></span>
+          </div>
+          <button id="stopButton" class="stop-button" type="button">Stop &amp; process</button>
+        </section>
+
+        <section id="livePanel" class="live-panel" hidden>
+          <div class="content-heading">
+            <div>
+              <span class="eyebrow">Live transcription</span>
+              <h2 id="liveStatus">Connecting…</h2>
+            </div>
+            <span class="live-pill">LIVE</span>
+          </div>
+          <pre id="liveTranscript" class="live-transcript">Listening…</pre>
+          <p class="supporting-copy">Live captions are provisional. Recall replaces them with Soniox’s higher-quality final diarized transcript after you stop.</p>
+        </section>
+
+        <div class="content-grid">
+          <section class="transcript-pane">
+            <div id="emptyState" class="empty-state">
+              <div class="empty-icon" aria-hidden="true">◉</div>
+              <h2>Your conversations will appear here</h2>
+              <p>Recall streams captions while you record, then attributes the final transcript to local voice profiles.</p>
+              <button id="emptyRecordButton" class="primary-button" type="button">Start a recording</button>
+            </div>
+
+            <div id="processingState" class="processing-state" hidden>
+              <div class="spinner" aria-hidden="true"></div>
+              <div>
+                <strong id="processingTitle">Processing recording</strong>
+                <p id="processingDetail">Preparing final transcription…</p>
+              </div>
+            </div>
+
+            <div id="transcriptContent" hidden>
+              <div class="content-heading transcript-heading">
+                <div>
+                  <span class="eyebrow">Transcript</span>
+                  <h2>Conversation</h2>
+                </div>
+                <span id="saveState" class="save-state">Saved locally</span>
+              </div>
+              <div id="segmentsList" class="segments-list"></div>
+              <div id="legacyTranscript" class="legacy-transcript" hidden></div>
+            </div>
+          </section>
+
+          <aside class="people-pane">
+            <div class="content-heading people-heading">
+              <div>
+                <span class="eyebrow">Voice database</span>
+                <h2>People</h2>
+              </div>
+              <button id="refreshSpeakers" class="icon-button" type="button" title="Refresh people" aria-label="Refresh people">↻</button>
+            </div>
+            <p class="supporting-copy people-help">New voices stay as VOICE numbers until you name or assign them. Voice samples are deleted after naming.</p>
+            <div id="speakersList" class="speakers-list"></div>
+          </aside>
+        </div>
+      </main>
+    </div>
+
+    <aside id="activityDrawer" class="activity-drawer" aria-hidden="true">
+      <div class="drawer-header">
+        <div>
+          <span class="eyebrow">Diagnostics</span>
+          <h2>Activity</h2>
+        </div>
+        <div class="drawer-actions">
+          <button id="clearActivity" class="text-button" type="button">Clear</button>
+          <button id="closeActivity" class="icon-button" type="button" aria-label="Close activity">×</button>
+        </div>
+      </div>
+      <div id="activityLog" class="activity-log" role="log" aria-live="polite"></div>
+    </aside>
+
+    <dialog id="settingsDialog" class="modal settings-modal">
+      <form id="settingsForm" method="dialog">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Preferences</span>
+            <h2>Settings</h2>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog="settingsDialog" aria-label="Close settings">×</button>
+        </div>
+
+        <section class="settings-section">
+          <div class="setting-title-row">
+            <div>
+              <h3>Soniox API key</h3>
+              <p>Bring your own key. Recall stores it in macOS Keychain, never in the app database.</p>
+            </div>
+            <span id="keyStatus" class="service-badge warning">Not configured</span>
+          </div>
+          <label class="field-label" for="sonioxKey">New or replacement key</label>
+          <div class="key-row">
+            <input id="sonioxKey" type="password" placeholder="Paste a Soniox API key" autocomplete="off" spellcheck="false" />
+            <button id="saveKeyButton" class="secondary-button" type="button">Save key</button>
+            <button id="deleteKeyButton" class="text-button danger-text" type="button">Remove</button>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <h3>Audio input</h3>
+          <label class="field-label" for="inputDevice">Recording source</label>
+          <select id="inputDevice"></select>
+          <p class="field-help">Choose your microphone, or a virtual/aggregate input such as BlackHole to capture meeting audio. Native macOS system-audio capture is not implemented yet.</p>
+        </section>
+
+        <section class="settings-section settings-grid">
+          <div>
+            <label class="field-label" for="languageHints">Likely languages</label>
+            <input id="languageHints" type="text" placeholder="en, fr, de, es, ru" />
+            <p class="field-help">Comma-separated hints improve recognition without preventing code-switching.</p>
+          </div>
+          <label class="toggle-row">
+            <span>
+              <strong>Live captions</strong>
+              <small>Stream provisional text while recording</small>
+            </span>
+            <input id="liveTranscription" type="checkbox" />
+          </label>
+        </section>
+
+        <div class="modal-footer">
+          <span id="settingsFeedback" class="modal-feedback"></span>
+          <button class="text-button" type="button" data-close-dialog="settingsDialog">Cancel</button>
+          <button id="saveSettingsButton" class="primary-button" type="submit">Save settings</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="nameDialog" class="modal compact-modal">
+      <form id="nameForm" method="dialog">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Voice profile</span>
+            <h2>Name this person</h2>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog="nameDialog" aria-label="Close">×</button>
+        </div>
+        <input id="nameSpeakerId" type="hidden" />
+        <label class="field-label" for="speakerName">Display name</label>
+        <input id="speakerName" type="text" placeholder="e.g. Michael" required />
+        <p class="field-help">Once named, the temporary voice excerpt is deleted. The voiceprint remains local for future matching.</p>
+        <div class="modal-footer">
+          <button class="text-button" type="button" data-close-dialog="nameDialog">Cancel</button>
+          <button class="primary-button" type="submit">Save name</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="assignDialog" class="modal compact-modal">
+      <form id="assignForm" method="dialog">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Voice profile</span>
+            <h2>Assign to an existing person</h2>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog="assignDialog" aria-label="Close">×</button>
+        </div>
+        <input id="assignSourceId" type="hidden" />
+        <label class="field-label" for="assignTarget">Person</label>
+        <select id="assignTarget" required></select>
+        <fieldset class="choice-group">
+          <legend>How should Recall update the voice profile?</legend>
+          <label><input type="radio" name="voiceprintMode" value="keep" checked /> Keep the old pattern and add this voice</label>
+          <label><input type="radio" name="voiceprintMode" value="replace" /> Replace the old pattern with this voice</label>
+        </fieldset>
+        <p class="field-help">Keep both is best for illness, aging, or different microphones. Replace only when the old pattern is wrong.</p>
+        <div class="modal-footer">
+          <button class="text-button" type="button" data-close-dialog="assignDialog">Cancel</button>
+          <button class="primary-button" type="submit">Assign person</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="unlockDialog" class="modal compact-modal">
+      <form id="unlockForm" method="dialog">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Existing local data</span>
+            <h2>Unlock Recall</h2>
+          </div>
+        </div>
+        <label class="field-label" for="databasePassword">Database password</label>
+        <input id="databasePassword" type="password" autocomplete="current-password" required />
+        <p class="field-help">This database was protected by an earlier Recall version. The password stays in memory only for this app session.</p>
+        <div class="modal-footer">
+          <span id="unlockFeedback" class="modal-feedback"></span>
+          <button class="primary-button" type="submit">Unlock</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite"></div>
     <script type="module" src="main.js"></script>
   </body>
 </html>

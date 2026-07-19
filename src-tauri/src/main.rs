@@ -1,62 +1,71 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
+use base64::Engine;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    SampleFormat, StreamConfig,
+    Device, SampleFormat, StreamConfig,
 };
-mod db;
-mod embedding;
-mod config;
-mod state;
-use state::AppState;
-use db::{Crypto, Db, SegmentRecord, Session, Speaker, StoredEmbedding};
-use chrono::Utc;
-use reqwest::blocking::{multipart, Client};
-use reqwest::Url;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuId, MenuItem},
+    path::BaseDirectory,
     tray::TrayIconBuilder,
     Emitter, Manager, State,
 };
-use base64::Engine;
+use tokio::sync::mpsc as tokio_mpsc;
+use uuid::Uuid;
 
-#[derive(Debug)]
-enum SampleChunk {
-    F32(Vec<f32>),
-    I16(Vec<i16>),
-}
+mod config;
+mod db;
+mod embedding;
+mod keychain;
+mod soniox;
+mod state;
 
-const TARGET_SPEAKER_MS: u64 = 10_000;
+use config::AppConfig;
+use db::{Crypto, Db, SegmentRecord, Session, Speaker, StoredEmbedding};
+use embedding::EMBEDDING_VERSION;
+use soniox::{LiveAudioMessage, TranscriptSegment};
+use state::AppState;
+
+const TARGET_SPEAKER_MS: u64 = 12_000;
 const MATCH_THRESHOLD: f32 = 0.90;
+const MATCH_MARGIN: f32 = 0.04;
 
-#[derive(Debug, Deserialize, Clone)]
-struct ApiSegment {
-    speaker: String,
-    start_ms: u64,
-    end_ms: u64,
-    text: String,
+#[derive(Debug, Serialize, Clone)]
+struct ProgressEvent {
+    event_id: String,
+    stage: String,
+    detail: Option<String>,
+    run_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-struct ApiTranscribeResponse {
-    transcript: String,
-    summary: Option<String>,
-    speakers: Vec<String>,
-    segments: Option<Vec<ApiSegment>>,
-    audio_url: Option<String>,
+#[derive(Debug, Serialize, Clone)]
+struct RecordingLevel {
+    level: f32,
+}
+
+#[derive(Debug, Serialize)]
+struct AudioDeviceInfo {
+    name: String,
+    is_default: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RecordingStarted {
+    path: String,
+    device_name: String,
+    sample_rate: u32,
+    live_started: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,7 +73,12 @@ struct AppStatus {
     encryption_enabled: bool,
     db_open: bool,
     needs_password: bool,
-    api_base: Option<String>,
+    recording: bool,
+    soniox_key_configured: bool,
+    speaker_model_available: bool,
+    selected_input_device: Option<String>,
+    language_hints: Vec<String>,
+    live_transcription: bool,
 }
 
 #[derive(Debug)]
@@ -73,53 +87,12 @@ struct AudioClip {
     sample_rate: u32,
 }
 
-#[derive(Debug, Serialize, Clone)]
-struct ProgressEvent {
-    stage: String,
-    detail: Option<String>,
-    run_id: Option<String>,
-}
-
-fn emit_progress(
-    handle: &tauri::AppHandle,
-    stage: &str,
-    detail: Option<String>,
-    run_id: Option<&String>,
-) {
-    if let Some(id) = run_id {
-        eprintln!("[progress {id}] {stage} {:?}", detail);
-    } else {
-        eprintln!("[progress] {stage} {:?}", detail);
-    }
-
-    let payload = ProgressEvent {
-        stage: stage.to_string(),
-        detail,
-        run_id: run_id.cloned(),
-    };
-    if let Some(id) = run_id {
-        if let Ok(mut guard) = handle
-            .state::<AppState>()
-            .inner()
-            .progress
-            .lock()
-        {
-            let entry = guard.entry(id.clone()).or_insert_with(Vec::new);
-            entry.push(payload.clone());
-        }
-    }
-    let _ = handle.emit("transcription:progress", payload.clone());
-    if let Some(win) = handle.get_webview_window("main") {
-        let _ = win.emit("transcription:progress", payload);
-    }
-}
-
 impl AudioClip {
     fn duration_ms(&self) -> u64 {
         if self.sample_rate == 0 {
             0
         } else {
-            (self.samples.len() as u64 * 1000) / self.sample_rate as u64
+            (self.samples.len() as u64 * 1_000) / self.sample_rate as u64
         }
     }
 }
@@ -136,145 +109,167 @@ struct RecordingManager {
 }
 
 impl RecordingManager {
-    fn start(&self) -> Result<PathBuf, String> {
-        let mut guard = self.current.lock().map_err(|_| "Lock poisoned")?;
+    fn start(
+        &self,
+        requested_device: Option<&str>,
+        live: Option<(String, Vec<String>)>,
+        app_handle: tauri::AppHandle,
+    ) -> Result<RecordingStarted, String> {
+        let mut guard = self.current.lock().map_err(|_| "Recording lock poisoned")?;
         if guard.is_some() {
-            return Err("Recording already in progress".into());
+            return Err("Recording is already in progress".into());
         }
 
         let host = cpal::default_host();
-        let device = host
+        let default_name = host
             .default_input_device()
-            .ok_or_else(|| "No input device found".to_string())?;
+            .and_then(|device| device.name().ok());
+        let device = find_input_device(&host, requested_device)?;
+        let device_name = device
+            .name()
+            .unwrap_or_else(|_| default_name.unwrap_or_else(|| "Default input".into()));
         let input_config = device
             .default_input_config()
-            .map_err(|e| format!("Failed to get input config: {e}"))?;
+            .map_err(|error| format!("Could not read input device configuration: {error}"))?;
         let sample_format = input_config.sample_format();
         let config: StreamConfig = input_config.into();
         let sample_rate = config.sample_rate.0;
-        let channels = config.channels;
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| e.to_string())?
-            .as_secs();
-        let output = std::env::temp_dir().join(format!("recall-{timestamp}.wav"));
-        let output_for_api = output.clone();
+        let channels = config.channels.max(1) as usize;
+        let output = std::env::temp_dir().join(format!("recall-{}.wav", Uuid::new_v4()));
+        let output_for_result = output.clone();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-        let output_for_thread = output.clone();
-        let handle = thread::spawn(move || -> Result<PathBuf, String> {
-            let wav_spec = match sample_format {
-                SampleFormat::F32 => hound::WavSpec {
-                    channels,
-                    sample_rate,
-                    bits_per_sample: 32,
-                    sample_format: hound::SampleFormat::Float,
-                },
-                SampleFormat::I16 | SampleFormat::U16 => hound::WavSpec {
-                    channels,
-                    sample_rate,
-                    bits_per_sample: 16,
-                    sample_format: hound::SampleFormat::Int,
-                },
-                _ => return Err("Unsupported sample format".into()),
-            };
+        let live_tx = live.map(|(api_key, language_hints)| {
+            let (tx, rx) = tokio_mpsc::unbounded_channel();
+            let handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) =
+                    soniox::run_realtime(api_key, language_hints, sample_rate, rx, handle.clone())
+                        .await
+                {
+                    soniox::emit_realtime_error(&handle, error);
+                }
+            });
+            tx
+        });
+        let live_started = live_tx.is_some();
 
-            let (data_tx, data_rx) = mpsc::channel::<SampleChunk>();
-            let stop_flag = Arc::new(AtomicBool::new(false));
-            let cb_flag = stop_flag.clone();
-            let err_fn = |err| eprintln!("recording error: {err}");
+        let output_for_thread = output.clone();
+        let callback_handle = app_handle.clone();
+        let handle = thread::spawn(move || -> Result<PathBuf, String> {
+            let wav_spec = hound::WavSpec {
+                channels: 1,
+                sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let (data_tx, data_rx) = mpsc::channel::<Vec<i16>>();
+            let meter_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let err_handle = callback_handle.clone();
+            let err_fn = move |error: cpal::StreamError| {
+                eprintln!("[recording] input stream error: {error}");
+                let _ = err_handle.emit("recording:error", error.to_string());
+            };
 
             let stream = match sample_format {
                 SampleFormat::F32 => {
-                    let tx = data_tx.clone();
+                    let writer_tx = data_tx.clone();
+                    let live_tx = live_tx.clone();
+                    let handle = callback_handle.clone();
+                    let counter = meter_counter.clone();
                     device
                         .build_input_stream(
                             &config,
                             move |data: &[f32], _| {
-                                if !cb_flag.load(Ordering::Relaxed) {
-                                    let _ = tx.send(SampleChunk::F32(data.to_vec()));
-                                }
+                                dispatch_samples(
+                                    downmix_f32(data, channels),
+                                    &writer_tx,
+                                    live_tx.as_ref(),
+                                    &handle,
+                                    &counter,
+                                );
                             },
                             err_fn,
                             None,
                         )
-                        .map_err(|e| format!("Failed to build input stream: {e}"))?
+                        .map_err(|error| format!("Could not build input stream: {error}"))?
                 }
                 SampleFormat::I16 => {
-                    let tx = data_tx.clone();
+                    let writer_tx = data_tx.clone();
+                    let live_tx = live_tx.clone();
+                    let handle = callback_handle.clone();
+                    let counter = meter_counter.clone();
                     device
                         .build_input_stream(
                             &config,
                             move |data: &[i16], _| {
-                                if !cb_flag.load(Ordering::Relaxed) {
-                                    let _ = tx.send(SampleChunk::I16(data.to_vec()));
-                                }
+                                dispatch_samples(
+                                    downmix_i16(data, channels),
+                                    &writer_tx,
+                                    live_tx.as_ref(),
+                                    &handle,
+                                    &counter,
+                                );
                             },
                             err_fn,
                             None,
                         )
-                        .map_err(|e| format!("Failed to build input stream: {e}"))?
+                        .map_err(|error| format!("Could not build input stream: {error}"))?
                 }
                 SampleFormat::U16 => {
-                    let tx = data_tx.clone();
+                    let writer_tx = data_tx.clone();
+                    let live_tx = live_tx.clone();
+                    let handle = callback_handle.clone();
+                    let counter = meter_counter.clone();
                     device
                         .build_input_stream(
                             &config,
                             move |data: &[u16], _| {
-                                if !cb_flag.load(Ordering::Relaxed) {
-                                    let converted: Vec<i16> =
-                                        data.iter().map(|s| (*s as i32 - 32768) as i16).collect();
-                                    let _ = tx.send(SampleChunk::I16(converted));
-                                }
+                                dispatch_samples(
+                                    downmix_u16(data, channels),
+                                    &writer_tx,
+                                    live_tx.as_ref(),
+                                    &handle,
+                                    &counter,
+                                );
                             },
                             err_fn,
                             None,
                         )
-                        .map_err(|e| format!("Failed to build input stream: {e}"))?
+                        .map_err(|error| format!("Could not build input stream: {error}"))?
                 }
-                _ => return Err("Unsupported sample format".into()),
+                other => return Err(format!("Unsupported input sample format: {other:?}")),
             };
+
+            let writer_output = output_for_thread.clone();
+            let writer = thread::spawn(move || -> Result<(), String> {
+                let mut writer = hound::WavWriter::create(&writer_output, wav_spec)
+                    .map_err(|error| format!("Could not create WAV recording: {error}"))?;
+                for chunk in data_rx {
+                    for sample in chunk {
+                        writer
+                            .write_sample(sample)
+                            .map_err(|error| format!("Could not write WAV recording: {error}"))?;
+                    }
+                }
+                writer
+                    .finalize()
+                    .map_err(|error| format!("Could not finalize WAV recording: {error}"))
+            });
 
             stream
                 .play()
-                .map_err(|e| format!("Failed to start input stream: {e}"))?;
-
-            let writer_output = output_for_thread.clone();
-            let writer_stop = stop_flag.clone();
-            let writer = thread::spawn(move || -> Result<(), String> {
-                let mut writer = hound::WavWriter::create(&writer_output, wav_spec)
-                    .map_err(|e| e.to_string())?;
-                for chunk in data_rx.iter() {
-                    if writer_stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    match chunk {
-                        SampleChunk::F32(data) => {
-                            for sample in data {
-                                writer.write_sample(sample).map_err(|e| e.to_string())?;
-                            }
-                        }
-                        SampleChunk::I16(data) => {
-                            for sample in data {
-                                writer.write_sample(sample).map_err(|e| e.to_string())?;
-                            }
-                        }
-                    }
-                }
-                writer.finalize().map_err(|e| e.to_string())?;
-                Ok(())
-            });
-
+                .map_err(|error| format!("Could not start input stream: {error}"))?;
             let _ = stop_rx.recv();
-            stop_flag.store(true, Ordering::SeqCst);
             drop(stream);
-            // allow callback to unwind
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(30));
             drop(data_tx);
-            let _ = writer
+            if let Some(live_tx) = live_tx {
+                let _ = live_tx.send(LiveAudioMessage::Finish);
+            }
+            writer
                 .join()
-                .map_err(|_| "Writer join error".to_string())??;
+                .map_err(|_| "Recording writer stopped unexpectedly".to_string())??;
             Ok(output)
         });
 
@@ -282,572 +277,825 @@ impl RecordingManager {
             stop_tx: Some(stop_tx),
             handle: Some(handle),
         });
-
-        Ok(output_for_api)
+        Ok(RecordingStarted {
+            path: output_for_result.to_string_lossy().to_string(),
+            device_name,
+            sample_rate,
+            live_started,
+        })
     }
 
     fn stop(&self) -> Result<PathBuf, String> {
-        let mut guard = self.current.lock().map_err(|_| "Lock poisoned")?;
+        let mut guard = self.current.lock().map_err(|_| "Recording lock poisoned")?;
         let mut recorder = guard
             .take()
-            .ok_or_else(|| "No active recording".to_string())?;
-
+            .ok_or_else(|| "There is no active recording".to_string())?;
         if let Some(tx) = recorder.stop_tx.take() {
             let _ = tx.send(());
         }
+        recorder
+            .handle
+            .take()
+            .ok_or_else(|| "Recording worker is missing".to_string())?
+            .join()
+            .map_err(|_| "Recording worker stopped unexpectedly".to_string())?
+    }
 
-        if let Some(handle) = recorder.handle.take() {
-            let path = handle.join().map_err(|_| "Join error".to_string())??;
-            return Ok(path);
-        }
-
-        Err("No recorder thread found".into())
+    fn is_recording(&self) -> bool {
+        self.current
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
     }
 }
 
-#[tauri::command]
-fn start_recording(state: State<RecordingManager>) -> Result<PathBuf, String> {
-    state.start()
+fn find_input_device(host: &cpal::Host, requested: Option<&str>) -> Result<Device, String> {
+    if let Some(requested) = requested.filter(|value| !value.trim().is_empty()) {
+        let devices = host
+            .input_devices()
+            .map_err(|error| format!("Could not list input devices: {error}"))?;
+        for device in devices {
+            if device.name().ok().as_deref() == Some(requested) {
+                return Ok(device);
+            }
+        }
+        return Err(format!("Input device is no longer available: {requested}"));
+    }
+    host.default_input_device()
+        .ok_or_else(|| "No microphone or audio input device is available".to_string())
+}
+
+fn dispatch_samples(
+    samples: Vec<i16>,
+    writer_tx: &mpsc::Sender<Vec<i16>>,
+    live_tx: Option<&tokio_mpsc::UnboundedSender<LiveAudioMessage>>,
+    app_handle: &tauri::AppHandle,
+    meter_counter: &std::sync::atomic::AtomicUsize,
+) {
+    if samples.is_empty() {
+        return;
+    }
+    if let Some(live_tx) = live_tx {
+        let bytes = bytemuck::cast_slice(&samples).to_vec();
+        let _ = live_tx.send(LiveAudioMessage::Audio(bytes));
+    }
+    if meter_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+        let rms = (samples
+            .iter()
+            .map(|sample| {
+                let value = *sample as f32 / i16::MAX as f32;
+                value * value
+            })
+            .sum::<f32>()
+            / samples.len() as f32)
+            .sqrt();
+        let _ = app_handle.emit(
+            "recording:level",
+            RecordingLevel {
+                level: (rms * 4.0).clamp(0.0, 1.0),
+            },
+        );
+    }
+    let _ = writer_tx.send(samples);
+}
+
+fn downmix_f32(data: &[f32], channels: usize) -> Vec<i16> {
+    data.chunks(channels)
+        .map(|frame| {
+            let average = frame.iter().copied().sum::<f32>() / frame.len() as f32;
+            (average.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+        })
+        .collect()
+}
+
+fn downmix_i16(data: &[i16], channels: usize) -> Vec<i16> {
+    data.chunks(channels)
+        .map(|frame| {
+            (frame.iter().map(|sample| *sample as i64).sum::<i64>() / frame.len() as i64) as i16
+        })
+        .collect()
+}
+
+fn downmix_u16(data: &[u16], channels: usize) -> Vec<i16> {
+    data.chunks(channels)
+        .map(|frame| {
+            let average =
+                frame.iter().map(|sample| *sample as i64).sum::<i64>() / frame.len() as i64;
+            (average - 32_768) as i16
+        })
+        .collect()
+}
+
+fn emit_progress(
+    handle: &tauri::AppHandle,
+    stage: &str,
+    detail: Option<String>,
+    run_id: Option<&str>,
+) {
+    if let Some(id) = run_id {
+        eprintln!("[progress {id}] {stage} {detail:?}");
+    } else {
+        eprintln!("[progress] {stage} {detail:?}");
+    }
+    let payload = ProgressEvent {
+        event_id: Uuid::new_v4().to_string(),
+        stage: stage.to_string(),
+        detail,
+        run_id: run_id.map(str::to_string),
+    };
+    if let Some(id) = run_id {
+        if let Ok(mut progress) = handle.state::<AppState>().progress.lock() {
+            progress
+                .entry(id.to_string())
+                .or_default()
+                .push(payload.clone());
+        }
+    }
+    let _ = handle.emit("transcription:progress", payload);
 }
 
 #[tauri::command]
-fn stop_recording(state: State<RecordingManager>) -> Result<PathBuf, String> {
-    state.stop()
+fn list_input_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|device| device.name().ok());
+    let devices = host
+        .input_devices()
+        .map_err(|error| format!("Could not list input devices: {error}"))?;
+    let mut output = Vec::new();
+    for device in devices {
+        if let Ok(name) = device.name() {
+            output.push(AudioDeviceInfo {
+                is_default: default_name.as_deref() == Some(name.as_str()),
+                name,
+            });
+        }
+    }
+    output.sort_by(|left, right| {
+        right
+            .is_default
+            .cmp(&left.is_default)
+            .then(left.name.cmp(&right.name))
+    });
+    Ok(output)
+}
+
+fn start_recording_impl(
+    manager: &RecordingManager,
+    app_state: &AppState,
+    app_handle: tauri::AppHandle,
+    input_device: Option<String>,
+) -> Result<RecordingStarted, String> {
+    let api_key = keychain::load_api_key()?;
+    let config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?
+        .clone();
+    let requested = input_device.or(config.selected_input_device.clone());
+    let live = config
+        .live_transcription
+        .then_some((api_key, config.language_hints.clone()));
+    let started = manager.start(requested.as_deref(), live, app_handle.clone())?;
+    let _ = app_handle.emit("recording:started", started.clone());
+    Ok(started)
 }
 
 #[tauri::command]
-fn transcribe_file(
-    path: String,
-    api_base: Option<String>,
+fn start_recording(
+    input_device: Option<String>,
+    manager: State<RecordingManager>,
     app_state: State<AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<RecordingStarted, String> {
+    start_recording_impl(&manager, &app_state, app_handle, input_device)
+}
+
+#[tauri::command]
+fn stop_recording(
+    manager: State<RecordingManager>,
+    app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    transcribe_file_inner(path, api_base, &app_state, None, None)
+    let path = manager.stop()?;
+    let path_string = path.to_string_lossy().to_string();
+    let _ = app_handle.emit("recording:stopped", path_string.clone());
+    Ok(path_string)
 }
 
 fn transcribe_file_inner(
-    path: String,
-    api_base: Option<String>,
+    path: &str,
     app_state: &AppState,
-    app_handle: Option<&tauri::AppHandle>,
-    run_id: Option<&String>,
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
 ) -> Result<String, String> {
-    eprintln!("[transcribe] start path={}", path);
-    if let Some(handle) = app_handle {
-        emit_progress(handle, "transcribe:start", Some("starting transcription".into()), run_id);
-    }
-    let api_base = api_base
-        .or_else(|| {
-            let cfg = app_state.config.lock().ok()?.clone();
-            cfg.api_base
-        })
-        .unwrap_or_else(|| "http://localhost:8787".to_string());
-
-    // ensure embedder is available before processing results
-    {
-        let embedder_loaded = app_state.embedder.lock().map_err(|_| "embedder lock")?.is_some();
-        if !embedder_loaded {
-            app_state.load_embedder()?;
-        }
-    }
-
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard
-        .as_ref()
-        .ok_or("Database not initialized (unlock to proceed)")?;
-    let _ = db.encrypted;
-
-    let url = Url::parse(&api_base)
-        .map_err(|e| format!("Invalid API base: {e}"))?
-        .join("v1/transcribe")
-        .map_err(|e| format!("Invalid endpoint: {e}"))?;
-
-    let file_bytes = std::fs::read(&path).map_err(|e| format!("Failed to read file: {e}"))?;
-    let part = multipart::Part::bytes(file_bytes).file_name("audio.wav");
-    let form = multipart::Form::new().part("file", part);
-
-    if let Some(handle) = app_handle {
-        emit_progress(handle, "azure:start", Some("uploading and starting STT".into()), run_id);
-    }
-    eprintln!("[transcribe] posting to Azure STT at {}", api_base);
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(240))
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    let res = client
-        .post(url)
-        .multipart(form)
-        .send()
-        .map_err(|e| format!("HTTP error: {e}"))?;
-
-    if !res.status().is_success() {
-        return Err(format!("API responded with status {}", res.status()));
-    }
-
-    let api_resp: ApiTranscribeResponse = res
-        .json()
-        .map_err(|e| format!("Decode error: {e}"))?;
-    let _ = (&api_resp.summary, &api_resp.speakers, &api_resp.audio_url);
-    eprintln!(
-        "[transcribe] STT done, transcript len={}, segments={}",
-        api_resp.transcript.len(),
-        api_resp.segments.as_ref().map(|s| s.len()).unwrap_or(0)
+    emit_progress(
+        app_handle,
+        "transcription:start",
+        Some("Preparing final transcription".into()),
+        Some(run_id),
     );
-    if let Some(handle) = app_handle {
-        emit_progress(handle, "azure:done", Some("STT finished".into()), run_id);
-    }
-
-    let audio_clip = read_audio_clip(&path)?;
-    let mut segments = normalize_segments(api_resp.segments.clone(), &api_resp.transcript, &audio_clip);
-    segments = merge_segments(&segments);
-    if let Some(handle) = app_handle {
-        emit_progress(
-            handle,
-            "segments:normalized",
-            Some(format!("{} segments", segments.len())),
-            run_id,
-        );
-    }
-
+    let api_key = keychain::load_api_key()?;
+    let language_hints = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?
+        .language_hints
+        .clone();
+    let result = soniox::transcribe_file(
+        Path::new(path),
+        &api_key,
+        &language_hints,
+        |stage, detail| emit_progress(app_handle, stage, Some(detail), Some(run_id)),
+    )?;
+    emit_progress(
+        app_handle,
+        "audio:read:start",
+        Some("Reading local audio for speaker fingerprints".into()),
+        Some(run_id),
+    );
+    let audio = read_audio_clip(path)?;
+    emit_progress(
+        app_handle,
+        "audio:read:done",
+        Some(format!(
+            "Loaded {:.1} seconds of mono audio",
+            audio.duration_ms() as f64 / 1_000.0
+        )),
+        Some(run_id),
+    );
+    let segments = merge_segments(&normalize_segments(
+        result.segments,
+        &result.transcript,
+        &audio,
+    ));
+    let db = app_state.db_handle()?;
+    let initial_display = build_display_transcript(&segments, &result.transcript);
+    let title = make_conversation_title(&result.transcript);
     let session_id = db
-        .insert_session(&api_resp.transcript)
-        .map_err(|e| format!("DB error: {e}"))?;
+        .insert_session(&title, &initial_display, audio.duration_ms() as i64)
+        .map_err(|error| format!("Could not save conversation: {error}"))?;
 
-    eprintln!("[transcribe] embedding/matching start");
-    if let Some(handle) = app_handle {
-        emit_progress(handle, "onnx:start", Some("embedding and matching".into()), run_id);
-    }
-    {
-        let mut embedder_guard = app_state.embedder.lock().map_err(|_| "embedder lock")?;
-        let embedder = embedder_guard
-            .as_mut()
-            .ok_or("Embedder not initialized")?;
+    emit_progress(
+        app_handle,
+        "voiceprints:start",
+        Some("Extracting and matching local voiceprints".into()),
+        Some(run_id),
+    );
+    let embedder_available = {
+        let loaded = app_state
+            .embedder
+            .lock()
+            .map_err(|_| "Speaker model lock poisoned")?
+            .is_some();
+        if loaded {
+            true
+        } else {
+            match app_state.load_embedder() {
+                Ok(()) => true,
+                Err(error) => {
+                    emit_progress(
+                        app_handle,
+                        "voiceprints:warning",
+                        Some(format!("Automatic matching unavailable: {error}")),
+                        Some(run_id),
+                    );
+                    false
+                }
+            }
+        }
+    };
+    if embedder_available {
+        let embedder = app_state
+            .embedder
+            .lock()
+            .map_err(|_| "Speaker model lock poisoned")?;
         process_segments(
-            &audio_clip,
+            &audio,
             &segments,
             &session_id,
-            db,
-            embedder,
+            &db,
+            embedder.as_ref(),
+            app_handle,
+            run_id,
+        )?;
+    } else {
+        process_segments(
+            &audio,
+            &segments,
+            &session_id,
+            &db,
+            None,
             app_handle,
             run_id,
         )?;
     }
-    eprintln!("[transcribe] embedding/matching done");
-    if let Some(handle) = app_handle {
-        emit_progress(
-            handle,
-            "onnx:done",
-            Some("embedding/matching done".into()),
-            run_id,
-        );
-    }
+    emit_progress(
+        app_handle,
+        "voiceprints:done",
+        Some("Speaker attribution finished".into()),
+        Some(run_id),
+    );
+    let saved_segments = db.list_segments(&session_id)?;
+    let final_display = build_saved_transcript(&saved_segments, &result.transcript);
+    db.update_session_transcript(&session_id, &final_display)?;
+    emit_progress(
+        app_handle,
+        "transcription:done",
+        Some("Conversation saved locally".into()),
+        Some(run_id),
+    );
+    Ok(session_id)
+}
 
-    let _ = std::fs::remove_file(&path);
-    if let Some(handle) = app_handle {
-        emit_progress(
-            handle,
-            "transcribe:done",
-            Some("finished transcription/embedding".into()),
-            run_id,
-        );
+fn queue_transcription(path: String, state: AppState, app_handle: tauri::AppHandle) -> String {
+    let run_id = Uuid::new_v4().to_string();
+    if let Ok(mut progress) = state.progress.lock() {
+        progress.entry(run_id.clone()).or_default();
     }
-
-    Ok(api_resp.transcript)
+    emit_progress(
+        &app_handle,
+        "queued",
+        Some("Final transcription queued".into()),
+        Some(&run_id),
+    );
+    let worker_run_id = run_id.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = transcribe_file_inner(&path, &state, &app_handle, &worker_run_id);
+        if let Err(error) = std::fs::remove_file(&path) {
+            if Path::new(&path).exists() {
+                emit_progress(
+                    &app_handle,
+                    "audio:cleanup:warning",
+                    Some(format!("Could not delete temporary recording: {error}")),
+                    Some(&worker_run_id),
+                );
+            }
+        } else {
+            emit_progress(
+                &app_handle,
+                "audio:cleanup:done",
+                Some("Temporary recording deleted".into()),
+                Some(&worker_run_id),
+            );
+        }
+        match result {
+            Ok(session_id) => emit_progress(
+                &app_handle,
+                "complete",
+                Some(session_id),
+                Some(&worker_run_id),
+            ),
+            Err(error) => emit_progress(&app_handle, "error", Some(error), Some(&worker_run_id)),
+        }
+    });
+    run_id
 }
 
 #[tauri::command]
 fn transcribe_file_async(
     path: String,
-    api_base: Option<String>,
     app_state: State<AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    let state = app_state.inner().clone();
-    let handle = app_handle.clone();
-    let run_id = uuid::Uuid::new_v4().to_string();
-    // Initialize log.
-    {
-        if let Ok(mut guard) = handle.state::<AppState>().inner().progress.lock() {
-            guard.entry(run_id.clone()).or_insert_with(Vec::new);
-        }
+    if !Path::new(&path).is_file() {
+        return Err("Recording file does not exist".into());
     }
-    emit_progress(
-        &handle,
-        "queued",
-        Some("queued transcription".to_string()),
-        Some(&run_id),
-    );
-    let run_id_clone = run_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        match transcribe_file_inner(path, api_base, &state, Some(&handle), Some(&run_id)) {
-            Ok(transcript) => {
-                emit_progress(&handle, "complete", Some(transcript), Some(&run_id));
-            }
-            Err(e) => {
-                eprintln!("[transcribe] error: {e}");
-                emit_progress(&handle, "error", Some(e), Some(&run_id));
-                emit_progress(&handle, "complete", Some("failed".into()), Some(&run_id));
-            }
-        }
-    });
-    Ok(run_id_clone)
+    Ok(queue_transcription(
+        path,
+        app_state.inner().clone(),
+        app_handle,
+    ))
 }
 
 #[tauri::command]
 fn get_progress(run_id: String, app_state: State<AppState>) -> Result<Vec<ProgressEvent>, String> {
-    let guard = app_state
+    Ok(app_state
         .progress
         .lock()
-        .map_err(|_| "progress lock")?;
-    Ok(guard.get(&run_id).cloned().unwrap_or_default())
+        .map_err(|_| "Progress lock poisoned")?
+        .get(&run_id)
+        .cloned()
+        .unwrap_or_default())
 }
 
 fn read_audio_clip(path: &str) -> Result<AudioClip, String> {
     let mut reader = hound::WavReader::open(path)
-        .map_err(|e| format!("Failed to open audio for embeddings: {e}"))?;
+        .map_err(|error| format!("Could not open recorded WAV: {error}"))?;
     let spec = reader.spec();
-    let channels = std::cmp::max(spec.channels as usize, 1);
-    let mut interleaved: Vec<f32> = Vec::new();
+    let channels = spec.channels.max(1) as usize;
+    let mut interleaved = Vec::new();
     match (spec.sample_format, spec.bits_per_sample) {
         (hound::SampleFormat::Int, 16) => {
             for sample in reader.samples::<i16>() {
-                let s = sample.map_err(|e| format!("Sample decode error: {e}"))?;
-                interleaved.push(s as f32 / i16::MAX as f32);
+                interleaved.push(
+                    sample.map_err(|error| format!("Could not decode WAV: {error}"))? as f32
+                        / i16::MAX as f32,
+                );
             }
         }
-        (hound::SampleFormat::Int, 24) | (hound::SampleFormat::Int, 32) => {
+        (hound::SampleFormat::Int, 24 | 32) => {
             for sample in reader.samples::<i32>() {
-                let s = sample.map_err(|e| format!("Sample decode error: {e}"))?;
-                interleaved.push(s as f32 / i32::MAX as f32);
+                interleaved.push(
+                    sample.map_err(|error| format!("Could not decode WAV: {error}"))? as f32
+                        / i32::MAX as f32,
+                );
             }
         }
         (hound::SampleFormat::Float, _) => {
             for sample in reader.samples::<f32>() {
-                let s = sample.map_err(|e| format!("Sample decode error: {e}"))?;
-                interleaved.push(s);
+                interleaved.push(sample.map_err(|error| format!("Could not decode WAV: {error}"))?);
             }
         }
-        _ => return Err("Unsupported WAV format for embedding".into()),
+        _ => return Err("The recorded WAV format is unsupported".into()),
     }
     if interleaved.is_empty() {
-        return Err("Audio buffer is empty".into());
+        return Err("The recording contains no audio samples".into());
     }
-    let mut mono = Vec::with_capacity(interleaved.len() / channels + 1);
-    for frame in interleaved.chunks(channels) {
-        let sum: f32 = frame.iter().sum();
-        mono.push(sum / channels as f32);
-    }
+    let samples = interleaved
+        .chunks(channels)
+        .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32)
+        .collect();
     Ok(AudioClip {
-        samples: mono,
+        samples,
         sample_rate: spec.sample_rate,
     })
 }
 
+fn normalize_segments(
+    mut segments: Vec<TranscriptSegment>,
+    transcript: &str,
+    audio: &AudioClip,
+) -> Vec<TranscriptSegment> {
+    if segments.is_empty() && !transcript.trim().is_empty() {
+        segments.push(TranscriptSegment {
+            speaker: "unknown".into(),
+            start_ms: 0,
+            end_ms: audio.duration_ms(),
+            text: transcript.trim().into(),
+        });
+    }
+    let duration = audio.duration_ms();
+    for segment in &mut segments {
+        if segment.end_ms < segment.start_ms {
+            segment.end_ms = segment.start_ms;
+        }
+        segment.end_ms = segment.end_ms.min(duration);
+    }
+    segments.sort_by_key(|segment| segment.start_ms);
+    segments
+}
+
+fn merge_segments(segments: &[TranscriptSegment]) -> Vec<TranscriptSegment> {
+    let mut merged: Vec<TranscriptSegment> = Vec::new();
+    for segment in segments {
+        if let Some(previous) = merged.last_mut() {
+            if previous.speaker == segment.speaker && segment.start_ms <= previous.end_ms + 1_000 {
+                previous.end_ms = previous.end_ms.max(segment.end_ms);
+                if !previous
+                    .text
+                    .chars()
+                    .last()
+                    .map(char::is_whitespace)
+                    .unwrap_or(false)
+                {
+                    previous.text.push(' ');
+                }
+                previous.text.push_str(segment.text.trim());
+                continue;
+            }
+        }
+        merged.push(segment.clone());
+    }
+    merged
+}
+
+fn build_display_transcript(segments: &[TranscriptSegment], fallback: &str) -> String {
+    let lines = segments
+        .iter()
+        .filter(|segment| !segment.text.trim().is_empty())
+        .map(|segment| format!("{}: {}", segment.speaker, segment.text.trim()))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        fallback.trim().to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn build_saved_transcript(segments: &[SegmentRecord], fallback: &str) -> String {
+    let lines = segments
+        .iter()
+        .filter(|segment| !segment.text.trim().is_empty())
+        .map(|segment| {
+            format!(
+                "{}: {}",
+                segment
+                    .speaker_label
+                    .as_deref()
+                    .unwrap_or("Unknown speaker"),
+                segment.text.trim()
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        fallback.trim().to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn refresh_session_transcript(db: &Db, session_id: &str) -> Result<(), String> {
+    let segments = db.list_segments(session_id)?;
+    let transcript = build_saved_transcript(&segments, "");
+    db.update_session_transcript(session_id, &transcript)
+}
+
+fn make_conversation_title(transcript: &str) -> String {
+    let words = transcript.split_whitespace().take(9).collect::<Vec<_>>();
+    if words.is_empty() {
+        chrono::Local::now()
+            .format("Conversation %d %b %Y, %H:%M")
+            .to_string()
+    } else {
+        let title = words.join(" ");
+        if transcript.split_whitespace().count() > words.len() {
+            format!("{title}…")
+        } else {
+            title
+        }
+    }
+}
+
+fn collect_audio_by_speaker(
+    audio: &AudioClip,
+    segments: &[TranscriptSegment],
+) -> HashMap<String, Vec<f32>> {
+    let mut buckets = HashMap::new();
+    let target_samples = ((audio.sample_rate as u64 * TARGET_SPEAKER_MS) / 1_000) as usize;
+    for segment in segments {
+        let start = ((segment.start_ms as u128 * audio.sample_rate as u128) / 1_000) as usize;
+        let end = ((segment.end_ms as u128 * audio.sample_rate as u128) / 1_000) as usize;
+        let start = start.min(audio.samples.len());
+        let end = end.min(audio.samples.len());
+        if end <= start {
+            continue;
+        }
+        let bucket: &mut Vec<f32> = buckets.entry(segment.speaker.clone()).or_default();
+        let remaining = target_samples.saturating_sub(bucket.len());
+        if remaining > 0 {
+            bucket.extend_from_slice(&audio.samples[start..(start + remaining.min(end - start))]);
+        }
+    }
+    buckets
+}
+
+fn process_segments(
+    audio: &AudioClip,
+    segments: &[TranscriptSegment],
+    session_id: &str,
+    db: &Db,
+    embedder: Option<&embedding::Embedder>,
+    app_handle: &tauri::AppHandle,
+    run_id: &str,
+) -> Result<(), String> {
+    let buckets = collect_audio_by_speaker(audio, segments);
+    let known = db.list_embeddings(EMBEDDING_VERSION)?;
+    let mut ordered_speakers = Vec::new();
+    let mut seen = HashSet::new();
+    for segment in segments {
+        if seen.insert(segment.speaker.clone()) {
+            ordered_speakers.push(segment.speaker.clone());
+        }
+    }
+    let mut mapping: HashMap<String, (String, String)> = HashMap::new();
+
+    for diarized_speaker in ordered_speakers {
+        let pcm = buckets.get(&diarized_speaker).cloned().unwrap_or_default();
+        let embedding = match (embedder, pcm.is_empty()) {
+            (Some(embedder), false) => match embedder.embed(&pcm, audio.sample_rate) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    emit_progress(
+                        app_handle,
+                        "voiceprint:warning",
+                        Some(format!("{diarized_speaker}: {error}")),
+                        Some(run_id),
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+
+        let matched = embedding
+            .as_ref()
+            .and_then(|query| best_speaker_match(query, &known));
+        let (speaker_id, label, is_new) = if let Some((speaker_id, label, score)) = matched {
+            emit_progress(
+                app_handle,
+                "voiceprint:matched",
+                Some(format!("{diarized_speaker} → {label} ({score:.2})")),
+                Some(run_id),
+            );
+            (speaker_id, label, false)
+        } else {
+            let label = db.next_voice_label()?;
+            let speaker_id = db.insert_speaker(Some(&label))?;
+            emit_progress(
+                app_handle,
+                "voiceprint:new",
+                Some(format!("{diarized_speaker} → {label}")),
+                Some(run_id),
+            );
+            (speaker_id, label, true)
+        };
+
+        if let Some(embedding) = embedding.as_ref() {
+            db.insert_embedding(&speaker_id, session_id, embedding, EMBEDDING_VERSION)?;
+        }
+        if is_new && !pcm.is_empty() {
+            let sample = encode_wav_base64(&pcm, audio.sample_rate)?;
+            db.insert_sample(&speaker_id, &sample, audio.sample_rate)?;
+            emit_progress(
+                app_handle,
+                "voiceprint:sample:stored",
+                Some(format!("Stored a temporary preview for {label}")),
+                Some(run_id),
+            );
+        }
+        mapping.insert(diarized_speaker, (speaker_id, label));
+    }
+
+    for segment in segments {
+        let mapped = mapping.get(&segment.speaker);
+        db.insert_segment(
+            session_id,
+            segment.start_ms as i64,
+            segment.end_ms as i64,
+            mapped.map(|value| value.0.as_str()),
+            mapped
+                .map(|value| value.1.as_str())
+                .or(Some("Unknown speaker")),
+            segment.text.trim(),
+        )?;
+    }
+    Ok(())
+}
+
+fn best_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> Option<(String, String, f32)> {
+    let mut by_speaker: HashMap<&str, (&StoredEmbedding, f32)> = HashMap::new();
+    for candidate in known {
+        let score = embedding::cosine_similarity(query, &candidate.vector);
+        let entry = by_speaker
+            .entry(candidate.speaker_id.as_str())
+            .or_insert((candidate, score));
+        if score > entry.1 {
+            *entry = (candidate, score);
+        }
+    }
+    let mut ranked = by_speaker.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    let (best, score) = ranked.first().copied()?;
+    let second = ranked.get(1).map(|value| value.1).unwrap_or(-1.0);
+    if score < MATCH_THRESHOLD || score - second < MATCH_MARGIN {
+        return None;
+    }
+    Some((
+        best.speaker_id.clone(),
+        best.speaker_label
+            .clone()
+            .unwrap_or_else(|| "Unnamed speaker".into()),
+        score,
+    ))
+}
+
 fn encode_wav_base64(pcm: &[f32], sample_rate: u32) -> Result<String, String> {
     use std::io::Cursor;
-    let mut buf: Vec<u8> = Vec::new();
-    let cursor = Cursor::new(&mut buf);
+    let mut buffer = Vec::new();
+    let cursor = Cursor::new(&mut buffer);
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::new(cursor, spec).map_err(|e| e.to_string())?;
+    let mut writer = hound::WavWriter::new(cursor, spec).map_err(|error| error.to_string())?;
     for sample in pcm {
-        let s = (sample * i16::MAX as f32)
-            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        writer.write_sample(s).map_err(|e| e.to_string())?;
+        writer
+            .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .map_err(|error| error.to_string())?;
     }
-    writer.finalize().map_err(|e| e.to_string())?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+    writer.finalize().map_err(|error| error.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(buffer))
 }
 
-fn normalize_segments(
-    segments: Option<Vec<ApiSegment>>,
-    transcript: &str,
-    audio: &AudioClip,
-) -> Vec<ApiSegment> {
-    let mut segs = segments.unwrap_or_default();
-    if segs.is_empty() {
-        let end_ms = audio.duration_ms().max(1_000);
-        segs.push(ApiSegment {
-            speaker: "speaker_0".to_string(),
-            start_ms: 0,
-            end_ms,
-            text: transcript.to_string(),
-        });
-    }
-
-    let max_end = audio.duration_ms();
-    for seg in segs.iter_mut() {
-        if seg.end_ms == 0 || seg.end_ms < seg.start_ms {
-            seg.end_ms = seg.start_ms.saturating_add(1_000);
-        }
-        if max_end > 0 && seg.end_ms > max_end {
-            seg.end_ms = max_end;
-        }
-    }
-    segs.sort_by_key(|s| s.start_ms);
-    segs
+#[tauri::command]
+fn save_soniox_key(api_key: String) -> Result<(), String> {
+    keychain::save_api_key(&api_key)
 }
 
-fn merge_segments(segments: &[ApiSegment]) -> Vec<ApiSegment> {
-    if segments.is_empty() {
-        return Vec::new();
-    }
-    let mut merged: Vec<ApiSegment> = Vec::new();
-    let mut current = segments[0].clone();
-    let gap_ms: u64 = 1000;
-    for seg in segments.iter().skip(1) {
-        if seg.speaker == current.speaker && seg.start_ms <= current.end_ms + gap_ms {
-            current.end_ms = current.end_ms.max(seg.end_ms);
-            current.text = format!("{} {}", current.text.trim_end(), seg.text);
-        } else {
-            merged.push(current);
-            current = seg.clone();
-        }
-    }
-    merged.push(current);
-    merged
+#[tauri::command]
+fn delete_soniox_key() -> Result<(), String> {
+    keychain::delete_api_key()
 }
 
-fn collect_audio_by_speaker(
-    audio: &AudioClip,
-    segments: &[ApiSegment],
-) -> HashMap<String, Vec<f32>> {
-    let mut buckets: HashMap<String, Vec<f32>> = HashMap::new();
-    let total_samples = audio.samples.len();
-    let target_samples =
-        std::cmp::max(1, ((audio.sample_rate as u64 * TARGET_SPEAKER_MS) / 1000) as usize);
-    let sr = audio.sample_rate as f64;
-
-    for seg in segments {
-        let start = ((seg.start_ms as f64 / 1000.0) * sr).floor() as usize;
-        let end = ((seg.end_ms as f64 / 1000.0) * sr).ceil() as usize;
-        if end <= start {
-            continue;
-        }
-        let start_idx = std::cmp::min(start, total_samples);
-        let end_idx = std::cmp::min(end, total_samples);
-        if end_idx <= start_idx {
-            continue;
-        }
-        let entry = buckets.entry(seg.speaker.clone()).or_default();
-        let remaining = target_samples.saturating_sub(entry.len());
-        if remaining == 0 {
-            continue;
-        }
-        let take_len = std::cmp::min(remaining, end_idx - start_idx);
-        entry.extend_from_slice(&audio.samples[start_idx..start_idx + take_len]);
-    }
-
-    buckets
+#[tauri::command]
+fn soniox_key_status() -> bool {
+    keychain::has_api_key()
 }
 
-fn best_match<'a>(
-    embedding: &[f32],
-    known: &'a [StoredEmbedding],
-) -> Option<(&'a StoredEmbedding, f32)> {
-    let mut best: Option<(&StoredEmbedding, f32)> = None;
-    for record in known {
-        if record.vector.len() != embedding.len() {
-            continue;
-        }
-        let score = embedding::cosine_similarity(embedding, &record.vector);
-        match best {
-            Some((_, current)) if score <= current => continue,
-            _ => best = Some((record, score)),
-        }
-    }
-    if let Some((rec, score)) = best {
-        if score >= MATCH_THRESHOLD {
-            return Some((rec, score));
-        }
-    }
-    None
+#[tauri::command]
+fn get_preferences(app_state: State<AppState>) -> Result<AppConfig, String> {
+    app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned".to_string())
+        .map(|config| config.clone())
 }
 
-fn process_segments(
-    audio: &AudioClip,
-    segments: &[ApiSegment],
-    session_id: &str,
-    db: &Db,
-    embedder: &mut crate::embedding::Embedder,
-    app_handle: Option<&tauri::AppHandle>,
-    run_id: Option<&String>,
+#[tauri::command]
+fn save_preferences(
+    selected_input_device: Option<String>,
+    language_hints: Vec<String>,
+    live_transcription: bool,
+    app_state: State<AppState>,
 ) -> Result<(), String> {
-    let mut diarization_to_profile: HashMap<String, (String, String)> = HashMap::new();
-    let speakers = db.list_speakers()?;
-    let mut next_label_index = speakers.len() + 1;
-
-    for (speaker_key, pcm) in collect_audio_by_speaker(audio, segments) {
-        if pcm.is_empty() {
-            continue;
-        }
-
-        // Reuse speaker if this diarization speaker already mapped in this run.
-        if let Some((sid, _label)) = diarization_to_profile.get(&speaker_key) {
-            let embedding_vec = match embedder.embed(&pcm) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    eprintln!("embedding error for {speaker_key}: {e}");
-                    if let Some(handle) = app_handle {
-                        emit_progress(
-                            handle,
-                            "error",
-                            Some(format!("embedding error for {speaker_key}: {e}")),
-                            run_id,
-                        );
-                    }
-                    None
-                }
-            };
-            if let Some(embedding_vec) = embedding_vec {
-                let _ = db.insert_embedding(sid, session_id, &embedding_vec);
-            }
-            continue;
-        }
-
-        let label = format!("VOICE{}", next_label_index);
-        next_label_index += 1;
-        let speaker_id = db.insert_speaker(Some(&label))?;
-        if let Some(handle) = app_handle {
-            emit_progress(
-                handle,
-                "embedding:new",
-                Some(format!("{} -> {}", speaker_key, label)),
-                run_id,
-            );
-            match encode_wav_base64(&pcm, audio.sample_rate) {
-                Ok(b64) => {
-                    if let Err(err) = db.insert_sample(&speaker_id, &b64, audio.sample_rate) {
-                        emit_progress(
-                            handle,
-                            "sample:error",
-                            Some(format!("{} sample store failed: {}", label, err)),
-                            run_id,
-                        );
-                    } else {
-                        emit_progress(
-                            handle,
-                            "sample:stored",
-                            Some(format!("{} sample stored", label)),
-                            run_id,
-                        );
-                    }
-                }
-                Err(err) => emit_progress(
-                    handle,
-                    "sample:error",
-                    Some(format!("{} sample store failed: {}", label, err)),
-                    run_id,
-                ),
-            }
-        }
-
-        let embedding_vec = match embedder.embed(&pcm) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("embedding error for {speaker_key}: {e}");
-                if let Some(handle) = app_handle {
-                    emit_progress(
-                        handle,
-                        "error",
-                        Some(format!("embedding error for {speaker_key}: {e}")),
-                        run_id,
-                    );
-                }
-                None
-            }
-        };
-        if let Some(embedding_vec) = embedding_vec {
-            let _ = db.insert_embedding(&speaker_id, session_id, &embedding_vec);
-        }
-        diarization_to_profile.insert(speaker_key, (speaker_id, label));
-    }
-
-    for seg in segments {
-        let (speaker_id, speaker_label) = diarization_to_profile
-            .get(&seg.speaker)
-            .cloned()
-            .unwrap_or_else(|| (String::new(), seg.speaker.clone()));
-        let speaker_id_opt = if speaker_id.is_empty() {
-            None
-        } else {
-            Some(speaker_id.as_str())
-        };
-        db.insert_segment(
-            session_id,
-            seg.start_ms as i64,
-            seg.end_ms as i64,
-            speaker_id_opt,
-            Some(&speaker_label),
-            &seg.text,
-        )
-        .map_err(|e| format!("DB error: {e}"))?;
-    }
-
-    Ok(())
+    let mut config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?;
+    config.selected_input_device = selected_input_device.filter(|value| !value.trim().is_empty());
+    config.language_hints = language_hints
+        .into_iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect();
+    config.live_transcription = live_transcription;
+    config.save(&app_state.config_path)
 }
 
 #[tauri::command]
 fn unlock_db(password: String, app_state: State<AppState>) -> Result<(), String> {
-    let cfg = app_state.config.lock().map_err(|_| "config lock")?.clone();
-    if !cfg.encryption_enabled {
-        return Err("Encryption is not enabled".into());
-    }
-    let salt = Db::load_existing_salt(app_state.db_path()).unwrap_or(None);
-    let crypto = Crypto::new(Some(&password), salt);
-    app_state.open_db(crypto)
-}
-
-#[tauri::command]
-fn enable_encryption(password: String, app_state: State<AppState>) -> Result<(), String> {
-    {
-        let mut cfg = app_state.config.lock().map_err(|_| "config lock")?;
-        cfg.encryption_enabled = true;
-        cfg.save(&app_state.config_path)?;
-    }
-    // Recreate DB encrypted (note: existing plaintext data not migrated).
-    {
-        let mut db_guard = app_state.db.lock().map_err(|_| "db lock")?;
-        *db_guard = None;
-    }
-    let db_path = app_state.data_dir.join("recall.db");
-    let _ = std::fs::remove_file(&db_path);
-    let crypto = Crypto::new(Some(&password), None);
-    app_state.open_db(crypto)
-}
-
-#[tauri::command]
-fn app_status(app_state: State<AppState>) -> Result<AppStatus, String> {
-    let cfg = app_state
+    let config = app_state
         .config
         .lock()
-        .map_err(|_| "config lock")?
+        .map_err(|_| "Configuration lock poisoned")?
         .clone();
-    let db_open = app_state.db.lock().map_err(|_| "DB lock poisoned")?.is_some();
+    if !config.encryption_enabled {
+        return Err("Local database encryption is not enabled".into());
+    }
+    let salt = Db::load_existing_salt(app_state.db_path()).unwrap_or(None);
+    app_state.unlock_db(Crypto::new(Some(&password), salt))
+}
+
+#[tauri::command]
+fn enable_encryption(_password: String, _app_state: State<AppState>) -> Result<(), String> {
+    Err(
+        "Encryption migration is not implemented safely yet; existing data was left unchanged"
+            .into(),
+    )
+}
+
+#[tauri::command]
+fn app_status(
+    app_state: State<AppState>,
+    manager: State<RecordingManager>,
+) -> Result<AppStatus, String> {
+    let config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?
+        .clone();
+    let db_open = app_state
+        .db
+        .lock()
+        .map_err(|_| "Database lock poisoned")?
+        .is_some();
     Ok(AppStatus {
-        encryption_enabled: cfg.encryption_enabled,
+        encryption_enabled: config.encryption_enabled,
         db_open,
-        needs_password: cfg.encryption_enabled && !db_open,
-        api_base: cfg.api_base,
+        needs_password: config.encryption_enabled && !db_open,
+        recording: manager.is_recording(),
+        soniox_key_configured: keychain::has_api_key(),
+        speaker_model_available: app_state.model_path.is_file(),
+        selected_input_device: config.selected_input_device,
+        language_hints: config.language_hints,
+        live_transcription: config.live_transcription,
     })
 }
 
 #[tauri::command]
 fn list_sessions(app_state: State<AppState>) -> Result<Vec<Session>, String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.list_sessions()
+    app_state.db_handle()?.list_sessions()
 }
 
 #[tauri::command]
-fn list_segments(session_id: String, app_state: State<AppState>) -> Result<Vec<SegmentRecord>, String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.list_segments(&session_id)
+fn list_segments(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<Vec<SegmentRecord>, String> {
+    app_state.db_handle()?.list_segments(&session_id)
 }
 
 #[tauri::command]
@@ -856,23 +1104,59 @@ fn update_transcript(
     transcript: String,
     app_state: State<AppState>,
 ) -> Result<(), String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.update_session_transcript(&session_id, &transcript)
+    app_state
+        .db_handle()?
+        .update_session_transcript(&session_id, &transcript)
+}
+
+#[tauri::command]
+fn update_session_title(
+    session_id: String,
+    title: String,
+    app_state: State<AppState>,
+) -> Result<(), String> {
+    app_state
+        .db_handle()?
+        .update_session_title(&session_id, &title)
+}
+
+#[tauri::command]
+fn update_segment_text(
+    segment_id: String,
+    session_id: String,
+    text: String,
+    app_state: State<AppState>,
+) -> Result<(), String> {
+    let db = app_state.db_handle()?;
+    db.update_segment_text(&segment_id, &text)?;
+    refresh_session_transcript(&db, &session_id)
+}
+
+#[tauri::command]
+fn assign_segment_speaker(
+    segment_id: String,
+    session_id: String,
+    speaker_id: Option<String>,
+    app_state: State<AppState>,
+) -> Result<(), String> {
+    let db = app_state.db_handle()?;
+    db.assign_segment_speaker(&segment_id, speaker_id.as_deref())?;
+    refresh_session_transcript(&db, &session_id)
 }
 
 #[tauri::command]
 fn delete_session(session_id: String, app_state: State<AppState>) -> Result<(), String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.delete_session(&session_id)
+    app_state.db_handle()?.delete_session(&session_id)
 }
 
 #[tauri::command]
 fn list_speakers(app_state: State<AppState>) -> Result<Vec<Speaker>, String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.list_speakers()
+    app_state.db_handle()?.list_speakers()
+}
+
+#[tauri::command]
+fn list_speakers_with_stats(app_state: State<AppState>) -> Result<Vec<db::SpeakerStats>, String> {
+    app_state.db_handle()?.list_speakers_with_stats()
 }
 
 #[tauri::command]
@@ -881,23 +1165,24 @@ fn rename_speaker(
     new_label: String,
     app_state: State<AppState>,
 ) -> Result<(), String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.rename_speaker(&speaker_id, &new_label)
+    let db = app_state.db_handle()?;
+    let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
+    db.rename_speaker(&speaker_id, &new_label)?;
+    for session_id in sessions {
+        refresh_session_transcript(&db, &session_id)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn delete_speaker(speaker_id: String, app_state: State<AppState>) -> Result<(), String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.delete_speaker(&speaker_id)
-}
-
-#[tauri::command]
-fn list_speakers_with_stats(app_state: State<AppState>) -> Result<Vec<db::SpeakerStats>, String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.list_speakers_with_stats()
+    let db = app_state.db_handle()?;
+    let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
+    db.delete_speaker(&speaker_id)?;
+    for session_id in sessions {
+        refresh_session_transcript(&db, &session_id)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -905,9 +1190,7 @@ fn get_speaker_samples(
     speaker_id: String,
     app_state: State<AppState>,
 ) -> Result<Vec<db::SpeakerSample>, String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    db.list_samples(&speaker_id)
+    app_state.db_handle()?.list_samples(&speaker_id)
 }
 
 #[tauri::command]
@@ -917,27 +1200,17 @@ fn merge_speakers(
     replace_embeddings: bool,
     app_state: State<AppState>,
 ) -> Result<(), String> {
-    let db_guard = app_state.db.lock().map_err(|_| "DB lock poisoned")?;
-    let db = db_guard.as_ref().ok_or("Database not initialized")?;
-    if replace_embeddings {
-        db.delete_embeddings_for(&target_id)?;
+    let db = app_state.db_handle()?;
+    let sessions = db.session_ids_for_speakers(&[source_id.as_str(), target_id.as_str()])?;
+    db.merge_speakers(&source_id, &target_id, replace_embeddings)?;
+    for session_id in sessions {
+        refresh_session_transcript(&db, &session_id)?;
     }
-    // Move embeddings
-    db.reassign_embeddings(&source_id, &target_id)?;
-    // Move samples
-    if replace_embeddings {
-        db.delete_samples(&target_id)?;
-    }
-    db.reassign_samples(&source_id, &target_id)?;
-    // Update segments
-    db.reassign_segments(&source_id, &target_id)?;
-    // Delete source speaker
-    db.delete_speaker(&source_id)?;
     Ok(())
 }
 
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, MenuId::new("open"), "Open", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, MenuId::new("open"), "Open Recall", true, None::<&str>)?;
     let start = MenuItem::with_id(
         app,
         MenuId::new("start"),
@@ -953,7 +1226,6 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, MenuId::new("quit"), "Quit", true, None::<&str>)?;
-
     let menu = MenuBuilder::new(app)
         .item(&open)
         .separator()
@@ -962,55 +1234,75 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
         .separator()
         .item(&quit)
         .build()?;
-
-    // Simple solid icon (1x1 RGBA).
     let icon = Image::new(&[30, 60, 120, 255], 1, 1);
-
     TrayIconBuilder::new()
         .icon(icon)
         .menu(&menu)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
             "start" => {
-                let _ = app.emit("recording:start", ());
+                let manager = app.state::<RecordingManager>();
+                let state = app.state::<AppState>();
+                if let Err(error) = start_recording_impl(&manager, &state, app.clone(), None) {
+                    let _ = app.emit("recording:error", error);
+                }
             }
             "stop" => {
-                let _ = app.emit("recording:stop", ());
+                let manager = app.state::<RecordingManager>();
+                match manager.stop() {
+                    Ok(path) => {
+                        let path = path.to_string_lossy().to_string();
+                        let _ = app.emit("recording:stopped", path.clone());
+                        let state = app.state::<AppState>().inner().clone();
+                        let run_id = queue_transcription(path, state, app.clone());
+                        let _ = app.emit("transcription:queued", run_id);
+                    }
+                    Err(error) => {
+                        let _ = app.emit("recording:error", error);
+                    }
+                }
             }
             "quit" => std::process::exit(0),
             _ => {}
         })
         .build(app)?;
-
     Ok(())
 }
 
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-        start_recording,
-        stop_recording,
-        transcribe_file,
-        transcribe_file_async,
-        get_progress,
-        unlock_db,
-        enable_encryption,
-        app_status,
-        list_sessions,
-        list_segments,
+            list_input_devices,
+            start_recording,
+            stop_recording,
+            transcribe_file_async,
+            get_progress,
+            save_soniox_key,
+            delete_soniox_key,
+            soniox_key_status,
+            get_preferences,
+            save_preferences,
+            unlock_db,
+            enable_encryption,
+            app_status,
+            list_sessions,
+            list_segments,
             update_transcript,
+            update_session_title,
+            update_segment_text,
+            assign_segment_speaker,
             delete_session,
             list_speakers,
             list_speakers_with_stats,
             rename_speaker,
             delete_speaker,
             get_speaker_samples,
-            merge_speakers
+            merge_speakers,
         ])
         .manage(RecordingManager::default())
         .setup(|app| {
@@ -1019,18 +1311,84 @@ fn main() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir().join("recall"));
             std::fs::create_dir_all(&data_dir).ok();
-            let app_state = AppState::new(data_dir);
+            let resource_model = app
+                .path()
+                .resolve("models/spkrec-ecapa-voxceleb.onnx", BaseDirectory::Resource)
+                .ok()
+                .filter(|path| path.is_file());
+            let development_model = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../models/spkrec-ecapa-voxceleb.onnx");
+            let model_path = resource_model.unwrap_or(development_model);
+            let app_state = AppState::new(data_dir, model_path);
             {
-                let cfg = app_state.config.lock().unwrap().clone();
-                if !cfg.encryption_enabled {
+                let config = app_state.config.lock().unwrap().clone();
+                if !config.encryption_enabled {
                     let _ = app_state.open_db(Crypto::new(None, None));
                 }
             }
             app.manage(app_state);
-
             build_tray(app)?;
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running Recall");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adjacent_interventions_from_same_speaker_are_merged() {
+        let segments = vec![
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 0,
+                end_ms: 500,
+                text: "Hello".into(),
+            },
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 600,
+                end_ms: 900,
+                text: "again".into(),
+            },
+            TranscriptSegment {
+                speaker: "speaker_2".into(),
+                start_ms: 1_000,
+                end_ms: 1_200,
+                text: "Hi".into(),
+            },
+        ];
+        let merged = merge_segments(&segments);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].text, "Hello again");
+    }
+
+    #[test]
+    fn match_requires_threshold_and_margin() {
+        let known = vec![
+            StoredEmbedding {
+                id: "e1".into(),
+                speaker_id: "s1".into(),
+                speaker_label: Some("Alice".into()),
+                vector: vec![1.0, 0.0],
+                source_session_id: "x".into(),
+                created_at: chrono::Utc::now(),
+                model_version: EMBEDDING_VERSION.into(),
+            },
+            StoredEmbedding {
+                id: "e2".into(),
+                speaker_id: "s2".into(),
+                speaker_label: Some("Bob".into()),
+                vector: vec![0.0, 1.0],
+                source_session_id: "x".into(),
+                created_at: chrono::Utc::now(),
+                model_version: EMBEDDING_VERSION.into(),
+            },
+        ];
+        let matched = best_speaker_match(&[1.0, 0.0], &known).unwrap();
+        assert_eq!(matched.0, "s1");
+        assert!(best_speaker_match(&[0.71, 0.70], &known).is_none());
+    }
 }

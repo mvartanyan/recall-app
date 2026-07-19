@@ -8,11 +8,12 @@ license = "MIT OR Apache-2.0"
 tauri = { version = "2.5.2", features = ["tray-icon"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
 cpal = { version = "0.15", features = ["jack"] }
 hound = "3.5"
-tempfile = "3.10"
 reqwest = { version = "0.11", features = ["json", "multipart", "blocking"] }
+tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
 rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -21,10 +22,9 @@ argon2 = "0.5"
 rand = "0.8"
 zeroize = "1.7"
 base64 = "0.22"
-serde_with = "3.11.0"
-ndarray = "0.15"
-ort = { version = "2.0.0-rc.10", features = ["download-binaries"] }
 bytemuck = { version = "1.15", features = ["derive"] }
+sherpa-onnx = "1.13.4"
+keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
 
 [build-dependencies]
 tauri-build = { version = "2.5.2", features = [] }

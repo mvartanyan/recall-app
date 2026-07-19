@@ -4,9 +4,6 @@
   "version": "0.1.0",
   "identifier": "com.example.recall",
   "build": {
-    "beforeDevCommand": "",
-    "beforeBuildCommand": "",
-    "devUrl": "http://localhost:1420",
     "frontendDist": "../src"
   },
   "app": {
@@ -14,8 +11,11 @@
     "windows": [
       {
         "title": "Recall",
-        "width": 900,
-        "height": 600,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 620,
+        "center": true,
         "resizable": true
       }
     ],
@@ -25,10 +25,12 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "../models/spkrec-ecapa-voxceleb.onnx": "models/spkrec-ecapa-voxceleb.onnx"
+    },
     "macOS": {
       "frameworks": [],
       "minimumSystemVersion": "10.13",
-      "exceptionDomain": "localhost",
       "infoPlist": "<key>NSMicrophoneUsageDescription</key><string>Recall needs microphone access to record audio.</string>"
     }
   }

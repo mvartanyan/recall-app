@@ -1,12 +1,27 @@
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
 use std::{fs, path::PathBuf};
 
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
-    pub api_base: Option<String>,
     pub encryption_enabled: bool,
+    pub selected_input_device: Option<String>,
+    pub language_hints: Vec<String>,
+    pub live_transcription: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            encryption_enabled: false,
+            selected_input_device: None,
+            language_hints: vec!["en", "fr", "de", "es", "ru"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            live_transcription: true,
+        }
+    }
 }
 
 impl AppConfig {
