@@ -2104,8 +2104,9 @@ async function saveSonioxKey() {
     await invoke("save_soniox_key", { apiKey });
     elements.sonioxKey.value = "";
     setServiceStatus(true);
-    elements.settingsFeedback.textContent = "Key saved locally; no Keychain prompt is required.";
-    addActivity("Soniox API key saved in Recall's local user-only file", "success");
+    elements.settingsFeedback.textContent =
+      "Soniox key saved. Recall will reuse it without a Keychain prompt.";
+    addActivity("Soniox API key saved locally", "success");
   } catch (error) {
     const message = errorText(error);
     elements.settingsFeedback.textContent = message;
@@ -2147,8 +2148,8 @@ async function saveOpenAIKey() {
     await invoke("save_openai_key", { apiKey });
     elements.openaiKey.value = "";
     setOpenAIStatus(true);
-    elements.settingsFeedback.textContent = "OpenAI key saved in Recall's local user-only file.";
-    addActivity("OpenAI API key saved in Recall's local user-only file", "success");
+    elements.settingsFeedback.textContent = "OpenAI key saved locally.";
+    addActivity("OpenAI API key saved locally", "success");
   } catch (error) {
     const message = errorText(error);
     elements.settingsFeedback.textContent = message;

@@ -208,28 +208,28 @@
         <img src="recall-icon.png" alt="" aria-hidden="true" />
         <div>
           <span class="eyebrow">Welcome to Recall</span>
-          <h2 id="onboardingTitle">Own your meeting memory.</h2>
-          <p>Recall is an open-source alternative to meeting-note services with substantial recurring subscriptions. Recall charges no subscription: you bring provider keys and pay the providers directly for the processing you use.</p>
+          <h2 id="onboardingTitle">Meeting transcripts, stored on your Mac.</h2>
+          <p>Recall is an open-source alternative to subscription meeting tools. It records meetings, shows live captions, and keeps the finished transcript locally. Recall has no subscription fee. Soniox bills you for transcription. OpenAI bills you for recaps if you choose to use them.</p>
         </div>
       </div>
 
       <div class="onboarding-scroll">
         <div class="onboarding-principles" aria-label="Recall principles">
-          <span>Local SQLite archive</span>
+          <span>Local conversation archive</span>
           <span>Local voice profiles</span>
-          <span>No Recall cloud</span>
+          <span>Open-source code</span>
         </div>
 
-        <p class="onboarding-choice-note"><strong>Only need transcription?</strong> Soniox is sufficient for live captions and the final diarized transcript. OpenAI is optional and is used only when you explicitly request meeting summaries and a recap.</p>
+        <p class="onboarding-choice-note"><strong>Transcription:</strong> Soniox provides live captions and the final speaker-separated transcript. OpenAI is optional. Recall contacts OpenAI when you choose <strong>Recap</strong>.</p>
 
-        <p class="onboarding-cost-note">For many people, direct usage costs can be far below a meeting-tool subscription. Your actual cost depends on how much you use Recall and on current provider pricing.</p>
+        <p class="onboarding-cost-note">Provider charges depend on usage and current pricing. Recall adds no fee.</p>
 
         <div class="provider-grid">
           <section class="provider-card">
             <div class="provider-card-heading">
               <div>
                 <span class="eyebrow">Required for transcription</span>
-                <h3>1. Connect Soniox</h3>
+                <h3>Connect Soniox</h3>
               </div>
               <span class="provider-role">Speech</span>
             </div>
@@ -237,7 +237,7 @@
               <li>Create an account or sign in to the Soniox Console.</li>
               <li>Open <strong>My First Project → API Keys</strong> and generate a key.</li>
               <li>Add prepaid balance or automatic top-up if your account requires it.</li>
-              <li>Paste the key into Recall Settings. It stays in a local user-only file.</li>
+              <li>Paste the key into Recall Settings. Recall stores it in a file readable only by your macOS user account.</li>
             </ol>
             <button class="secondary-button external-link-button" type="button" data-external-url="https://console.soniox.com">Open Soniox Console ↗</button>
           </section>
@@ -246,7 +246,7 @@
             <div class="provider-card-heading">
               <div>
                 <span class="eyebrow">Optional for recaps</span>
-                <h3>2. Connect OpenAI</h3>
+                <h3>Connect OpenAI</h3>
               </div>
               <span class="provider-role">Summaries</span>
             </div>
@@ -254,7 +254,7 @@
               <li>Create or sign in to an OpenAI API Platform account.</li>
               <li>Add API billing or credits. ChatGPT subscriptions and API billing are separate.</li>
               <li>Create a secret key on the API Keys page and paste it into Recall Settings.</li>
-              <li>OpenAI is called only when you explicitly choose <strong>Recap</strong>.</li>
+              <li>Recall contacts OpenAI when you choose <strong>Recap</strong>.</li>
             </ol>
             <div class="provider-links">
               <button class="secondary-button external-link-button" type="button" data-external-url="https://platform.openai.com/api-keys">Open API keys ↗</button>
@@ -265,14 +265,14 @@
 
         <section class="onboarding-fork-note">
           <div>
-            <span class="eyebrow">Opinionated by default, forkable by design</span>
-            <h3>Soniox + OpenAI is the official path—not a lock-in.</h3>
+            <span class="eyebrow">Provider support</span>
+            <h3>The maintained app uses Soniox and OpenAI.</h3>
           </div>
-          <p>Recall intentionally avoids a provider-picker maze. If you prefer Whisper, Deepgram, Anthropic, a local model, or something else, fork the repository and replace the focused provider module while keeping the desktop interface, local archive, and voice library.</p>
+          <p>If you prefer Whisper, Deepgram, Anthropic, or a local model, the relevant native provider module can be replaced in a fork. The desktop interface, local archive, and voice library can remain unchanged.</p>
           <button class="text-button external-link-button" type="button" data-external-url="https://github.com/mvartanyan/recall-app">View the source ↗</button>
         </section>
 
-        <p class="onboarding-browser-note">Account links open official provider pages in your default browser. Conversations and speaker identities remain in Recall's local database; because the project is open source, you can inspect, back up, migrate, and modify how they are stored.</p>
+        <p class="onboarding-browser-note">These buttons open official provider pages in your default browser. Recall stores conversations and speaker identities in its local database. The source and storage format are available for inspection, backup, migration, and modification.</p>
       </div>
 
       <div class="modal-footer onboarding-footer">
@@ -328,7 +328,7 @@
           <div class="setting-title-row">
             <div>
               <h3>Soniox API key</h3>
-              <p>Bring your own key. Recall stores it in a local user-only file and reuses it without macOS Keychain password prompts.</p>
+              <p>Recall stores the key in a file readable only by your macOS user account. The app reuses it without Keychain prompts.</p>
             </div>
             <span id="keyStatus" class="service-badge warning" hidden>Not configured</span>
           </div>
@@ -344,7 +344,7 @@
           <div class="setting-title-row">
             <div>
               <h3>OpenAI API key (optional)</h3>
-              <p>Not needed for transcription. Used only when you explicitly click Recap. Recall sends the finalized transcript and optional agenda directly to OpenAI with <code>store: false</code>. This disables API response storage but is not, by itself, a Zero Data Retention guarantee.</p>
+              <p>OpenAI is optional and used for Recap requests. Recall sends the finalized transcript and optional agenda with <code>store: false</code>. OpenAI account-level data controls and retention terms still apply.</p>
             </div>
             <span id="openaiKeyStatus" class="service-badge warning" hidden>Not configured</span>
           </div>
@@ -356,7 +356,7 @@
           </div>
           <label class="field-label model-field" for="openaiModel">Model</label>
           <input id="openaiModel" type="text" value="gpt-5.6-terra" spellcheck="false" />
-          <p class="field-help">Editable so you can use a model available to your OpenAI project. Existing recaps remain readable if the key is removed.</p>
+          <p class="field-help">Enter any model available to your OpenAI project. Saved recaps remain readable after the key is removed.</p>
         </section>
 
         <section class="settings-section">

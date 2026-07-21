@@ -35,6 +35,7 @@ const licenseApache = fs.readFileSync(
   "utf8",
 );
 const packageJson = fs.readFileSync(new URL("../package.json", import.meta.url), "utf8");
+const appReadme = fs.readFileSync(new URL("../README.md", import.meta.url), "utf8");
 const packageMacScript = fs.readFileSync(
   new URL("../scripts/package_macos_local.sh", import.meta.url),
   "utf8",
@@ -146,12 +147,13 @@ test("the project publishes permissive source licenses without relicensing the m
 
 test("first launch explains provider setup and remains reopenable", () => {
   assert.match(html, /id="onboardingDialog"/);
-  assert.match(html, /Own your meeting memory/);
-  assert.match(html, /Opinionated by default, forkable by design/);
-  assert.match(html, /Soniox is sufficient for live captions and the final diarized transcript/);
-  assert.match(html, /OpenAI is optional and is used only when you explicitly request/);
+  assert.match(html, /Meeting transcripts, stored on your Mac/);
+  assert.match(html, /Provider support/);
+  assert.match(html, /Soniox provides live captions and the final speaker-separated transcript/);
+  assert.match(html, /OpenAI is optional/);
+  assert.match(html, /Recall contacts OpenAI when you choose/);
   assert.match(html, /OpenAI API key \(optional\)/);
-  assert.match(html, /Not needed for transcription/);
+  assert.match(html, /OpenAI account-level data controls and retention terms still apply/);
   assert.match(html, /id="gettingStartedButton"/);
   assert.match(javascript, /shouldShowOnboarding/);
   assert.match(javascript, /scheduleInitialSetupPrompt/);
@@ -160,6 +162,21 @@ test("first launch explains provider setup and remains reopenable", () => {
   assert.match(javascript, /open_external_url/);
   assert.match(rustMain, /const ALLOWED_EXTERNAL_URLS/);
   assert.match(rustMain, /fn is_allowed_external_url/);
+});
+
+test("public copy avoids discarded slogans and staged contrasts", () => {
+  const publicCopy = `${html}\n${appReadme}`;
+  for (const expression of [
+    /This is deliberate/i,
+    /not a lock-in/i,
+    /Opinionated by default/i,
+    /forkable by design/i,
+    /provider-picker maze/i,
+    /least-common-denominator/i,
+    /Own your meeting memory/i,
+  ]) {
+    assert.doesNotMatch(publicCopy, expression);
+  }
 });
 
 test("live captions have event delivery plus a native polling fallback", () => {
@@ -252,12 +269,12 @@ test("speaker matching requires trusted names and unique meeting claims", () => 
   assert.match(rustMain, /if is_new \{\s*db\.insert_embedding/);
 });
 
-test("the Soniox key uses a local user-only file instead of Keychain", () => {
+test("the Soniox key stays in a local user-only file", () => {
   assert.match(rustCredentials, /SONIOX_KEY_FILENAME.*soniox-api-key/);
   assert.match(rustCredentials, /from_mode\(0o600\)/);
   assert.doesNotMatch(cargoToml, /^keyring\s*=/m);
-  assert.match(html, /local user-only file/);
-  assert.match(javascript, /no Keychain prompt is required/);
+  assert.match(html, /file readable only by your macOS user account/);
+  assert.match(javascript, /Recall will reuse it without a Keychain prompt/);
 });
 
 test("OpenAI recaps are explicit native Responses API calls with strict stateless output", () => {
@@ -280,7 +297,7 @@ test("OpenAI credentials are local user-only data and never returned to JavaScri
   assert.match(rustCredentials, /save_openai_api_key/);
   assert.match(rustCredentials, /from_mode\(0o600\)/);
   assert.doesNotMatch(javascript, /load_openai_key|OPENAI_API_KEY/);
-  assert.match(html, /Zero Data Retention guarantee/);
+  assert.match(html, /OpenAI account-level data controls and retention terms still apply/);
 });
 
 test("recaps and original agenda files use encrypted-capable local persistence", () => {

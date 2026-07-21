@@ -1,37 +1,35 @@
 # Recall
 
-**A local-first, open-source meeting memory for macOS.**
+**A local-first, open-source meeting recorder for macOS.**
 
-Recall records meetings, shows live captions, produces a final diarized transcript, identifies recurring voices with a local voice database, and can generate an on-demand meeting recap. It is intended as an open-source alternative to meeting-note and summarization products with substantial recurring subscription fees.
+Recall records meetings, shows live captions, creates a speaker-separated final transcript, and uses a local voice database to recognize people across meetings. OpenAI can prepare a recap when requested.
 
-Recall itself has no subscription and no hosted Recall account. You bring API keys and pay the providers directly for the processing you use. For many people, those usage-based charges can be far below another monthly meeting-tool subscription, although actual cost depends on usage and current provider pricing. Conversations, participant names, agendas, recaps, and voice profiles remain in a local SQLite archive whose format and implementation you control.
+Recall is an open-source alternative to subscription meeting tools. The app has no subscription fee or hosted account. Users supply their own API keys and pay each provider according to use. Conversations, participant names, agendas, recaps, and voice profiles are stored in a local SQLite archive.
 
-## Opinionated by default, forkable by design
+## Supported providers
 
-The official Recall build supports exactly two cloud providers:
+The maintained Recall app supports two cloud providers:
 
 - [Soniox](https://soniox.com/) for live and final speech-to-text, language identification, and within-meeting diarization.
-- [OpenAI](https://platform.openai.com/) for optional recaps that run only when the user explicitly requests one.
+- [OpenAI](https://platform.openai.com/) for optional recaps requested by the user.
 
-This is deliberate. Recall avoids making every user navigate a provider matrix or making its main interface the least-common-denominator of many APIs. Soniox plus OpenAI is the maintained, tested path.
-
-It is also not a lock-in. Fork the repository if you want Whisper, Deepgram, Anthropic, a local model, or another provider. Provider-specific transport and response handling are concentrated in [`src-tauri/src/soniox.rs`](src-tauri/src/soniox.rs) and [`src-tauri/src/openai.rs`](src-tauri/src/openai.rs); the local database, recording flow, voice library, and desktop interface remain reusable. A replacement still needs to map its provider's events and output into Recall's existing transcript or recap contracts and update the corresponding tests, but it does not require rebuilding the product around a web backend or plugin framework.
+Support for another provider can be added in a fork. Provider-specific transport and response handling live in [`src-tauri/src/soniox.rs`](src-tauri/src/soniox.rs) and [`src-tauri/src/openai.rs`](src-tauri/src/openai.rs). The local database, recording flow, voice library, and desktop interface can remain unchanged. A replacement needs to map its events and output into Recall's transcript or recap contracts and update the related tests.
 
 Recall-owned source is available under your choice of the [MIT License](LICENSE-MIT) or [Apache License 2.0](LICENSE-APACHE). Third-party dependencies and the bundled voice model retain their own terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## The privacy and cost model
+## Data and provider charges
 
 The active app is standalone:
 
-- It connects directly to Soniox with the user's own API key.
+- It connects directly to Soniox with the user's API key.
 - The key is stored in a local user-only file with `0600` permissions so it can
   be reused without recurring macOS Keychain password prompts.
-- It does not require FastAPI, Uvicorn, Azure, Blob Storage, or a localhost service.
+- The desktop app runs without FastAPI, Uvicorn, Azure, Blob Storage, or a localhost service.
 - Conversations, transcript interventions, speaker names, and voiceprints stay in local SQLite.
 - Temporary raw audio is deleted after final transcription and local voiceprint extraction.
-- OpenAI is optional and receives transcript/agenda content only when the user explicitly chooses **Recap**.
+- OpenAI is optional. Recall sends transcript and agenda content to it when the user chooses **Recap**.
 
-Recall is local-first, not offline-only: audio is sent directly to Soniox for transcription, and finalized meeting material is sent directly to OpenAI only for an explicit recap. There is no Recall cloud in between.
+Recall stores its archive locally. During transcription, it sends audio directly to Soniox. When the user chooses **Recap**, it sends the finalized meeting material directly to OpenAI. Recall has no hosted service between the app and these providers. Recall adds no fee; provider charges depend on usage and current pricing.
 
 ## Current capabilities
 
@@ -80,7 +78,7 @@ Recall is local-first, not offline-only: audio is sent directly to Soniox for tr
   and shows **Jump to latest** until the user resumes following.
 - Sort people by when they were last heard and mark which profiles occur in the
   selected conversation; older profiles without a current ECAPA vector are
-  labelled explicitly rather than appearing newly detected.
+  labelled as historical profiles.
 - Start or stop recording from the macOS menu-bar item.
 - Attach or paste an agenda at any time after a conversation exists. PDF,
   DOC/DOCX, RTF, ODT, text/Markdown, HTML/XML, PowerPoint, and spreadsheet files
@@ -97,8 +95,8 @@ Recall is local-first, not offline-only: audio is sent directly to Soniox for tr
 - Let the editable meeting title use all header space before the action buttons,
   wrap without a hard line limit, and grow the header naturally. OpenAI receives
   a soft instruction to keep generated titles within two normal desktop lines.
-- Keep summary/action evidence IDs as internal factuality metadata rather than
-  displaying them as links in generated views or clipboard exports.
+- Keep summary/action evidence IDs as internal factuality metadata. Generated
+  views and clipboard exports omit them.
 - Copy the transcript or generated material as plain text or Markdown.
 - Mark a recap stale after transcript, speaker, agenda, or translation-policy
   changes; hide stale inline translations and preserve the last good recap
@@ -110,7 +108,7 @@ Recall never generates a recap automatically.
 
 Recall opens a getting-started guide the first time it launches. The guide explains the two provider roles, links only to official account pages, and can be reopened later from **Settings → Getting started**.
 
-Soniox alone is sufficient for live captions and the final diarized transcript. OpenAI is optional and is used only for on-demand summaries and recaps.
+Soniox provides live captions and the final speaker-separated transcript. OpenAI is optional. Recall contacts OpenAI for summaries and recaps when the user chooses **Recap**.
 
 To configure transcription:
 
@@ -294,7 +292,7 @@ already exists.
 
 ## Voice identification design
 
-Soniox diarization answers “who spoke when in this recording” but does not provide a persistent cross-meeting identity. Recall handles persistent identity locally:
+Soniox assigns speaker labels within a recording. Recall handles persistent identity across meetings locally:
 
 1. Final Soniox tokens are grouped into contiguous speaker interventions.
 2. Up to about 12 seconds of audio is gathered for each diarized speaker.
@@ -312,10 +310,10 @@ Soniox diarization answers “who spoke when in this recording” but does not p
    Only naming or explicitly assigning a provisional profile expands the
    reference library.
 
-These rules deliberately optimize for precision: duplicate `VOICE<n>` profiles
-are preferable to silently attributing words to the wrong person. The user can
-preview and name a voice or assign a duplicate while choosing whether to
-preserve or replace the prior reference pattern.
+These rules favor precision. A duplicate `VOICE<n>` profile is safer than an
+incorrect automatic identity. The user can preview and name a voice or assign
+a duplicate while choosing whether to preserve or replace the prior reference
+pattern.
 
 The current pipeline version is `wespeaker-ecapa512-lm-v2`. Embeddings from the
 replaced v1 model are preserved but ignored. The database now distinguishes
