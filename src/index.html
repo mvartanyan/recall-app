@@ -10,7 +10,7 @@
     <div class="app-shell">
       <aside class="sidebar">
         <div class="brand-row">
-          <div class="brand-mark" aria-hidden="true">R</div>
+          <img class="brand-mark" src="recall-icon.png" alt="" aria-hidden="true" />
           <div>
             <h1>Recall</h1>
             <p>Private meeting memory</p>
@@ -31,6 +31,12 @@
             <span aria-hidden="true">⌕</span>
             <input id="conversationSearch" type="search" placeholder="Search conversations" autocomplete="off" />
           </label>
+          <label class="conversation-filter">
+            <span>Voice</span>
+            <select id="conversationSpeakerFilter" aria-label="Filter conversations by voice">
+              <option value="">All voices</option>
+            </select>
+          </label>
           <div id="sessionsList" class="sessions-list" aria-live="polite"></div>
         </div>
 
@@ -50,11 +56,14 @@
       <main class="workspace">
         <header class="topbar">
           <div class="topbar-copy">
-            <input id="conversationTitle" class="conversation-title" value="New conversation" aria-label="Conversation title" disabled />
+            <textarea id="conversationTitle" class="conversation-title" rows="1" aria-label="Conversation title" disabled>New conversation</textarea>
             <div id="conversationMeta" class="conversation-meta">Record a conversation to begin</div>
           </div>
           <div class="topbar-actions">
-            <span id="serviceBadge" class="service-badge warning">Soniox key needed</span>
+            <button id="agendaButton" class="secondary-button compact-action" type="button" hidden>Add agenda</button>
+            <button id="recapButton" class="primary-button compact-action" type="button" hidden>Recap</button>
+            <span id="serviceBadge" class="service-badge warning" hidden>Soniox key needed</span>
+            <span id="openaiServiceBadge" class="service-badge warning" hidden>OpenAI key needed</span>
             <button id="deleteSessionButton" class="icon-button danger" type="button" title="Delete conversation" aria-label="Delete conversation" hidden>⌫</button>
           </div>
         </header>
@@ -73,20 +82,25 @@
           <button id="stopButton" class="stop-button" type="button">Stop &amp; process</button>
         </section>
 
-        <section id="livePanel" class="live-panel" hidden>
-          <div class="content-heading">
-            <div>
-              <span class="eyebrow">Live transcription</span>
-              <h2 id="liveStatus">Connecting…</h2>
-            </div>
-            <span class="live-pill">LIVE</span>
-          </div>
-          <pre id="liveTranscript" class="live-transcript">Listening…</pre>
-          <p class="supporting-copy">Live captions are provisional. Recall replaces them with Soniox’s higher-quality final diarized transcript after you stop.</p>
-        </section>
-
         <div class="content-grid">
           <section class="transcript-pane">
+            <section id="livePanel" class="live-panel mode-surface" hidden aria-live="polite">
+              <div class="content-heading">
+                <div>
+                  <span class="eyebrow">Current recording</span>
+                  <h2 id="liveStatus">Connecting live captions…</h2>
+                </div>
+                <span class="live-pill">LIVE</span>
+              </div>
+              <div class="live-transcript-frame">
+                <pre id="liveTranscript" class="live-transcript">Listening…</pre>
+                <button id="jumpToLiveButton" class="jump-to-live" type="button" hidden>
+                  Jump to latest ↓
+                </button>
+              </div>
+              <p class="supporting-copy">Live captions are provisional. The final diarized transcript replaces them after processing.</p>
+            </section>
+
             <div id="emptyState" class="empty-state">
               <div class="empty-icon" aria-hidden="true">◉</div>
               <h2>Your conversations will appear here</h2>
@@ -94,36 +108,81 @@
               <button id="emptyRecordButton" class="primary-button" type="button">Start a recording</button>
             </div>
 
-            <div id="processingState" class="processing-state" hidden>
+            <div id="processingState" class="processing-state mode-surface" role="status" aria-live="polite" hidden>
               <div class="spinner" aria-hidden="true"></div>
-              <div>
+              <div class="processing-copy">
+                <span class="eyebrow">Final transcript</span>
                 <strong id="processingTitle">Processing recording</strong>
                 <p id="processingDetail">Preparing final transcription…</p>
               </div>
+              <p class="processing-note">You can start another recording while this continues in the background.</p>
             </div>
 
             <div id="transcriptContent" hidden>
-              <div class="content-heading transcript-heading">
+              <div id="recapStaleBanner" class="recap-stale-banner" hidden>
                 <div>
-                  <span class="eyebrow">Transcript</span>
-                  <h2>Conversation</h2>
+                  <strong>This recap is out of date.</strong>
+                  <span>The transcript, participants, agenda, or translation policy changed after it was generated.</span>
                 </div>
-                <span id="saveState" class="save-state">Saved locally</span>
+                <button id="staleRegenerateButton" class="secondary-button compact-action" type="button">Regenerate</button>
               </div>
-              <div id="segmentsList" class="segments-list"></div>
-              <div id="legacyTranscript" class="legacy-transcript" hidden></div>
+
+              <nav id="recapTabs" class="recap-tabs" role="tablist" aria-label="Conversation content">
+                <button id="transcriptTab" class="recap-tab selected" type="button" role="tab" aria-selected="true" data-recap-tab="transcript">Transcript</button>
+                <button id="executiveTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="executive" hidden>Executive summary</button>
+                <button id="fullSummaryTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="full" hidden>Full summary</button>
+                <button id="actionsTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="actions" hidden>Actions</button>
+                <button id="agendaCoverageTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="agenda" hidden>Agenda coverage</button>
+              </nav>
+
+              <section id="transcriptTabPanel" class="recap-tab-panel" role="tabpanel">
+                <div class="content-heading transcript-heading">
+                  <div>
+                    <span class="eyebrow">Transcript</span>
+                    <h2>Conversation</h2>
+                  </div>
+                  <div class="panel-actions">
+                    <span id="saveState" class="save-state">Saved locally</span>
+                    <button id="copyTranscriptText" class="text-button" type="button">Copy text</button>
+                    <button id="copyTranscriptMarkdown" class="text-button" type="button">Copy Markdown</button>
+                  </div>
+                </div>
+                <div id="segmentsList" class="segments-list"></div>
+                <div id="legacyTranscript" class="legacy-transcript" hidden></div>
+              </section>
+
+              <section id="generatedTabPanel" class="recap-tab-panel generated-panel" role="tabpanel" hidden>
+                <div class="content-heading transcript-heading generated-heading">
+                  <div>
+                    <span id="generatedEyebrow" class="eyebrow">Recap</span>
+                    <h2 id="generatedTitle">Executive summary</h2>
+                  </div>
+                  <div class="panel-actions generated-actions">
+                    <div id="generatedLanguageToggle" class="language-toggle" role="group" aria-label="Summary language">
+                      <button id="showOriginalButton" class="selected" type="button">Original</button>
+                      <button id="showEnglishButton" type="button">English</button>
+                    </div>
+                    <button id="copyGeneratedText" class="text-button" type="button">Copy text</button>
+                    <button id="copyGeneratedMarkdown" class="text-button" type="button">Copy Markdown</button>
+                  </div>
+                </div>
+                <div id="generatedContent" class="generated-content"></div>
+              </section>
             </div>
           </section>
 
           <aside class="people-pane">
             <div class="content-heading people-heading">
               <div>
-                <span class="eyebrow">Voice database</span>
-                <h2>People</h2>
+                <span class="eyebrow">Selected conversation</span>
+                <h2>Voices</h2>
               </div>
-              <button id="refreshSpeakers" class="icon-button" type="button" title="Refresh people" aria-label="Refresh people">↻</button>
+              <div class="people-heading-actions">
+                <button id="voiceLibraryButton" class="text-button" type="button">Voice Library</button>
+                <button id="refreshSpeakers" class="icon-button" type="button" title="Refresh voices" aria-label="Refresh voices">↻</button>
+              </div>
             </div>
-            <p class="supporting-copy people-help">New voices stay as VOICE numbers until you name or assign them. Voice samples are deleted after naming.</p>
+            <p class="supporting-copy people-help">Only voices attributed in this conversation appear here. Identified people and new VOICE profiles can both be reviewed or corrected.</p>
             <div id="speakersList" class="speakers-list"></div>
           </aside>
         </div>
@@ -144,6 +203,36 @@
       <div id="activityLog" class="activity-log" role="log" aria-live="polite"></div>
     </aside>
 
+    <dialog id="voiceLibraryDialog" class="modal voice-library-modal">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow">Voice database</span>
+          <h2>Voice Library</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog="voiceLibraryDialog" aria-label="Close Voice Library">×</button>
+      </div>
+      <div class="voice-library-body">
+        <p class="supporting-copy voice-library-help"><strong>Manage everyone Recall has heard.</strong> Name new VOICE profiles, assign them to an existing person, preview retained excerpts, or remove profiles you no longer need. Only named people are eligible for automatic recognition, and named people used by conversation history are protected from deletion.</p>
+        <div id="voiceLibraryList" class="speakers-list voice-library-list"></div>
+      </div>
+    </dialog>
+
+    <div id="confirmationDialog" class="confirmation-overlay" role="alertdialog" aria-modal="true" aria-labelledby="confirmationTitle" hidden>
+      <form id="confirmationForm" class="modal compact-modal confirmation-card">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow danger-eyebrow">Confirm action</span>
+            <h2 id="confirmationTitle">Delete item?</h2>
+          </div>
+        </div>
+        <p id="confirmationMessage" class="confirmation-message"></p>
+        <div class="modal-footer">
+          <button id="confirmationCancel" class="text-button" type="button">Cancel</button>
+          <button id="confirmationAccept" class="danger-button" type="submit">Delete</button>
+        </div>
+      </form>
+    </div>
+
     <dialog id="settingsDialog" class="modal settings-modal">
       <form id="settingsForm" method="dialog">
         <div class="modal-header">
@@ -158,9 +247,9 @@
           <div class="setting-title-row">
             <div>
               <h3>Soniox API key</h3>
-              <p>Bring your own key. Recall stores it in macOS Keychain, never in the app database.</p>
+              <p>Bring your own key. Recall stores it in a local user-only file and reuses it without macOS Keychain password prompts.</p>
             </div>
-            <span id="keyStatus" class="service-badge warning">Not configured</span>
+            <span id="keyStatus" class="service-badge warning" hidden>Not configured</span>
           </div>
           <label class="field-label" for="sonioxKey">New or replacement key</label>
           <div class="key-row">
@@ -171,17 +260,41 @@
         </section>
 
         <section class="settings-section">
+          <div class="setting-title-row">
+            <div>
+              <h3>OpenAI API key</h3>
+              <p>Used only when you explicitly click Recap. Recall sends the finalized transcript and optional agenda directly to OpenAI with <code>store: false</code>. This disables API response storage but is not, by itself, a Zero Data Retention guarantee.</p>
+            </div>
+            <span id="openaiKeyStatus" class="service-badge warning" hidden>Not configured</span>
+          </div>
+          <label class="field-label" for="openaiKey">New or replacement key</label>
+          <div class="key-row">
+            <input id="openaiKey" type="password" placeholder="Paste an OpenAI API key" autocomplete="off" spellcheck="false" />
+            <button id="saveOpenAIKeyButton" class="secondary-button" type="button">Save key</button>
+            <button id="deleteOpenAIKeyButton" class="text-button danger-text" type="button">Remove</button>
+          </div>
+          <label class="field-label model-field" for="openaiModel">Model</label>
+          <input id="openaiModel" type="text" value="gpt-5.6-terra" spellcheck="false" />
+          <p class="field-help">Editable so you can use a model available to your OpenAI project. Existing recaps remain readable if the key is removed.</p>
+        </section>
+
+        <section class="settings-section">
           <h3>Audio input</h3>
           <label class="field-label" for="inputDevice">Recording source</label>
           <select id="inputDevice"></select>
           <p class="field-help">Choose your microphone, or a virtual/aggregate input such as BlackHole to capture meeting audio. Native macOS system-audio capture is not implemented yet.</p>
         </section>
 
-        <section class="settings-section settings-grid">
+        <section class="settings-section settings-grid recap-settings-grid">
           <div>
             <label class="field-label" for="languageHints">Likely languages</label>
             <input id="languageHints" type="text" placeholder="en, fr, de, es, ru" />
             <p class="field-help">Comma-separated hints improve recognition without preventing code-switching.</p>
+          </div>
+          <div>
+            <label class="field-label" for="noTranslationLanguages">No translation for languages</label>
+            <input id="noTranslationLanguages" type="text" placeholder="e.g. de, fr" />
+            <p class="field-help">Base language codes. English is always left untranslated and does not need to be listed.</p>
           </div>
           <label class="toggle-row">
             <span>
@@ -200,22 +313,78 @@
       </form>
     </dialog>
 
+    <dialog id="agendaDialog" class="modal agenda-modal">
+      <form id="agendaForm">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Meeting context</span>
+            <h2>Agenda</h2>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog="agendaDialog" aria-label="Close agenda">×</button>
+        </div>
+        <div class="agenda-body">
+          <div id="agendaCurrent" class="agenda-current">No agenda attached.</div>
+          <label class="field-label" for="agendaText">Paste agenda text</label>
+          <textarea id="agendaText" rows="9" placeholder="Paste the meeting agenda here…"></textarea>
+          <p class="field-help">Or attach the original PDF, DOC/DOCX, RTF, ODT, text, HTML/XML, PowerPoint, or spreadsheet file. Recall stores a local copy and sends the original file only when you click Recap.</p>
+          <div class="agenda-actions">
+            <button id="attachAgendaButton" class="secondary-button" type="button">Choose file…</button>
+            <button id="removeAgendaButton" class="text-button danger-text" type="button" hidden>Remove agenda</button>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <span id="agendaFeedback" class="modal-feedback"></span>
+          <button class="text-button" type="button" data-close-dialog="agendaDialog">Cancel</button>
+          <button id="saveAgendaTextButton" class="primary-button" type="submit">Save pasted text</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="unresolvedDialog" class="modal compact-modal unresolved-modal">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow">Participant check</span>
+          <h2>Name participants first?</h2>
+        </div>
+      </div>
+      <div class="unresolved-body">
+        <p>Recall found transcript interventions that are still assigned to unknown or VOICE profiles. Named participants make action attribution and summaries more reliable.</p>
+        <ul id="unresolvedList"></ul>
+      </div>
+      <div class="modal-footer unresolved-actions">
+        <button id="cancelUnresolvedButton" class="text-button" type="button">Cancel</button>
+        <button id="reviewUnresolvedButton" class="secondary-button" type="button">Review voices</button>
+        <button id="recapAnywayButton" class="primary-button" type="button">Recap anyway</button>
+      </div>
+    </dialog>
+
+    <dialog id="recapProgressDialog" class="modal compact-modal recap-progress-modal">
+      <div class="recap-progress-body">
+        <div id="recapProgressSpinner" class="spinner" aria-hidden="true"></div>
+        <span class="eyebrow">OpenAI recap</span>
+        <h2 id="recapProgressTitle">Preparing conversation</h2>
+        <p id="recapProgressDetail">Preparing transcript and agenda…</p>
+        <small>Recall makes one on-demand request. Closing the app will interrupt it.</small>
+        <button id="recapProgressClose" class="primary-button" type="button" data-close-dialog="recapProgressDialog" hidden>Close</button>
+      </div>
+    </dialog>
+
     <dialog id="nameDialog" class="modal compact-modal">
       <form id="nameForm" method="dialog">
         <div class="modal-header">
           <div>
             <span class="eyebrow">Voice profile</span>
-            <h2>Name this person</h2>
+            <h2 id="nameDialogTitle">Name this person</h2>
           </div>
           <button class="icon-button" type="button" data-close-dialog="nameDialog" aria-label="Close">×</button>
         </div>
         <input id="nameSpeakerId" type="hidden" />
         <label class="field-label" for="speakerName">Display name</label>
         <input id="speakerName" type="text" placeholder="e.g. Michael" required />
-        <p class="field-help">Once named, the temporary voice excerpt is deleted. The voiceprint remains local for future matching.</p>
+        <p class="field-help">Naming enables automatic recognition for this person. The temporary voice excerpt is then deleted; only the local reference voiceprint remains.</p>
         <div class="modal-footer">
           <button class="text-button" type="button" data-close-dialog="nameDialog">Cancel</button>
-          <button class="primary-button" type="submit">Save name</button>
+          <button id="saveSpeakerNameButton" class="primary-button" type="submit">Save name</button>
         </div>
       </form>
     </dialog>

@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     path::Path,
+    sync::Once,
     thread,
     time::{Duration, Instant},
 };
@@ -9,7 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::blocking::{multipart, Client, Response};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -17,6 +18,13 @@ const REST_BASE: &str = "https://api.soniox.com/v1";
 const REALTIME_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
 const ASYNC_MODEL: &str = "stt-async-v5";
 const REALTIME_MODEL: &str = "stt-rt-v5";
+static TLS_PROVIDER: Once = Once::new();
+
+fn ensure_tls_provider() {
+    TLS_PROVIDER.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TranscriptSegment {
@@ -88,6 +96,28 @@ pub struct LiveTranscriptEvent {
     pub finished: bool,
     pub status: String,
     pub error: Option<String>,
+}
+
+impl LiveTranscriptEvent {
+    pub fn idle() -> Self {
+        Self {
+            text: String::new(),
+            final_text: String::new(),
+            finished: false,
+            status: "Live captions idle".into(),
+            error: None,
+        }
+    }
+
+    pub fn starting(enabled: bool) -> Self {
+        let mut event = Self::idle();
+        event.status = if enabled {
+            "Starting live captions".into()
+        } else {
+            "Live captions disabled".into()
+        };
+        event
+    }
 }
 
 #[derive(Debug)]
@@ -258,38 +288,39 @@ pub async fn run_realtime(
     mut audio_rx: mpsc::UnboundedReceiver<LiveAudioMessage>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    ensure_tls_provider();
     emit_live(&app_handle, "Connecting live captions", "", "", false, None);
-    let (mut socket, _) = connect_async(REALTIME_URL)
-        .await
-        .map_err(|error| format!("Could not connect to Soniox live transcription: {error}"))?;
-    let hints = normalize_language_hints(&language_hints);
-    let mut config = json!({
-        "api_key": api_key,
-        "model": REALTIME_MODEL,
-        "audio_format": "pcm_s16le",
-        "sample_rate": sample_rate,
-        "num_channels": 1,
-        "enable_speaker_diarization": true,
-        "enable_language_identification": true,
-        "enable_endpoint_detection": false,
-    });
-    if !hints.is_empty() {
-        config["language_hints"] = json!(hints);
-    }
+    eprintln!("[live] connecting to Soniox realtime STT");
+    let (mut socket, _) =
+        tokio::time::timeout(Duration::from_secs(10), connect_async(REALTIME_URL))
+            .await
+            .map_err(|_| {
+                "Timed out connecting to Soniox live transcription after 10 seconds".to_string()
+            })?
+            .map_err(|error| format!("Could not connect to Soniox live transcription: {error}"))?;
+    let config = realtime_config(&api_key, &language_hints, sample_rate);
     socket
         .send(Message::Text(config.to_string()))
         .await
         .map_err(|error| format!("Could not configure Soniox live transcription: {error}"))?;
+    eprintln!("[live] connected and configured");
     emit_live(&app_handle, "Live captions connected", "", "", false, None);
 
     let (mut writer, mut reader) = socket.split();
     let send_audio = async move {
+        let mut sent_audio = false;
         while let Some(message) = audio_rx.recv().await {
             match message {
-                LiveAudioMessage::Audio(bytes) => writer
-                    .send(Message::Binary(bytes))
-                    .await
-                    .map_err(|error| format!("Could not stream audio to Soniox: {error}"))?,
+                LiveAudioMessage::Audio(bytes) => {
+                    writer
+                        .send(Message::Binary(bytes))
+                        .await
+                        .map_err(|error| format!("Could not stream audio to Soniox: {error}"))?;
+                    if !sent_audio {
+                        sent_audio = true;
+                        eprintln!("[live] streaming microphone audio");
+                    }
+                }
                 LiveAudioMessage::Finish => {
                     writer
                         .send(Message::Text(String::new()))
@@ -308,6 +339,7 @@ pub async fn run_realtime(
 
     let receive_captions = async move {
         let mut final_tokens: Vec<Token> = Vec::new();
+        let mut received_response = false;
         while let Some(incoming) = reader.next().await {
             let incoming =
                 incoming.map_err(|error| format!("Soniox live connection error: {error}"))?;
@@ -320,6 +352,10 @@ pub async fn run_realtime(
             };
             let response: RealtimeResponse = serde_json::from_str(&text)
                 .map_err(|error| format!("Could not decode Soniox live response: {error}"))?;
+            if !received_response {
+                received_response = true;
+                eprintln!("[live] receiving caption updates");
+            }
             if response.error_code.is_some() {
                 let kind = response
                     .error_type
@@ -358,6 +394,7 @@ pub async fn run_realtime(
                 None,
             );
             if response.finished {
+                eprintln!("[live] caption stream finished");
                 return Ok(());
             }
         }
@@ -367,6 +404,24 @@ pub async fn run_realtime(
     futures_util::future::try_join(send_audio, receive_captions)
         .await
         .map(|_| ())
+}
+
+fn realtime_config(api_key: &str, language_hints: &[String], sample_rate: u32) -> Value {
+    let hints = normalize_language_hints(language_hints);
+    let mut config = json!({
+        "api_key": api_key,
+        "model": REALTIME_MODEL,
+        "audio_format": "pcm_s16le",
+        "sample_rate": sample_rate,
+        "num_channels": 1,
+        "enable_speaker_diarization": true,
+        "enable_language_identification": true,
+        "enable_endpoint_detection": false,
+    });
+    if !hints.is_empty() {
+        config["language_hints"] = json!(hints);
+    }
+    config
 }
 
 pub fn emit_realtime_error(app_handle: &tauri::AppHandle, error: String) {
@@ -388,16 +443,18 @@ fn emit_live(
     finished: bool,
     error: Option<String>,
 ) {
-    let _ = app_handle.emit(
-        "live-transcription",
-        LiveTranscriptEvent {
-            text: text.to_string(),
-            final_text: final_text.to_string(),
-            finished,
-            status: status.to_string(),
-            error,
-        },
-    );
+    let payload = LiveTranscriptEvent {
+        text: text.to_string(),
+        final_text: final_text.to_string(),
+        finished,
+        status: status.to_string(),
+        error,
+    };
+    let state = app_handle.state::<crate::state::AppState>();
+    if let Ok(mut snapshot) = state.live_transcript.lock() {
+        *snapshot = payload.clone();
+    }
+    let _ = app_handle.emit("live-transcription", payload);
 }
 
 fn normalize_language_hints(languages: &[String]) -> Vec<String> {
@@ -603,5 +660,35 @@ mod tests {
     fn language_hints_are_deduplicated_and_normalized() {
         let hints = vec!["en-US".into(), "de-DE".into(), "en".into(), " ru ".into()];
         assert_eq!(normalize_language_hints(&hints), vec!["en", "de", "ru"]);
+    }
+
+    #[test]
+    fn live_snapshot_starts_in_the_requested_mode() {
+        assert_eq!(
+            LiveTranscriptEvent::starting(true).status,
+            "Starting live captions"
+        );
+        assert_eq!(
+            LiveTranscriptEvent::starting(false).status,
+            "Live captions disabled"
+        );
+    }
+
+    #[test]
+    fn realtime_tls_provider_is_selected_explicitly() {
+        ensure_tls_provider();
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn realtime_config_streams_raw_mono_pcm_with_diarization() {
+        let config = realtime_config("test-key", &["ru-RU".into(), "en-US".into()], 48_000);
+        assert_eq!(config["model"], REALTIME_MODEL);
+        assert_eq!(config["audio_format"], "pcm_s16le");
+        assert_eq!(config["sample_rate"], 48_000);
+        assert_eq!(config["num_channels"], 1);
+        assert_eq!(config["enable_speaker_diarization"], true);
+        assert_eq!(config["enable_language_identification"], true);
+        assert_eq!(config["language_hints"], json!(["ru", "en"]));
     }
 }

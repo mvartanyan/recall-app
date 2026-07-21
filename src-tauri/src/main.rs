@@ -25,21 +25,44 @@ use tokio::sync::mpsc as tokio_mpsc;
 use uuid::Uuid;
 
 mod config;
+mod credentials;
 mod db;
 mod embedding;
-mod keychain;
+mod openai;
+mod recap;
 mod soniox;
 mod state;
 
 use config::AppConfig;
-use db::{Crypto, Db, SegmentRecord, Session, Speaker, StoredEmbedding};
+use db::{
+    AgendaMetadata, AgendaRecord, Crypto, Db, RecapRecord, RecapSave, SegmentRecord, Session,
+    Speaker, StoredEmbedding,
+};
 use embedding::EMBEDDING_VERSION;
-use soniox::{LiveAudioMessage, TranscriptSegment};
+use recap::{AgendaFingerprint, RecapSourceSegment};
+use soniox::{LiveAudioMessage, LiveTranscriptEvent, TranscriptSegment};
 use state::AppState;
 
 const TARGET_SPEAKER_MS: u64 = 12_000;
+const MIN_SPEAKER_MS: u64 = 3_000;
 const MATCH_THRESHOLD: f32 = 0.90;
-const MATCH_MARGIN: f32 = 0.04;
+const MATCH_MARGIN: f32 = 0.06;
+const PROFILE_CLAIM_MARGIN: f32 = 0.05;
+const MAX_AGENDA_BYTES: usize = 50 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+struct SpeakerMatch {
+    speaker_id: String,
+    label: String,
+    score: f32,
+}
+
+#[derive(Debug)]
+struct VoiceObservation {
+    diarized_speaker: String,
+    pcm: Vec<f32>,
+    embedding: Vec<f32>,
+}
 
 #[derive(Debug, Serialize, Clone)]
 struct ProgressEvent {
@@ -47,6 +70,13 @@ struct ProgressEvent {
     stage: String,
     detail: Option<String>,
     run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RecapProgressEvent {
+    session_id: String,
+    stage: String,
+    detail: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -75,10 +105,28 @@ struct AppStatus {
     needs_password: bool,
     recording: bool,
     soniox_key_configured: bool,
+    openai_key_configured: bool,
     speaker_model_available: bool,
     selected_input_device: Option<String>,
     language_hints: Vec<String>,
     live_transcription: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RecapStateView {
+    agenda: Option<AgendaMetadata>,
+    recap: Option<RecapRecord>,
+    current_fingerprint: String,
+    stale: bool,
+    unresolved_profiles: Vec<String>,
+    in_flight: bool,
+}
+
+struct RecapSnapshot {
+    segments: Vec<RecapSourceSegment>,
+    agenda: Option<AgendaRecord>,
+    source_fingerprint: String,
+    unresolved_profiles: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -339,7 +387,10 @@ fn dispatch_samples(
         let bytes = bytemuck::cast_slice(&samples).to_vec();
         let _ = live_tx.send(LiveAudioMessage::Audio(bytes));
     }
-    if meter_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+    if meter_counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .is_multiple_of(8)
+    {
         let rms = (samples
             .iter()
             .map(|sample| {
@@ -447,13 +498,14 @@ fn start_recording_impl(
     app_handle: tauri::AppHandle,
     input_device: Option<String>,
 ) -> Result<RecordingStarted, String> {
-    let api_key = keychain::load_api_key()?;
+    let api_key = app_state.load_soniox_key()?;
     let config = app_state
         .config
         .lock()
         .map_err(|_| "Configuration lock poisoned")?
         .clone();
     let requested = input_device.or(config.selected_input_device.clone());
+    app_state.reset_live_transcript(config.live_transcription)?;
     let live = config
         .live_transcription
         .then_some((api_key, config.language_hints.clone()));
@@ -495,7 +547,7 @@ fn transcribe_file_inner(
         Some("Preparing final transcription".into()),
         Some(run_id),
     );
-    let api_key = keychain::load_api_key()?;
+    let api_key = app_state.load_soniox_key()?;
     let language_hints = app_state
         .config
         .lock()
@@ -539,7 +591,9 @@ fn transcribe_file_inner(
     emit_progress(
         app_handle,
         "voiceprints:start",
-        Some("Extracting and matching local voiceprints".into()),
+        Some(format!(
+            "Extracting and matching local voiceprints with {EMBEDDING_VERSION}"
+        )),
         Some(run_id),
     );
     let embedder_available = {
@@ -677,6 +731,15 @@ fn get_progress(run_id: String, app_state: State<AppState>) -> Result<Vec<Progre
         .get(&run_id)
         .cloned()
         .unwrap_or_default())
+}
+
+#[tauri::command]
+fn get_live_transcription(app_state: State<AppState>) -> Result<LiveTranscriptEvent, String> {
+    app_state
+        .live_transcript
+        .lock()
+        .map_err(|_| "Live transcription lock poisoned".to_string())
+        .map(|snapshot| snapshot.clone())
 }
 
 fn read_audio_clip(path: &str) -> Result<AudioClip, String> {
@@ -868,12 +931,21 @@ fn process_segments(
             ordered_speakers.push(segment.speaker.clone());
         }
     }
-    let mut mapping: HashMap<String, (String, String)> = HashMap::new();
+    let mut observations = Vec::new();
 
     for diarized_speaker in ordered_speakers {
         let pcm = buckets.get(&diarized_speaker).cloned().unwrap_or_default();
-        let embedding = match (embedder, pcm.is_empty()) {
-            (Some(embedder), false) => match embedder.embed(&pcm, audio.sample_rate) {
+        let sample_duration_ms = if audio.sample_rate == 0 {
+            0
+        } else {
+            (pcm.len() as u64 * 1_000) / audio.sample_rate as u64
+        };
+        let embedding = match (
+            embedder,
+            pcm.is_empty(),
+            sample_duration_ms >= MIN_SPEAKER_MS,
+        ) {
+            (Some(embedder), false, true) => match embedder.embed(&pcm, audio.sample_rate) {
                 Ok(value) => Some(value),
                 Err(error) => {
                     emit_progress(
@@ -885,34 +957,106 @@ fn process_segments(
                     None
                 }
             },
+            (None, _, _) => {
+                emit_progress(
+                    app_handle,
+                    "voiceprint:warning",
+                    Some(format!(
+                        "{diarized_speaker}: local ECAPA model is unavailable; leaving this intervention unattributed"
+                    )),
+                    Some(run_id),
+                );
+                None
+            }
+            (_, _, false) => {
+                emit_progress(
+                    app_handle,
+                    "voiceprint:warning",
+                    Some(format!(
+                        "{diarized_speaker}: only {:.1} seconds of speech; at least {:.1} seconds is required for a voiceprint",
+                        sample_duration_ms as f64 / 1_000.0,
+                        MIN_SPEAKER_MS as f64 / 1_000.0,
+                    )),
+                    Some(run_id),
+                );
+                None
+            }
             _ => None,
         };
 
-        let matched = embedding
-            .as_ref()
-            .and_then(|query| best_speaker_match(query, &known));
-        let (speaker_id, label, is_new) = if let Some((speaker_id, label, score)) = matched {
+        let Some(embedding) = embedding else {
+            emit_progress(
+                app_handle,
+                "voiceprint:skipped",
+                Some(format!(
+                    "{diarized_speaker}: no persistent voice profile was created"
+                )),
+                Some(run_id),
+            );
+            continue;
+        };
+
+        observations.push(VoiceObservation {
+            diarized_speaker,
+            pcm,
+            embedding,
+        });
+    }
+
+    let candidates = observations
+        .iter()
+        .map(|observation| best_speaker_match(&observation.embedding, &known))
+        .collect::<Vec<_>>();
+    let resolved_matches = resolve_unique_profile_matches(&candidates);
+    let mut mapping: HashMap<String, (String, String)> = HashMap::new();
+
+    for (observation, (candidate, matched)) in observations
+        .into_iter()
+        .zip(candidates.into_iter().zip(resolved_matches))
+    {
+        let VoiceObservation {
+            diarized_speaker,
+            pcm,
+            embedding,
+        } = observation;
+        let (speaker_id, label, is_new) = if let Some(matched) = matched {
             emit_progress(
                 app_handle,
                 "voiceprint:matched",
-                Some(format!("{diarized_speaker} → {label} ({score:.2})")),
+                Some(format!(
+                    "{diarized_speaker} → {} ({:.2}; reference left unchanged)",
+                    matched.label, matched.score
+                )),
                 Some(run_id),
             );
-            (speaker_id, label, false)
+            (matched.speaker_id, matched.label, false)
         } else {
             let label = db.next_voice_label()?;
             let speaker_id = db.insert_speaker(Some(&label))?;
+            let reason = candidate
+                .map(|candidate| {
+                    format!(
+                        "the {:.2} claim for {} was not unique within this recording",
+                        candidate.score, candidate.label
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!("no named profile reached {MATCH_THRESHOLD:.2} unambiguously")
+                });
             emit_progress(
                 app_handle,
                 "voiceprint:new",
-                Some(format!("{diarized_speaker} → {label}")),
+                Some(format!("{diarized_speaker} → {label} ({reason})")),
                 Some(run_id),
             );
             (speaker_id, label, true)
         };
 
-        if let Some(embedding) = embedding.as_ref() {
-            db.insert_embedding(&speaker_id, session_id, embedding, EMBEDDING_VERSION)?;
+        // New provisional voices establish a reference. Automatic matches are
+        // intentionally not fed back into the reference library: only a human
+        // naming or assigning a provisional profile can expand a known person.
+        if is_new {
+            db.insert_embedding(&speaker_id, session_id, &embedding, EMBEDDING_VERSION)?;
         }
         if is_new && !pcm.is_empty() {
             let sample = encode_wav_base64(&pcm, audio.sample_rate)?;
@@ -943,9 +1087,22 @@ fn process_segments(
     Ok(())
 }
 
-fn best_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> Option<(String, String, f32)> {
+fn is_provisional_label(label: &str) -> bool {
+    label
+        .strip_prefix("VOICE")
+        .map(|suffix| !suffix.is_empty() && suffix.chars().all(|value| value.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+fn best_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> Option<SpeakerMatch> {
     let mut by_speaker: HashMap<&str, (&StoredEmbedding, f32)> = HashMap::new();
     for candidate in known {
+        let Some(label) = candidate.speaker_label.as_deref() else {
+            continue;
+        };
+        if is_provisional_label(label) {
+            continue;
+        }
         let score = embedding::cosine_similarity(query, &candidate.vector);
         let entry = by_speaker
             .entry(candidate.speaker_id.as_str())
@@ -961,13 +1118,53 @@ fn best_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> Option<(Strin
     if score < MATCH_THRESHOLD || score - second < MATCH_MARGIN {
         return None;
     }
-    Some((
-        best.speaker_id.clone(),
-        best.speaker_label
+    Some(SpeakerMatch {
+        speaker_id: best.speaker_id.clone(),
+        label: best
+            .speaker_label
             .clone()
             .unwrap_or_else(|| "Unnamed speaker".into()),
         score,
-    ))
+    })
+}
+
+fn resolve_unique_profile_matches(
+    candidates: &[Option<SpeakerMatch>],
+) -> Vec<Option<SpeakerMatch>> {
+    let mut claims: HashMap<&str, Vec<(usize, f32)>> = HashMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if let Some(candidate) = candidate {
+            claims
+                .entry(candidate.speaker_id.as_str())
+                .or_default()
+                .push((index, candidate.score));
+        }
+    }
+
+    let mut accepted = HashSet::new();
+    for mut profile_claims in claims.into_values() {
+        profile_claims.sort_by(|left, right| right.1.total_cmp(&left.1));
+        let (best_index, best_score) = profile_claims[0];
+        let runner_up = profile_claims.get(1).map(|value| value.1);
+        if runner_up
+            .map(|score| best_score - score >= PROFILE_CLAIM_MARGIN)
+            .unwrap_or(true)
+        {
+            accepted.insert(best_index);
+        }
+    }
+
+    candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            if accepted.contains(&index) {
+                candidate.clone()
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn encode_wav_base64(pcm: &[f32], sample_rate: u32) -> Result<String, String> {
@@ -991,18 +1188,33 @@ fn encode_wav_base64(pcm: &[f32], sample_rate: u32) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn save_soniox_key(api_key: String) -> Result<(), String> {
-    keychain::save_api_key(&api_key)
+fn save_soniox_key(api_key: String, app_state: State<AppState>) -> Result<(), String> {
+    app_state.save_soniox_key(&api_key)
 }
 
 #[tauri::command]
-fn delete_soniox_key() -> Result<(), String> {
-    keychain::delete_api_key()
+fn delete_soniox_key(app_state: State<AppState>) -> Result<(), String> {
+    app_state.delete_soniox_key()
 }
 
 #[tauri::command]
-fn soniox_key_status() -> bool {
-    keychain::has_api_key()
+fn soniox_key_status(app_state: State<AppState>) -> bool {
+    app_state.has_soniox_key()
+}
+
+#[tauri::command]
+fn save_openai_key(api_key: String, app_state: State<AppState>) -> Result<(), String> {
+    app_state.save_openai_key(&api_key)
+}
+
+#[tauri::command]
+fn delete_openai_key(app_state: State<AppState>) -> Result<(), String> {
+    app_state.delete_openai_key()
+}
+
+#[tauri::command]
+fn openai_key_status(app_state: State<AppState>) -> bool {
+    app_state.has_openai_key()
 }
 
 #[tauri::command]
@@ -1019,19 +1231,35 @@ fn save_preferences(
     selected_input_device: Option<String>,
     language_hints: Vec<String>,
     live_transcription: bool,
+    openai_model: String,
+    no_translation_languages: Vec<String>,
     app_state: State<AppState>,
 ) -> Result<(), String> {
+    let openai_model = openai_model.trim();
+    if openai_model.is_empty() {
+        return Err("OpenAI model cannot be empty".into());
+    }
+    let normalized_hints = language_hints
+        .into_iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut excluded_languages = no_translation_languages
+        .into_iter()
+        .map(|value| value.trim().to_lowercase())
+        .filter(|value| !value.is_empty() && value != "en")
+        .collect::<Vec<_>>();
+    excluded_languages.sort();
+    excluded_languages.dedup();
     let mut config = app_state
         .config
         .lock()
         .map_err(|_| "Configuration lock poisoned")?;
     config.selected_input_device = selected_input_device.filter(|value| !value.trim().is_empty());
-    config.language_hints = language_hints
-        .into_iter()
-        .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty())
-        .collect();
+    config.language_hints = normalized_hints;
     config.live_transcription = live_transcription;
+    config.openai_model = openai_model.to_string();
+    config.no_translation_languages = excluded_languages;
     config.save(&app_state.config_path)
 }
 
@@ -1077,7 +1305,8 @@ fn app_status(
         db_open,
         needs_password: config.encryption_enabled && !db_open,
         recording: manager.is_recording(),
-        soniox_key_configured: keychain::has_api_key(),
+        soniox_key_configured: app_state.has_soniox_key(),
+        openai_key_configured: app_state.has_openai_key(),
         speaker_model_available: app_state.model_path.is_file(),
         selected_input_device: config.selected_input_device,
         language_hints: config.language_hints,
@@ -1145,8 +1374,337 @@ fn assign_segment_speaker(
 }
 
 #[tauri::command]
-fn delete_session(session_id: String, app_state: State<AppState>) -> Result<(), String> {
+fn delete_session(session_id: String, app_state: State<AppState>) -> Result<usize, String> {
     app_state.db_handle()?.delete_session(&session_id)
+}
+
+fn recap_snapshot(db: &Db, config: &AppConfig, session_id: &str) -> Result<RecapSnapshot, String> {
+    let session = db
+        .list_sessions()?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Conversation not found".to_string())?;
+    let stored_segments = db.list_segments(session_id)?;
+    let mut segments = stored_segments
+        .into_iter()
+        .filter(|segment| !segment.text.trim().is_empty())
+        .map(|segment| RecapSourceSegment {
+            id: segment.id,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+            speaker_id: segment.speaker_id,
+            speaker_label: segment
+                .speaker_label
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or_else(|| "Unknown speaker".to_string()),
+            text: segment.text,
+        })
+        .collect::<Vec<_>>();
+    if segments.is_empty() && !session.transcript.trim().is_empty() {
+        segments.push(RecapSourceSegment {
+            id: format!("legacy-{session_id}"),
+            start_ms: 0,
+            end_ms: session.duration_ms,
+            speaker_id: None,
+            speaker_label: "Unknown speaker".into(),
+            text: session.transcript,
+        });
+    }
+    if segments.is_empty() {
+        return Err("This conversation has no transcript to recap".into());
+    }
+    let mut seen_unresolved = HashSet::new();
+    let unresolved_profiles = segments
+        .iter()
+        .filter_map(|segment| {
+            let unresolved = segment.speaker_id.is_none()
+                || segment.speaker_label.trim().is_empty()
+                || is_provisional_label(&segment.speaker_label);
+            (unresolved && seen_unresolved.insert(segment.speaker_label.clone()))
+                .then(|| segment.speaker_label.clone())
+        })
+        .collect::<Vec<_>>();
+    let agenda = db.load_agenda(session_id)?;
+    let agenda_fingerprint = agenda.as_ref().map(|agenda| AgendaFingerprint {
+        source_kind: &agenda.source_kind,
+        filename: &agenda.filename,
+        mime_type: &agenda.mime_type,
+        content: &agenda.content,
+    });
+    let source_fingerprint = recap::source_fingerprint(
+        &segments,
+        agenda_fingerprint,
+        &config.no_translation_languages,
+    )?;
+    Ok(RecapSnapshot {
+        segments,
+        agenda,
+        source_fingerprint,
+        unresolved_profiles,
+    })
+}
+
+fn recap_state_view(app_state: &AppState, session_id: &str) -> Result<RecapStateView, String> {
+    let db = app_state.db_handle()?;
+    let config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned".to_string())?
+        .clone();
+    let snapshot = recap_snapshot(&db, &config, session_id)?;
+    let recap = db.load_recap(session_id)?;
+    let stale = recap
+        .as_ref()
+        .map(|recap| recap.source_fingerprint != snapshot.source_fingerprint)
+        .unwrap_or(false);
+    let in_flight = app_state
+        .recap_in_flight
+        .lock()
+        .map_err(|_| "Recap lock poisoned".to_string())?
+        .contains(session_id);
+    Ok(RecapStateView {
+        agenda: snapshot.agenda.as_ref().map(AgendaRecord::metadata),
+        recap,
+        current_fingerprint: snapshot.source_fingerprint,
+        stale,
+        unresolved_profiles: snapshot.unresolved_profiles,
+        in_flight,
+    })
+}
+
+#[tauri::command]
+fn get_recap_state(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<RecapStateView, String> {
+    recap_state_view(app_state.inner(), &session_id)
+}
+
+#[tauri::command]
+fn save_agenda_text(
+    session_id: String,
+    text: String,
+    app_state: State<AppState>,
+) -> Result<AgendaMetadata, String> {
+    if text.trim().is_empty() {
+        return Err("Paste some agenda text first".into());
+    }
+    if text.len() >= MAX_AGENDA_BYTES {
+        return Err("Agenda text must be smaller than 50 MB".into());
+    }
+    app_state
+        .db_handle()?
+        .upsert_agenda(
+            &session_id,
+            "text",
+            "Pasted agenda.txt",
+            "text/plain",
+            text.as_bytes(),
+        )
+        .map(|agenda| agenda.metadata())
+}
+
+#[tauri::command]
+fn choose_agenda_file(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<Option<AgendaMetadata>, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("Choose a meeting agenda")
+        .add_filter(
+            "Agenda documents",
+            &[
+                "pdf", "doc", "docx", "rtf", "odt", "txt", "md", "json", "html", "htm", "xml",
+                "ppt", "pptx", "csv", "xls", "xlsx",
+            ],
+        )
+        .pick_file();
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let mime_type = agenda_mime_type(&path).ok_or_else(|| {
+        "That agenda file type is not supported. Choose PDF, DOC/DOCX, RTF, ODT, text, HTML/XML, PowerPoint, or a spreadsheet."
+            .to_string()
+    })?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("Could not inspect the agenda file: {error}"))?;
+    if metadata.len() >= MAX_AGENDA_BYTES as u64 {
+        return Err("Agenda files must be smaller than 50 MB".into());
+    }
+    let content =
+        std::fs::read(&path).map_err(|error| format!("Could not read the agenda file: {error}"))?;
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "The agenda filename is not valid Unicode".to_string())?;
+    app_state
+        .db_handle()?
+        .upsert_agenda(&session_id, "file", filename, mime_type, &content)
+        .map(|agenda| Some(agenda.metadata()))
+}
+
+#[tauri::command]
+fn remove_agenda(session_id: String, app_state: State<AppState>) -> Result<bool, String> {
+    app_state.db_handle()?.delete_agenda(&session_id)
+}
+
+fn agenda_mime_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        Some("pdf") => Some("application/pdf"),
+        Some("doc") => Some("application/msword"),
+        Some("docx") => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        }
+        Some("rtf") => Some("application/rtf"),
+        Some("odt") => Some("application/vnd.oasis.opendocument.text"),
+        Some("txt") => Some("text/plain"),
+        Some("md") => Some("text/markdown"),
+        Some("json") => Some("application/json"),
+        Some("html") | Some("htm") => Some("text/html"),
+        Some("xml") => Some("application/xml"),
+        Some("ppt") => Some("application/vnd.ms-powerpoint"),
+        Some("pptx") => {
+            Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")
+        }
+        Some("csv") => Some("text/csv"),
+        Some("xls") => Some("application/vnd.ms-excel"),
+        Some("xlsx") => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        _ => None,
+    }
+}
+
+fn emit_recap_progress(app_handle: &tauri::AppHandle, session_id: &str, stage: &str, detail: &str) {
+    eprintln!("[recap {session_id}] {stage}: {detail}");
+    let _ = app_handle.emit(
+        "recap:progress",
+        RecapProgressEvent {
+            session_id: session_id.to_string(),
+            stage: stage.to_string(),
+            detail: detail.to_string(),
+        },
+    );
+}
+
+async fn generate_recap_inner(
+    session_id: &str,
+    allow_unresolved: bool,
+    app_state: &AppState,
+    app_handle: &tauri::AppHandle,
+) -> Result<(), String> {
+    emit_recap_progress(
+        app_handle,
+        session_id,
+        "prepare",
+        "Preparing transcript and agenda",
+    );
+    let db = app_state.db_handle()?;
+    let config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned".to_string())?
+        .clone();
+    let model = config.openai_model.trim().to_string();
+    if model.is_empty() {
+        return Err("Configure an OpenAI model in Settings before creating a recap".into());
+    }
+    let api_key = app_state.load_openai_key()?;
+    let snapshot = recap_snapshot(&db, &config, session_id)?;
+    if !allow_unresolved && !snapshot.unresolved_profiles.is_empty() {
+        return Err(format!(
+            "Name or assign {} unresolved voice profile{} before recapping, or explicitly choose Recap anyway",
+            snapshot.unresolved_profiles.len(),
+            if snapshot.unresolved_profiles.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    emit_recap_progress(app_handle, session_id, "openai", "Waiting for OpenAI");
+    let response = openai::generate_recap(openai::RecapRequest {
+        api_key: &api_key,
+        model: &model,
+        segments: &snapshot.segments,
+        agenda: snapshot.agenda.as_ref(),
+        no_translation_languages: &config.no_translation_languages,
+    })
+    .await?;
+    for warning in &response.warnings {
+        emit_recap_progress(app_handle, session_id, "warning", warning);
+    }
+    emit_recap_progress(
+        app_handle,
+        session_id,
+        "validate",
+        "Validating structured recap",
+    );
+    let current_config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned".to_string())?
+        .clone();
+    let current_snapshot = recap_snapshot(&db, &current_config, session_id)?;
+    if current_snapshot.source_fingerprint != snapshot.source_fingerprint {
+        return Err(
+            "The transcript, speakers, agenda, or translation policy changed while OpenAI was working. Nothing was replaced; run Recap again."
+                .into(),
+        );
+    }
+    emit_recap_progress(app_handle, session_id, "save", "Saving recap locally");
+    db.save_recap_and_title(RecapSave {
+        session_id,
+        title: &response.payload.meeting_title_english,
+        model: &model,
+        prompt_version: recap::PROMPT_VERSION,
+        schema_version: recap::SCHEMA_VERSION,
+        source_fingerprint: &snapshot.source_fingerprint,
+        payload: &response.payload,
+        input_tokens: response.input_tokens,
+        output_tokens: response.output_tokens,
+    })?;
+    let persisted = db
+        .load_recap(session_id)?
+        .ok_or_else(|| "The recap save completed but could not be read back".to_string())?;
+    if persisted.source_fingerprint != snapshot.source_fingerprint {
+        return Err("The saved recap failed its source-integrity check".into());
+    }
+    emit_recap_progress(app_handle, session_id, "complete", "Recap ready");
+    Ok(())
+}
+
+#[tauri::command]
+async fn generate_recap(
+    session_id: String,
+    allow_unresolved: bool,
+    app_state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<RecapStateView, String> {
+    let app_state = app_state.inner().clone();
+    {
+        let mut in_flight = app_state
+            .recap_in_flight
+            .lock()
+            .map_err(|_| "Recap lock poisoned".to_string())?;
+        if !in_flight.insert(session_id.clone()) {
+            return Err("A recap is already being generated for this conversation".into());
+        }
+    }
+    let result = generate_recap_inner(&session_id, allow_unresolved, &app_state, &app_handle).await;
+    if let Ok(mut in_flight) = app_state.recap_in_flight.lock() {
+        in_flight.remove(&session_id);
+    }
+    match result {
+        Ok(()) => recap_state_view(&app_state, &session_id),
+        Err(error) => {
+            emit_recap_progress(&app_handle, &session_id, "error", &error);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1157,6 +1715,16 @@ fn list_speakers(app_state: State<AppState>) -> Result<Vec<Speaker>, String> {
 #[tauri::command]
 fn list_speakers_with_stats(app_state: State<AppState>) -> Result<Vec<db::SpeakerStats>, String> {
     app_state.db_handle()?.list_speakers_with_stats()
+}
+
+#[tauri::command]
+fn list_session_ids_for_speaker(
+    speaker_id: String,
+    app_state: State<AppState>,
+) -> Result<Vec<String>, String> {
+    app_state
+        .db_handle()?
+        .session_ids_for_speakers(&[speaker_id.as_str()])
 }
 
 #[tauri::command]
@@ -1282,9 +1850,13 @@ fn main() {
             stop_recording,
             transcribe_file_async,
             get_progress,
+            get_live_transcription,
             save_soniox_key,
             delete_soniox_key,
             soniox_key_status,
+            save_openai_key,
+            delete_openai_key,
+            openai_key_status,
             get_preferences,
             save_preferences,
             unlock_db,
@@ -1297,8 +1869,14 @@ fn main() {
             update_segment_text,
             assign_segment_speaker,
             delete_session,
+            get_recap_state,
+            save_agenda_text,
+            choose_agenda_file,
+            remove_agenda,
+            generate_recap,
             list_speakers,
             list_speakers_with_stats,
+            list_session_ids_for_speaker,
             rename_speaker,
             delete_speaker,
             get_speaker_samples,
@@ -1338,6 +1916,23 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn stored_embedding(
+        id: &str,
+        speaker_id: &str,
+        label: &str,
+        vector: Vec<f32>,
+    ) -> StoredEmbedding {
+        StoredEmbedding {
+            id: id.into(),
+            speaker_id: speaker_id.into(),
+            speaker_label: Some(label.into()),
+            vector,
+            source_session_id: "x".into(),
+            created_at: chrono::Utc::now(),
+            model_version: EMBEDDING_VERSION.into(),
+        }
+    }
+
     #[test]
     fn adjacent_interventions_from_same_speaker_are_merged() {
         let segments = vec![
@@ -1368,27 +1963,62 @@ mod tests {
     #[test]
     fn match_requires_threshold_and_margin() {
         let known = vec![
-            StoredEmbedding {
-                id: "e1".into(),
-                speaker_id: "s1".into(),
-                speaker_label: Some("Alice".into()),
-                vector: vec![1.0, 0.0],
-                source_session_id: "x".into(),
-                created_at: chrono::Utc::now(),
-                model_version: EMBEDDING_VERSION.into(),
-            },
-            StoredEmbedding {
-                id: "e2".into(),
-                speaker_id: "s2".into(),
-                speaker_label: Some("Bob".into()),
-                vector: vec![0.0, 1.0],
-                source_session_id: "x".into(),
-                created_at: chrono::Utc::now(),
-                model_version: EMBEDDING_VERSION.into(),
-            },
+            stored_embedding("e1", "s1", "Alice", vec![1.0, 0.0]),
+            stored_embedding("e2", "s2", "Bob", vec![0.0, 1.0]),
         ];
         let matched = best_speaker_match(&[1.0, 0.0], &known).unwrap();
-        assert_eq!(matched.0, "s1");
+        assert_eq!(matched.speaker_id, "s1");
         assert!(best_speaker_match(&[0.71, 0.70], &known).is_none());
+    }
+
+    #[test]
+    fn strict_ecapa_threshold_accepts_high_confidence_repeat_voice() {
+        let known = vec![stored_embedding("e1", "s1", "Alice", vec![1.0, 0.0])];
+        assert!(best_speaker_match(&[0.91, 0.414_608_24], &known).is_some());
+        assert!(best_speaker_match(&[0.89, 0.455_960_5], &known).is_none());
+    }
+
+    #[test]
+    fn provisional_profiles_never_match_automatically() {
+        let known = vec![stored_embedding("e1", "s1", "VOICE9", vec![1.0, 0.0])];
+        assert!(best_speaker_match(&[1.0, 0.0], &known).is_none());
+    }
+
+    #[test]
+    fn one_named_profile_cannot_claim_multiple_diarized_voices() {
+        let candidates = vec![
+            Some(SpeakerMatch {
+                speaker_id: "s1".into(),
+                label: "Alice".into(),
+                score: 0.96,
+            }),
+            Some(SpeakerMatch {
+                speaker_id: "s1".into(),
+                label: "Alice".into(),
+                score: 0.88,
+            }),
+        ];
+        let resolved = resolve_unique_profile_matches(&candidates);
+        assert!(resolved[0].is_some());
+        assert!(resolved[1].is_none());
+    }
+
+    #[test]
+    fn close_competing_claims_are_all_rejected() {
+        let candidates = vec![
+            Some(SpeakerMatch {
+                speaker_id: "s1".into(),
+                label: "Alice".into(),
+                score: 0.95,
+            }),
+            Some(SpeakerMatch {
+                speaker_id: "s1".into(),
+                label: "Alice".into(),
+                score: 0.92,
+            }),
+        ];
+        assert!(resolve_unique_profile_matches(&candidates)
+            .iter()
+            .all(Option::is_none));
     }
 }

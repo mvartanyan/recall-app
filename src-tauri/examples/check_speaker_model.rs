@@ -12,7 +12,7 @@ fn main() {
     let wavs: Vec<String> = std::env::args().skip(2).collect();
     assert!(!wavs.is_empty(), "at least one wav path");
     let config = SpeakerEmbeddingExtractorConfig {
-        model: Some(model.into()),
+        model: Some(model),
         num_threads: 2,
         debug: false,
         provider: Some("cpu".into()),

@@ -13,6 +13,7 @@ hound = "3.5"
 reqwest = { version = "0.11", features = ["json", "multipart", "blocking"] }
 tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -24,7 +25,8 @@ zeroize = "1.7"
 base64 = "0.22"
 bytemuck = { version = "1.15", features = ["derive"] }
 sherpa-onnx = "1.13.4"
-keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
+sha2 = "0.10"
+rfd = "0.17.2"
 
 [build-dependencies]
 tauri-build = { version = "2.5.2", features = [] }

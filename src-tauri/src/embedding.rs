@@ -1,6 +1,6 @@
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 
-pub const EMBEDDING_VERSION: &str = "sherpa-onnx-ecapa-v1";
+pub const EMBEDDING_VERSION: &str = "wespeaker-ecapa512-lm-v2";
 const MODEL_SAMPLE_RATE: u32 = 16_000;
 
 pub struct Embedder {

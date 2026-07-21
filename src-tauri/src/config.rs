@@ -8,6 +8,8 @@ pub struct AppConfig {
     pub selected_input_device: Option<String>,
     pub language_hints: Vec<String>,
     pub live_transcription: bool,
+    pub openai_model: String,
+    pub no_translation_languages: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -20,6 +22,8 @@ impl Default for AppConfig {
                 .map(str::to_string)
                 .collect(),
             live_transcription: true,
+            openai_model: "gpt-5.6-terra".to_string(),
+            no_translation_languages: Vec::new(),
         }
     }
 }

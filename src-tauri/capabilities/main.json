@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-capability",
+  "description": "Allow the bundled Recall window to subscribe to native app events.",
+  "windows": ["main"],
+  "permissions": ["core:event:default"]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add the metadata sherpa-onnx needs to the vendored SpeechBrain ECAPA model.
+"""Add the metadata sherpa-onnx needs to the official WeSpeaker ECAPA model.
 
 This is a one-time, reproducible model packaging step. It changes only ONNX
 metadata; model weights and graph nodes are left untouched.
@@ -13,9 +13,9 @@ import onnx
 MODEL = Path(__file__).resolve().parents[1] / "models" / "spkrec-ecapa-voxceleb.onnx"
 METADATA = {
     "framework": "wespeaker",
-    "language": "multilingual",
-    "url": "https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb",
-    "comment": "SpeechBrain ECAPA-TDNN exported for Recall",
+    "language": "en",
+    "url": "https://huggingface.co/Wespeaker/wespeaker-ecapa-tdnn512-LM",
+    "comment": "Official WeSpeaker ECAPA-TDNN-512 LM",
     "sample_rate": "16000",
     "output_dim": "192",
     "normalize_samples": "0",

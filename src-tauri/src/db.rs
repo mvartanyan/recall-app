@@ -17,6 +17,8 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::recap::RecapPayload;
+
 #[derive(Clone)]
 pub struct Crypto {
     key: Option<aes_gcm::Key<Aes256Gcm>>,
@@ -143,9 +145,80 @@ pub struct SpeakerStats {
     pub id: String,
     pub label: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub last_seen_at: Option<DateTime<Utc>>,
     pub sample_count: usize,
     pub embedding_count: usize,
     pub conversation_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgendaRecord {
+    pub source_kind: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub content: Vec<u8>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgendaMetadata {
+    pub source_kind: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub size_bytes: usize,
+    pub updated_at: DateTime<Utc>,
+    pub text_content: Option<String>,
+}
+
+impl AgendaRecord {
+    pub fn metadata(&self) -> AgendaMetadata {
+        AgendaMetadata {
+            source_kind: self.source_kind.clone(),
+            filename: self.filename.clone(),
+            mime_type: self.mime_type.clone(),
+            size_bytes: self.content.len(),
+            updated_at: self.updated_at,
+            text_content: (self.source_kind == "text")
+                .then(|| String::from_utf8_lossy(&self.content).to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecapRecord {
+    pub session_id: String,
+    pub generated_at: DateTime<Utc>,
+    pub model: String,
+    pub prompt_version: String,
+    pub schema_version: String,
+    pub source_fingerprint: String,
+    pub payload: RecapPayload,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+pub struct RecapSave<'a> {
+    pub session_id: &'a str,
+    pub title: &'a str,
+    pub model: &'a str,
+    pub prompt_version: &'a str,
+    pub schema_version: &'a str,
+    pub source_fingerprint: &'a str,
+    pub payload: &'a RecapPayload,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+fn is_provisional_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    let Some(suffix) = trimmed
+        .get(..5)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("VOICE"))
+    else {
+        return false;
+    };
+    let number = &trimmed[suffix.len()..];
+    !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
 }
 
 impl Db {
@@ -167,23 +240,47 @@ impl Db {
             return Ok(());
         }
         let conn = Connection::open(path).map_err(|error| error.to_string())?;
-        let mut needs_migration = false;
-        for (table, column) in [
+        let recap_migration_needed = Self::table_exists(&conn, "sessions")?
+            && (!Self::table_exists(&conn, "session_agendas")?
+                || !Self::table_exists(&conn, "session_recaps")?);
+        if recap_migration_needed {
+            let backup = Self::recap_migration_backup_path(path);
+            if !backup.exists() {
+                std::fs::copy(path, &backup).map_err(|error| {
+                    format!(
+                        "Could not back up the existing Recall database to {} before adding recaps: {error}",
+                        backup.display()
+                    )
+                })?;
+                eprintln!(
+                    "[database] backed up the pre-recap database to {}",
+                    backup.display()
+                );
+            }
+        }
+        let checks = [
             ("sessions", "title"),
             ("sessions", "duration_ms"),
             ("segments", "speaker_id"),
             ("embeddings", "model_version"),
-        ] {
+            ("embeddings", "is_reference"),
+        ];
+        let mut missing = Vec::new();
+        for (table, column) in checks {
             if Self::table_exists(&conn, table)? && !Self::column_exists(&conn, table, column)? {
-                needs_migration = true;
-                break;
+                missing.push((table, column));
             }
         }
         drop(conn);
-        if !needs_migration {
+        if missing.is_empty() {
             return Ok(());
         }
-        let backup = Self::migration_backup_path(path);
+        let reference_only = missing.as_slice() == [("embeddings", "is_reference")];
+        let backup = if reference_only {
+            Self::reference_migration_backup_path(path)
+        } else {
+            Self::migration_backup_path(path)
+        };
         if backup.exists() {
             return Ok(());
         }
@@ -206,6 +303,22 @@ impl Db {
             .and_then(|value| value.to_str())
             .unwrap_or("recall");
         path.with_file_name(format!("{stem}.pre-standalone-v1.db"))
+    }
+
+    fn reference_migration_backup_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        path.with_file_name(format!("{stem}.pre-voice-reference-v1.db"))
+    }
+
+    fn recap_migration_backup_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        path.with_file_name(format!("{stem}.pre-recap-v1.db"))
     }
 
     fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
@@ -254,6 +367,9 @@ impl Db {
 
     fn init_schema(&self) -> Result<(), String> {
         let conn_guard = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let embeddings_existed = Self::table_exists(&conn_guard, "embeddings")?;
+        let embeddings_had_reference =
+            embeddings_existed && Self::column_exists(&conn_guard, "embeddings", "is_reference")?;
         conn_guard
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -277,7 +393,8 @@ impl Db {
                     vector_ct TEXT NOT NULL,
                     source_session_id TEXT,
                     created_at TEXT NOT NULL,
-                    model_version TEXT
+                    model_version TEXT,
+                    is_reference INTEGER NOT NULL DEFAULT 1
                  );
                  CREATE TABLE IF NOT EXISTS speaker_samples (
                     id TEXT PRIMARY KEY,
@@ -295,6 +412,27 @@ impl Db {
                     speaker_id TEXT,
                     text_nonce TEXT,
                     text_ct TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_agendas (
+                    session_id TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    content_nonce TEXT,
+                    content_ct TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_recaps (
+                    session_id TEXT PRIMARY KEY,
+                    generated_at TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    prompt_version TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    payload_nonce TEXT,
+                    payload_ct TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0
                  );",
             )
             .map_err(|e| e.to_string())?;
@@ -304,6 +442,50 @@ impl Db {
         Self::add_column_if_missing(&conn_guard, "sessions", "title", "TEXT")?;
         Self::add_column_if_missing(&conn_guard, "sessions", "duration_ms", "INTEGER DEFAULT 0")?;
         Self::add_column_if_missing(&conn_guard, "embeddings", "model_version", "TEXT")?;
+        if embeddings_existed && !embeddings_had_reference {
+            Self::add_column_if_missing(
+                &conn_guard,
+                "embeddings",
+                "is_reference",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        let reference_migration_complete: bool = conn_guard
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='voice_reference_migration_v1')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !reference_migration_complete {
+            // Earlier builds did not distinguish enrollment voiceprints from
+            // automatically accumulated observations. Preserve the oldest
+            // vector for each profile/model as its conservative reference and
+            // quarantine the rest from matching instead of deleting anything.
+            // The marker makes this restart-safe if the app stops after ALTER
+            // TABLE but before reference initialization completes.
+            conn_guard
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     UPDATE embeddings SET is_reference = 0;
+                     UPDATE embeddings AS candidate
+                        SET is_reference = 1
+                      WHERE NOT EXISTS (
+                            SELECT 1
+                              FROM embeddings AS earlier
+                             WHERE earlier.speaker_id = candidate.speaker_id
+                               AND COALESCE(earlier.model_version, '') = COALESCE(candidate.model_version, '')
+                               AND (
+                                    earlier.created_at < candidate.created_at
+                                    OR (earlier.created_at = candidate.created_at AND earlier.id < candidate.id)
+                               )
+                      );
+                     INSERT OR REPLACE INTO meta(key, value)
+                     VALUES('voice_reference_migration_v1', 'complete');
+                     COMMIT;",
+                )
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 
@@ -387,11 +569,41 @@ impl Db {
         Ok(id)
     }
 
-    pub fn delete_session(&self, session_id: &str) -> Result<(), String> {
+    pub fn delete_session(&self, session_id: &str) -> Result<usize, String> {
         let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let referenced_speakers = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT s.id, s.label
+                       FROM segments sg
+                       JOIN speakers s ON s.id = sg.speaker_id
+                      WHERE sg.session_id=?1",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut speakers = Vec::new();
+            for row in rows {
+                speakers.push(row.map_err(|error| error.to_string())?);
+            }
+            speakers
+        };
         tx.execute(
             "DELETE FROM segments WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_recaps WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_agendas WHERE session_id=?1",
             params![session_id],
         )
         .map_err(|error| error.to_string())?;
@@ -401,8 +613,41 @@ impl Db {
         if changed == 0 {
             return Err("Conversation not found".into());
         }
+        let mut removed_voices = 0;
+        for (speaker_id, label) in referenced_speakers {
+            let is_unnamed = label
+                .as_deref()
+                .map(|value| value.trim().is_empty() || is_provisional_label(value))
+                .unwrap_or(true);
+            if !is_unnamed {
+                continue;
+            }
+            let still_referenced: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM segments WHERE speaker_id=?1)",
+                    params![speaker_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if still_referenced {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM embeddings WHERE speaker_id=?1",
+                params![speaker_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "DELETE FROM speaker_samples WHERE speaker_id=?1",
+                params![speaker_id],
+            )
+            .map_err(|error| error.to_string())?;
+            removed_voices += tx
+                .execute("DELETE FROM speakers WHERE id=?1", params![speaker_id])
+                .map_err(|error| error.to_string())?;
+        }
         tx.commit().map_err(|error| error.to_string())?;
-        Ok(())
+        Ok(removed_voices)
     }
 
     pub fn update_session_transcript(
@@ -543,6 +788,225 @@ impl Db {
         Ok(segments)
     }
 
+    pub fn upsert_agenda(
+        &self,
+        session_id: &str,
+        source_kind: &str,
+        filename: &str,
+        mime_type: &str,
+        content: &[u8],
+    ) -> Result<AgendaRecord, String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let (nonce, ct) = self.crypto.encrypt(content);
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let session_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !session_exists {
+            return Err("Conversation not found".into());
+        }
+        conn.execute(
+            "INSERT INTO session_agendas(
+                session_id, source_kind, filename, mime_type, content_nonce, content_ct, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO UPDATE SET
+                source_kind=excluded.source_kind,
+                filename=excluded.filename,
+                mime_type=excluded.mime_type,
+                content_nonce=excluded.content_nonce,
+                content_ct=excluded.content_ct,
+                updated_at=excluded.updated_at",
+            params![
+                session_id,
+                source_kind,
+                filename,
+                mime_type,
+                nonce,
+                ct,
+                now.to_rfc3339()
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(AgendaRecord {
+            source_kind: source_kind.to_string(),
+            filename: filename.to_string(),
+            mime_type: mime_type.to_string(),
+            content: content.to_vec(),
+            updated_at: now,
+        })
+    }
+
+    pub fn load_agenda(&self, session_id: &str) -> Result<Option<AgendaRecord>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT source_kind, filename, mime_type, content_nonce, content_ct, updated_at
+                   FROM session_agendas
+                  WHERE session_id=?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((source_kind, filename, mime_type, nonce, ct, updated_at)) = row else {
+            return Ok(None);
+        };
+        let content = self.crypto.decrypt(&nonce, &ct)?;
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Utc);
+        Ok(Some(AgendaRecord {
+            source_kind,
+            filename,
+            mime_type,
+            content,
+            updated_at,
+        }))
+    }
+
+    pub fn delete_agenda(&self, session_id: &str) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "DELETE FROM session_agendas WHERE session_id=?1",
+                params![session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(changed > 0)
+    }
+
+    pub fn load_recap(&self, session_id: &str) -> Result<Option<RecapRecord>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT generated_at, model, prompt_version, schema_version, source_fingerprint,
+                        payload_nonce, payload_ct, input_tokens, output_tokens
+                   FROM session_recaps
+                  WHERE session_id=?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((
+            generated_at,
+            model,
+            prompt_version,
+            schema_version,
+            source_fingerprint,
+            nonce,
+            ct,
+            input_tokens,
+            output_tokens,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let payload_bytes = self.crypto.decrypt(&nonce, &ct)?;
+        let payload = serde_json::from_slice::<RecapPayload>(&payload_bytes)
+            .map_err(|error| format!("Could not read the saved recap: {error}"))?;
+        let generated_at = DateTime::parse_from_rfc3339(&generated_at)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Utc);
+        Ok(Some(RecapRecord {
+            session_id: session_id.to_string(),
+            generated_at,
+            model,
+            prompt_version,
+            schema_version,
+            source_fingerprint,
+            payload,
+            input_tokens: input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+        }))
+    }
+
+    pub fn save_recap_and_title(&self, recap: RecapSave<'_>) -> Result<RecapRecord, String> {
+        let generated_at: DateTime<Utc> = SystemTime::now().into();
+        let payload_bytes = serde_json::to_vec(recap.payload)
+            .map_err(|error| format!("Could not serialize the recap: {error}"))?;
+        let (nonce, ct) = self.crypto.encrypt(&payload_bytes);
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE sessions SET title=?1 WHERE id=?2",
+                params![recap.title.trim(), recap.session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("Conversation not found".into());
+        }
+        tx.execute(
+            "INSERT INTO session_recaps(
+                session_id, generated_at, model, prompt_version, schema_version,
+                source_fingerprint, payload_nonce, payload_ct, input_tokens, output_tokens
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(session_id) DO UPDATE SET
+                generated_at=excluded.generated_at,
+                model=excluded.model,
+                prompt_version=excluded.prompt_version,
+                schema_version=excluded.schema_version,
+                source_fingerprint=excluded.source_fingerprint,
+                payload_nonce=excluded.payload_nonce,
+                payload_ct=excluded.payload_ct,
+                input_tokens=excluded.input_tokens,
+                output_tokens=excluded.output_tokens",
+            params![
+                recap.session_id,
+                generated_at.to_rfc3339(),
+                recap.model,
+                recap.prompt_version,
+                recap.schema_version,
+                recap.source_fingerprint,
+                nonce,
+                ct,
+                recap.input_tokens.min(i64::MAX as u64) as i64,
+                recap.output_tokens.min(i64::MAX as u64) as i64,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(RecapRecord {
+            session_id: recap.session_id.to_string(),
+            generated_at,
+            model: recap.model.to_string(),
+            prompt_version: recap.prompt_version.to_string(),
+            schema_version: recap.schema_version.to_string(),
+            source_fingerprint: recap.source_fingerprint.to_string(),
+            payload: recap.payload.clone(),
+            input_tokens: recap.input_tokens,
+            output_tokens: recap.output_tokens,
+        })
+    }
+
     pub fn update_segment_text(&self, segment_id: &str, text: &str) -> Result<(), String> {
         let (nonce, ct) = self.crypto.encrypt(text.trim().as_bytes());
         let changed = self
@@ -651,10 +1115,14 @@ impl Db {
             .prepare(
                 "SELECT s.id, s.label, s.created_at,
                         (SELECT COUNT(1) FROM speaker_samples sm WHERE sm.speaker_id = s.id) as sample_count,
-                        (SELECT COUNT(1) FROM embeddings e WHERE e.speaker_id = s.id AND e.model_version = ?1) as embedding_count,
-                        (SELECT COUNT(DISTINCT sg.session_id) FROM segments sg WHERE sg.speaker_id = s.id) as conversation_count
+                        (SELECT COUNT(1) FROM embeddings e WHERE e.speaker_id = s.id AND e.model_version = ?1 AND e.is_reference = 1) as embedding_count,
+                        (SELECT COUNT(DISTINCT sg.session_id) FROM segments sg WHERE sg.speaker_id = s.id) as conversation_count,
+                        (SELECT MAX(se.created_at)
+                           FROM segments sg
+                           JOIN sessions se ON se.id = sg.session_id
+                          WHERE sg.speaker_id = s.id) as last_seen_at
                  FROM speakers s
-                 ORDER BY s.created_at ASC",
+                 ORDER BY COALESCE(last_seen_at, s.created_at) DESC",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -665,6 +1133,7 @@ impl Db {
                 let sample_count: i64 = row.get(3)?;
                 let embedding_count: i64 = row.get(4)?;
                 let conversation_count: i64 = row.get(5)?;
+                let last_seen_at: Option<String> = row.get(6)?;
                 Ok((
                     id,
                     label,
@@ -672,21 +1141,37 @@ impl Db {
                     sample_count,
                     embedding_count,
                     conversation_count,
+                    last_seen_at,
                 ))
             })
             .map_err(|e| e.to_string())?;
 
         let mut speakers = Vec::new();
         for row in rows {
-            let (id, label, created_at, sample_count, embedding_count, conversation_count) =
-                row.map_err(|e| e.to_string())?;
+            let (
+                id,
+                label,
+                created_at,
+                sample_count,
+                embedding_count,
+                conversation_count,
+                last_seen_at,
+            ) = row.map_err(|e| e.to_string())?;
             let created_at = DateTime::parse_from_rfc3339(&created_at)
                 .map_err(|e| e.to_string())?
                 .with_timezone(&Utc);
+            let last_seen_at = last_seen_at
+                .map(|value| {
+                    DateTime::parse_from_rfc3339(&value)
+                        .map(|date| date.with_timezone(&Utc))
+                        .map_err(|error| error.to_string())
+                })
+                .transpose()?;
             speakers.push(SpeakerStats {
                 id,
                 label,
                 created_at,
+                last_seen_at,
                 sample_count: sample_count as usize,
                 embedding_count: embedding_count as usize,
                 conversation_count: conversation_count as usize,
@@ -759,6 +1244,33 @@ impl Db {
     pub fn delete_speaker(&self, speaker_id: &str) -> Result<(), String> {
         let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let profile: Option<(Option<String>, i64)> = tx
+            .query_row(
+                "SELECT s.label,
+                        (SELECT COUNT(DISTINCT sg.session_id)
+                           FROM segments sg
+                          WHERE sg.speaker_id = s.id)
+                   FROM speakers s
+                  WHERE s.id=?1",
+                params![speaker_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((label, conversation_count)) = profile else {
+            return Err("Speaker profile not found".into());
+        };
+        let is_named = label
+            .as_deref()
+            .map(|value| !value.trim().is_empty() && !is_provisional_label(value))
+            .unwrap_or(false);
+        if is_named && conversation_count > 0 {
+            let label = label.as_deref().unwrap_or("This named person");
+            return Err(format!(
+                "{label} is used in {conversation_count} conversation{}. Reassign or delete those conversations before deleting the named voice profile.",
+                if conversation_count == 1 { "" } else { "s" }
+            ));
+        }
         tx.execute(
             "DELETE FROM embeddings WHERE speaker_id=?1",
             params![speaker_id],
@@ -774,12 +1286,8 @@ impl Db {
             params![speaker_id],
         )
         .map_err(|e| e.to_string())?;
-        let changed = tx
-            .execute("DELETE FROM speakers WHERE id=?1", params![speaker_id])
+        tx.execute("DELETE FROM speakers WHERE id=?1", params![speaker_id])
             .map_err(|e| e.to_string())?;
-        if changed == 0 {
-            return Err("Speaker profile not found".into());
-        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -836,7 +1344,7 @@ impl Db {
 
         let target_is_named = target_label
             .as_deref()
-            .map(|label| !label.starts_with("VOICE"))
+            .map(|label| !is_provisional_label(label))
             .unwrap_or(false);
         if target_is_named {
             tx.execute(
@@ -872,7 +1380,7 @@ impl Db {
             .lock()
             .map_err(|_| "lock poisoned".to_string())?
             .execute(
-                "INSERT INTO embeddings(id, speaker_id, vector_nonce, vector_ct, source_session_id, created_at, model_version) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO embeddings(id, speaker_id, vector_nonce, vector_ct, source_session_id, created_at, model_version, is_reference) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
                 params![id, speaker_id, nonce, ct, session_id, now.to_rfc3339(), model_version],
             )
             .map_err(|e| e.to_string())?;
@@ -937,7 +1445,7 @@ impl Db {
                 "SELECT e.id, e.speaker_id, s.label, e.vector_nonce, e.vector_ct, e.source_session_id, e.created_at, e.model_version
                  FROM embeddings e
                  LEFT JOIN speakers s ON e.speaker_id = s.id
-                 WHERE e.model_version = ?1",
+                 WHERE e.model_version = ?1 AND e.is_reference = 1",
             )
             .map_err(|e| e.to_string())?;
         let rows = stmt
@@ -1005,12 +1513,48 @@ mod tests {
         Db::open(":memory:", Crypto::new(None, None)).expect("open in-memory database")
     }
 
+    fn test_recap_payload() -> RecapPayload {
+        let localized = crate::recap::LocalizedText {
+            original: "Summary".into(),
+            english: "Summary".into(),
+        };
+        RecapPayload {
+            meeting_title_english: "Weekly planning".into(),
+            dominant_language: "en".into(),
+            executive_summary: localized.clone(),
+            full_summary: vec![crate::recap::SummarySection {
+                heading: localized.clone(),
+                body: localized,
+                evidence_segment_ids: vec!["segment-1".into()],
+            }],
+            commitments: Vec::new(),
+            actions_already_taken: Vec::new(),
+            agenda_present: false,
+            agenda_coverage: Vec::new(),
+            translations: Vec::new(),
+        }
+    }
+
     #[test]
     fn voice_labels_are_monotonic() {
         let db = memory_db();
         db.insert_speaker(Some("Alice")).unwrap();
         db.insert_speaker(Some("VOICE9")).unwrap();
         assert_eq!(db.next_voice_label().unwrap(), "VOICE10");
+    }
+
+    #[test]
+    fn speaker_stats_report_when_a_voice_was_last_heard() {
+        let db = memory_db();
+        let session = db.insert_session("Test", "", 1_000).unwrap();
+        let speaker = db.insert_speaker(Some("VOICE1")).unwrap();
+        db.insert_segment(&session, 0, 1_000, Some(&speaker), Some("VOICE1"), "Hello")
+            .unwrap();
+
+        let stats = db.list_speakers_with_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].conversation_count, 1);
+        assert!(stats[0].last_seen_at.is_some());
     }
 
     #[test]
@@ -1031,6 +1575,78 @@ mod tests {
         let segments = db.list_segments(&session).unwrap();
         assert_eq!(segments[0].speaker_label.as_deref(), Some("Alice"));
         assert!(db.list_samples(&speaker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_named_voice_used_by_history_is_blocked() {
+        let db = memory_db();
+        let session = db.insert_session("Test", "", 1_000).unwrap();
+        let speaker = db.insert_speaker(Some("Alice")).unwrap();
+        db.insert_embedding(
+            &speaker,
+            &session,
+            &[1.0, 0.0],
+            crate::embedding::EMBEDDING_VERSION,
+        )
+        .unwrap();
+        db.insert_sample(&speaker, "dGVzdA==", 16_000).unwrap();
+        db.insert_segment(&session, 0, 1_000, Some(&speaker), Some("Alice"), "Hello")
+            .unwrap();
+
+        let error = db.delete_speaker(&speaker).unwrap_err();
+
+        assert!(error.contains("used in 1 conversation"));
+        assert_eq!(db.list_speakers().unwrap().len(), 1);
+        assert_eq!(
+            db.list_embeddings(crate::embedding::EMBEDDING_VERSION)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(db.list_samples(&speaker).unwrap().len(), 1);
+        let segments = db.list_segments(&session).unwrap();
+        assert_eq!(segments[0].speaker_id.as_deref(), Some(speaker.as_str()));
+        assert_eq!(segments[0].speaker_label.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn deleting_an_unused_named_voice_removes_its_private_artifacts() {
+        let db = memory_db();
+        let session = db.insert_session("Test", "", 1_000).unwrap();
+        let speaker = db.insert_speaker(Some("Alice")).unwrap();
+        db.insert_embedding(
+            &speaker,
+            &session,
+            &[1.0, 0.0],
+            crate::embedding::EMBEDDING_VERSION,
+        )
+        .unwrap();
+        db.insert_sample(&speaker, "dGVzdA==", 16_000).unwrap();
+
+        db.delete_speaker(&speaker).unwrap();
+
+        assert!(db.list_speakers().unwrap().is_empty());
+        assert!(db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap()
+            .is_empty());
+        assert!(db.list_samples(&speaker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_provisional_voice_can_unattribute_history() {
+        let db = memory_db();
+        let session = db.insert_session("Test", "", 1_000).unwrap();
+        let speaker = db.insert_speaker(Some("VOICE12")).unwrap();
+        db.insert_segment(&session, 0, 1_000, Some(&speaker), Some("VOICE12"), "Hello")
+            .unwrap();
+
+        db.delete_speaker(&speaker).unwrap();
+
+        assert!(db.list_speakers().unwrap().is_empty());
+        let segments = db.list_segments(&session).unwrap();
+        assert!(segments[0].speaker_id.is_none());
+        assert!(segments[0].speaker_label.is_none());
     }
 
     #[test]
@@ -1088,7 +1704,7 @@ mod tests {
         db.insert_segment(&session, 0, 1_000, Some(&speaker), Some("Alice"), "Hello")
             .unwrap();
 
-        db.delete_session(&session).unwrap();
+        assert_eq!(db.delete_session(&session).unwrap(), 0);
 
         assert!(db.list_sessions().unwrap().is_empty());
         assert_eq!(db.list_speakers().unwrap().len(), 1);
@@ -1101,9 +1717,185 @@ mod tests {
     }
 
     #[test]
+    fn agenda_and_recap_round_trip_and_are_deleted_with_the_conversation() {
+        let db = memory_db();
+        let session = db.insert_session("Before recap", "", 1_000).unwrap();
+        let agenda = db
+            .upsert_agenda(
+                &session,
+                "text",
+                "Pasted agenda.txt",
+                "text/plain",
+                b"Introductions",
+            )
+            .unwrap();
+        assert_eq!(
+            agenda.metadata().text_content.as_deref(),
+            Some("Introductions")
+        );
+        let recap = db
+            .save_recap_and_title(RecapSave {
+                session_id: &session,
+                title: "Weekly planning",
+                model: "test-model",
+                prompt_version: crate::recap::PROMPT_VERSION,
+                schema_version: crate::recap::SCHEMA_VERSION,
+                source_fingerprint: "fingerprint",
+                payload: &test_recap_payload(),
+                input_tokens: 123,
+                output_tokens: 45,
+            })
+            .unwrap();
+        assert_eq!(recap.payload.meeting_title_english, "Weekly planning");
+        assert_eq!(db.list_sessions().unwrap()[0].title, "Weekly planning");
+        assert_eq!(
+            db.load_agenda(&session).unwrap().unwrap().content,
+            b"Introductions"
+        );
+        assert_eq!(
+            db.load_recap(&session).unwrap().unwrap().source_fingerprint,
+            "fingerprint"
+        );
+
+        db.delete_session(&session).unwrap();
+        assert!(db.load_agenda(&session).unwrap().is_none());
+        assert!(db.load_recap(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn deleting_a_conversation_removes_its_orphan_provisional_voice() {
+        let db = memory_db();
+        let session = db.insert_session("Test", "", 1_000).unwrap();
+        let speaker = db.insert_speaker(Some("VOICE12")).unwrap();
+        db.insert_embedding(
+            &speaker,
+            &session,
+            &[1.0, 0.0],
+            crate::embedding::EMBEDDING_VERSION,
+        )
+        .unwrap();
+        db.insert_sample(&speaker, "dGVzdA==", 16_000).unwrap();
+        db.insert_segment(&session, 0, 1_000, Some(&speaker), Some("VOICE12"), "Hello")
+            .unwrap();
+
+        assert_eq!(db.delete_session(&session).unwrap(), 1);
+        assert!(db.list_speakers().unwrap().is_empty());
+        assert!(db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap()
+            .is_empty());
+        assert!(db.list_samples(&speaker).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_one_conversation_keeps_a_provisional_voice_used_elsewhere() {
+        let db = memory_db();
+        let first = db.insert_session("First", "", 1_000).unwrap();
+        let second = db.insert_session("Second", "", 1_000).unwrap();
+        let speaker = db.insert_speaker(Some("VOICE4")).unwrap();
+        db.insert_embedding(
+            &speaker,
+            &first,
+            &[1.0, 0.0],
+            crate::embedding::EMBEDDING_VERSION,
+        )
+        .unwrap();
+        db.insert_sample(&speaker, "dGVzdA==", 16_000).unwrap();
+        for session in [&first, &second] {
+            db.insert_segment(session, 0, 1_000, Some(&speaker), Some("VOICE4"), "Hello")
+                .unwrap();
+        }
+
+        assert_eq!(db.delete_session(&first).unwrap(), 0);
+        assert_eq!(db.list_speakers().unwrap().len(), 1);
+        assert_eq!(db.list_samples(&speaker).unwrap().len(), 1);
+        assert_eq!(
+            db.list_embeddings(crate::embedding::EMBEDDING_VERSION)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            db.session_ids_for_speakers(&[speaker.as_str()]).unwrap(),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn migration_keeps_only_the_oldest_legacy_embedding_as_a_reference() {
+        let path = std::env::temp_dir().join(format!(
+            "recall-reference-migration-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let backup = Db::reference_migration_backup_path(&path);
+        let vector = general_purpose::STANDARD.encode(bytemuck::cast_slice(&[1.0_f32, 0.0]));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE speakers (
+                    id TEXT PRIMARY KEY,
+                    label TEXT,
+                    created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE embeddings (
+                    id TEXT PRIMARY KEY,
+                    speaker_id TEXT,
+                    vector_nonce TEXT,
+                    vector_ct TEXT NOT NULL,
+                    source_session_id TEXT,
+                    created_at TEXT NOT NULL,
+                    model_version TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO speakers(id, label, created_at) VALUES('s1', 'Alice', '2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO embeddings VALUES('older', 's1', '', ?1, 'session-1', '2026-01-01T00:00:00Z', ?2)",
+                params![vector, crate::embedding::EMBEDDING_VERSION],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO embeddings VALUES('newer', 's1', '', ?1, 'session-2', '2026-01-02T00:00:00Z', ?2)",
+                params![vector, crate::embedding::EMBEDDING_VERSION],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+        assert!(backup.is_file());
+        let references = db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].id, "older");
+        let conn = db.conn.lock().unwrap();
+        let total: i64 = conn
+            .query_row("SELECT COUNT(1) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 2);
+        let marker: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='voice_reference_migration_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "complete");
+        drop(conn);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
     fn opening_a_legacy_database_adds_columns_without_losing_transcript() {
         let path = std::env::temp_dir().join(format!("recall-db-test-{}.sqlite", Uuid::new_v4()));
         let backup = Db::migration_backup_path(&path);
+        let recap_backup = Db::recap_migration_backup_path(&path);
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -1169,5 +1961,6 @@ mod tests {
         }
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(backup).unwrap();
+        std::fs::remove_file(recap_backup).unwrap();
     }
 }
