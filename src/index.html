@@ -203,6 +203,84 @@
       <div id="activityLog" class="activity-log" role="log" aria-live="polite"></div>
     </aside>
 
+    <dialog id="onboardingDialog" class="modal onboarding-modal" aria-labelledby="onboardingTitle">
+      <div class="onboarding-hero">
+        <img src="recall-icon.png" alt="" aria-hidden="true" />
+        <div>
+          <span class="eyebrow">Welcome to Recall</span>
+          <h2 id="onboardingTitle">Own your meeting memory.</h2>
+          <p>Recall is an open-source alternative to meeting-note services with substantial recurring subscriptions. Recall charges no subscription: you bring provider keys and pay the providers directly for the processing you use.</p>
+        </div>
+      </div>
+
+      <div class="onboarding-scroll">
+        <div class="onboarding-principles" aria-label="Recall principles">
+          <span>Local SQLite archive</span>
+          <span>Local voice profiles</span>
+          <span>No Recall cloud</span>
+        </div>
+
+        <p class="onboarding-choice-note"><strong>Only need transcription?</strong> Soniox is sufficient for live captions and the final diarized transcript. OpenAI is optional and is used only when you explicitly request meeting summaries and a recap.</p>
+
+        <p class="onboarding-cost-note">For many people, direct usage costs can be far below a meeting-tool subscription. Your actual cost depends on how much you use Recall and on current provider pricing.</p>
+
+        <div class="provider-grid">
+          <section class="provider-card">
+            <div class="provider-card-heading">
+              <div>
+                <span class="eyebrow">Required for transcription</span>
+                <h3>1. Connect Soniox</h3>
+              </div>
+              <span class="provider-role">Speech</span>
+            </div>
+            <ol>
+              <li>Create an account or sign in to the Soniox Console.</li>
+              <li>Open <strong>My First Project → API Keys</strong> and generate a key.</li>
+              <li>Add prepaid balance or automatic top-up if your account requires it.</li>
+              <li>Paste the key into Recall Settings. It stays in a local user-only file.</li>
+            </ol>
+            <button class="secondary-button external-link-button" type="button" data-external-url="https://console.soniox.com">Open Soniox Console ↗</button>
+          </section>
+
+          <section class="provider-card">
+            <div class="provider-card-heading">
+              <div>
+                <span class="eyebrow">Optional for recaps</span>
+                <h3>2. Connect OpenAI</h3>
+              </div>
+              <span class="provider-role">Summaries</span>
+            </div>
+            <ol>
+              <li>Create or sign in to an OpenAI API Platform account.</li>
+              <li>Add API billing or credits. ChatGPT subscriptions and API billing are separate.</li>
+              <li>Create a secret key on the API Keys page and paste it into Recall Settings.</li>
+              <li>OpenAI is called only when you explicitly choose <strong>Recap</strong>.</li>
+            </ol>
+            <div class="provider-links">
+              <button class="secondary-button external-link-button" type="button" data-external-url="https://platform.openai.com/api-keys">Open API keys ↗</button>
+              <button class="text-button external-link-button" type="button" data-external-url="https://platform.openai.com/settings/organization/billing/overview">Open billing ↗</button>
+            </div>
+          </section>
+        </div>
+
+        <section class="onboarding-fork-note">
+          <div>
+            <span class="eyebrow">Opinionated by default, forkable by design</span>
+            <h3>Soniox + OpenAI is the official path—not a lock-in.</h3>
+          </div>
+          <p>Recall intentionally avoids a provider-picker maze. If you prefer Whisper, Deepgram, Anthropic, a local model, or something else, fork the repository and replace the focused provider module while keeping the desktop interface, local archive, and voice library.</p>
+          <button class="text-button external-link-button" type="button" data-external-url="https://github.com/mvartanyan/recall-app">View the source ↗</button>
+        </section>
+
+        <p class="onboarding-browser-note">Account links open official provider pages in your default browser. Conversations and speaker identities remain in Recall's local database; because the project is open source, you can inspect, back up, migrate, and modify how they are stored.</p>
+      </div>
+
+      <div class="modal-footer onboarding-footer">
+        <button id="onboardingExploreButton" class="text-button" type="button">Explore first</button>
+        <button id="onboardingSettingsButton" class="primary-button" type="button" autofocus>Open Settings</button>
+      </div>
+    </dialog>
+
     <dialog id="voiceLibraryDialog" class="modal voice-library-modal">
       <div class="modal-header">
         <div>
@@ -240,7 +318,10 @@
             <span class="eyebrow">Preferences</span>
             <h2>Settings</h2>
           </div>
-          <button class="icon-button" type="button" data-close-dialog="settingsDialog" aria-label="Close settings">×</button>
+          <div class="modal-header-actions">
+            <button id="gettingStartedButton" class="text-button" type="button">Getting started</button>
+            <button class="icon-button" type="button" data-close-dialog="settingsDialog" aria-label="Close settings">×</button>
+          </div>
         </div>
 
         <section class="settings-section">
@@ -262,8 +343,8 @@
         <section class="settings-section">
           <div class="setting-title-row">
             <div>
-              <h3>OpenAI API key</h3>
-              <p>Used only when you explicitly click Recap. Recall sends the finalized transcript and optional agenda directly to OpenAI with <code>store: false</code>. This disables API response storage but is not, by itself, a Zero Data Retention guarantee.</p>
+              <h3>OpenAI API key (optional)</h3>
+              <p>Not needed for transcription. Used only when you explicitly click Recap. Recall sends the finalized transcript and optional agenda directly to OpenAI with <code>store: false</code>. This disables API response storage but is not, by itself, a Zero Data Retention guarantee.</p>
             </div>
             <span id="openaiKeyStatus" class="service-badge warning" hidden>Not configured</span>
           </div>

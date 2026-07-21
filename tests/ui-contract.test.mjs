@@ -20,7 +20,25 @@ const tauriConfig = fs.readFileSync(
   new URL("../src-tauri/tauri.conf.json", import.meta.url),
   "utf8",
 );
+const tauriSettings = JSON.parse(tauriConfig);
+const macEntitlements = fs.readFileSync(
+  new URL("../src-tauri/Entitlements.plist", import.meta.url),
+  "utf8",
+);
+const thirdPartyNotices = fs.readFileSync(
+  new URL("../THIRD_PARTY_NOTICES.md", import.meta.url),
+  "utf8",
+);
+const licenseMit = fs.readFileSync(new URL("../LICENSE-MIT", import.meta.url), "utf8");
+const licenseApache = fs.readFileSync(
+  new URL("../LICENSE-APACHE", import.meta.url),
+  "utf8",
+);
 const packageJson = fs.readFileSync(new URL("../package.json", import.meta.url), "utf8");
+const packageMacScript = fs.readFileSync(
+  new URL("../scripts/package_macos_local.sh", import.meta.url),
+  "utf8",
+);
 const stylesheet = fs.readFileSync(new URL("../src/style.css", import.meta.url), "utf8");
 const mainCapability = JSON.parse(
   fs.readFileSync(
@@ -93,6 +111,55 @@ test("the Recall mark is used by both the desktop view and native bundle", () =>
   ]) {
     assert(fs.existsSync(new URL(asset, import.meta.url)), `Missing identity asset: ${asset}`);
   }
+});
+
+test("the macOS package declares its runtime, microphone, model, and notice contract", () => {
+  assert.equal(tauriSettings.bundle.macOS.minimumSystemVersion, "11.0");
+  assert.equal(tauriSettings.bundle.macOS.entitlements, "Entitlements.plist");
+  assert.match(macEntitlements, /com\.apple\.security\.device\.audio-input/);
+  assert.match(macEntitlements, /<true\s*\/>/);
+  assert.equal(
+    tauriSettings.bundle.resources["../THIRD_PARTY_NOTICES.md"],
+    "THIRD_PARTY_NOTICES.md",
+  );
+  assert.equal(tauriSettings.bundle.resources["../LICENSE-MIT"], "LICENSE-MIT");
+  assert.equal(
+    tauriSettings.bundle.resources["../LICENSE-APACHE"],
+    "LICENSE-APACHE",
+  );
+  assert.match(thirdPartyNotices, /WeSpeaker ECAPA-TDNN-512/);
+  assert.match(thirdPartyNotices, /Creative Commons Attribution 4\.0/);
+  assert.match(packageJson, /"package:mac:local"/);
+  assert.match(packageJson, /"verify:mac:package"/);
+  assert.match(packageMacScript, /npm run audit:licenses/);
+  assert.match(packageMacScript, /npm run audit:secrets/);
+});
+
+test("the project publishes permissive source licenses without relicensing the model", () => {
+  assert.equal(JSON.parse(packageJson).license, "MIT OR Apache-2.0");
+  assert.match(cargoToml, /^license\s*=\s*"MIT OR Apache-2\.0"/m);
+  assert.match(licenseMit, /Permission is hereby granted, free of charge/);
+  assert.match(licenseApache, /Apache License[\s\S]*Version 2\.0/);
+  assert.match(thirdPartyNotices, /model is made available under/);
+  assert.match(thirdPartyNotices, /CC BY 4\.0/);
+});
+
+test("first launch explains provider setup and remains reopenable", () => {
+  assert.match(html, /id="onboardingDialog"/);
+  assert.match(html, /Own your meeting memory/);
+  assert.match(html, /Opinionated by default, forkable by design/);
+  assert.match(html, /Soniox is sufficient for live captions and the final diarized transcript/);
+  assert.match(html, /OpenAI is optional and is used only when you explicitly request/);
+  assert.match(html, /OpenAI API key \(optional\)/);
+  assert.match(html, /Not needed for transcription/);
+  assert.match(html, /id="gettingStartedButton"/);
+  assert.match(javascript, /shouldShowOnboarding/);
+  assert.match(javascript, /scheduleInitialSetupPrompt/);
+  assert.match(javascript, /invoke\("complete_onboarding"/);
+  assert.match(rustConfig, /onboarding_version/);
+  assert.match(javascript, /open_external_url/);
+  assert.match(rustMain, /const ALLOWED_EXTERNAL_URLS/);
+  assert.match(rustMain, /fn is_allowed_external_url/);
 });
 
 test("live captions have event delivery plus a native polling fallback", () => {

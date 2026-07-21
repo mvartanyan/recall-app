@@ -2,11 +2,20 @@
   "name": "recall",
   "version": "0.1.0",
   "description": "Recall desktop app (Tauri + Rust).",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mvartanyan/recall-app.git"
+  },
   "type": "module",
   "main": "src/main.js",
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
+    "package:mac:local": "./scripts/package_macos_local.sh",
+    "verify:mac:package": "./scripts/verify_macos_bundle.sh",
+    "audit:licenses": "node scripts/audit_licenses.mjs",
+    "audit:secrets": "node scripts/audit_secrets.mjs",
     "check:ui": "node --check src/main.js",
     "test": "node --test src/ui-helpers.test.mjs tests/ui-contract.test.mjs",
     "lint": "npm run check:ui"

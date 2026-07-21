@@ -1,6 +1,25 @@
-# Recall desktop
+# Recall
 
-Recall is a macOS-first Tauri desktop app for recording meetings, showing live captions, producing a final diarized transcript, identifying recurring voices with a local voice database, and optionally generating an on-demand OpenAI recap.
+**A local-first, open-source meeting memory for macOS.**
+
+Recall records meetings, shows live captions, produces a final diarized transcript, identifies recurring voices with a local voice database, and can generate an on-demand meeting recap. It is intended as an open-source alternative to meeting-note and summarization products with substantial recurring subscription fees.
+
+Recall itself has no subscription and no hosted Recall account. You bring API keys and pay the providers directly for the processing you use. For many people, those usage-based charges can be far below another monthly meeting-tool subscription, although actual cost depends on usage and current provider pricing. Conversations, participant names, agendas, recaps, and voice profiles remain in a local SQLite archive whose format and implementation you control.
+
+## Opinionated by default, forkable by design
+
+The official Recall build supports exactly two cloud providers:
+
+- [Soniox](https://soniox.com/) for live and final speech-to-text, language identification, and within-meeting diarization.
+- [OpenAI](https://platform.openai.com/) for optional recaps that run only when the user explicitly requests one.
+
+This is deliberate. Recall avoids making every user navigate a provider matrix or making its main interface the least-common-denominator of many APIs. Soniox plus OpenAI is the maintained, tested path.
+
+It is also not a lock-in. Fork the repository if you want Whisper, Deepgram, Anthropic, a local model, or another provider. Provider-specific transport and response handling are concentrated in [`src-tauri/src/soniox.rs`](src-tauri/src/soniox.rs) and [`src-tauri/src/openai.rs`](src-tauri/src/openai.rs); the local database, recording flow, voice library, and desktop interface remain reusable. A replacement still needs to map its provider's events and output into Recall's existing transcript or recap contracts and update the corresponding tests, but it does not require rebuilding the product around a web backend or plugin framework.
+
+Recall-owned source is available under your choice of the [MIT License](LICENSE-MIT) or [Apache License 2.0](LICENSE-APACHE). Third-party dependencies and the bundled voice model retain their own terms; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## The privacy and cost model
 
 The active app is standalone:
 
@@ -11,6 +30,8 @@ The active app is standalone:
 - Conversations, transcript interventions, speaker names, and voiceprints stay in local SQLite.
 - Temporary raw audio is deleted after final transcription and local voiceprint extraction.
 - OpenAI is optional and receives transcript/agenda content only when the user explicitly chooses **Recap**.
+
+Recall is local-first, not offline-only: audio is sent directly to Soniox for transcription, and finalized meeting material is sent directly to OpenAI only for an explicit recap. There is no Recall cloud in between.
 
 ## Current capabilities
 
@@ -85,7 +106,29 @@ The active app is standalone:
 
 Recall never generates a recap automatically.
 
-## First-time setup on macOS
+## First launch on macOS
+
+Recall opens a getting-started guide the first time it launches. The guide explains the two provider roles, links only to official account pages, and can be reopened later from **Settings → Getting started**.
+
+Soniox alone is sufficient for live captions and the final diarized transcript. OpenAI is optional and is used only for on-demand summaries and recaps.
+
+To configure transcription:
+
+1. Create an account or sign in at the [Soniox Console](https://console.soniox.com/).
+2. Open **My First Project → API Keys** and generate a key.
+3. Add prepaid balance or automatic top-up if your Soniox account requires it.
+4. In Recall Settings, paste the key and choose **Save key**.
+
+To enable optional recaps:
+
+1. Sign in to the [OpenAI API Platform](https://platform.openai.com/). ChatGPT subscriptions and API billing are separate.
+2. Configure [API billing](https://platform.openai.com/settings/organization/billing/overview).
+3. Create a secret on the [API Keys page](https://platform.openai.com/api-keys).
+4. Paste it into Recall Settings and choose a model available to your API project.
+
+Recall stores both keys in local macOS user-only files. It does not put them in SQLite or return them to the desktop JavaScript view.
+
+## Run from source on macOS
 
 You need:
 
@@ -107,7 +150,7 @@ npm run dev
 
 npm ci installs packages into app/node_modules/; it does not install Recall packages globally. node_modules/, Rust build output, editor files, and local environment files are ignored by Git. package-lock.json is intentionally tracked.
 
-On first launch:
+After launching from source:
 
 1. Open **Settings**.
 2. Paste a Soniox API key and choose **Save key**. Recall writes it to its local
@@ -138,6 +181,8 @@ From app/:
 npm ci
 npm test
 npm run lint
+npm run audit:licenses
+npm run audit:secrets
 npm run dev
 ~~~
 
@@ -173,6 +218,18 @@ The resulting development binary is:
 ~~~text
 app/src-tauri/target/debug/recall
 ~~~
+
+Build and verify an optimized Apple-silicon DMG for local/internal testing:
+
+~~~sh
+npm run package:mac:local
+~~~
+
+This recipe uses ad-hoc signing and is not a distributable public release.
+Developer ID signing and Apple notarization are required before ordinary users
+can open a downloaded build without a Gatekeeper warning. See
+[PACKAGING.md](PACKAGING.md) for artifact paths, verification, release
+credentials, architecture choices, and the external-release checklist.
 
 Speaker-model smoke test with a mono WAV:
 
@@ -283,7 +340,9 @@ that migration and is never overwritten.
 - Native macOS system-audio capture is pending; virtual/aggregate input is the current route.
 - Local database encryption migration is pending.
 - The legacy bundle identifier com.example.recall is retained to avoid silently moving existing user data.
-- App signing, notarization, auto-update, and release packaging are not configured.
+- A repeatable ad-hoc Apple-silicon app/DMG build, microphone entitlement, model
+  attribution, and package verifier are configured. Developer ID signing,
+  notarization, Intel/universal builds, and auto-update are not configured.
 - The native recap client, schema validation, persistence, stale-result guard,
   and interface contracts have automated coverage. The configured model has
   also returned valid structured results for the current multilingual meeting
@@ -292,3 +351,11 @@ that migration and is never overwritten.
   two-segment probe passed that contract. Full native save/tab acceptance plus
   PDF/DOCX agenda testing still need confirmation; model output quality and cost
   have not yet been calibrated.
+
+## License and publication
+
+Recall-owned source is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. This lets forks use, modify, redistribute, and commercialize the code under widely used permissive terms. Contributions are accepted under the same dual license unless explicitly agreed otherwise.
+
+Dependencies are not relicensed by Recall. Their declared licenses are checked by `npm run audit:licenses`; the current macOS dependency graph has no GPL, AGPL, LGPL, SSPL, Business Source License, or non-commercial dependency. Several transitive Rust crates use MPL-2.0 file-level terms, which remain their own terms. The included WeSpeaker ECAPA model is CC BY 4.0 and requires attribution. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [`models/README.md`](models/README.md).
+
+Before a public binary release, regenerate and review complete third-party notices, complete Apple Developer ID signing/notarization, and run the acceptance checklist in [PACKAGING.md](PACKAGING.md). The license audit is an engineering safeguard, not legal advice.

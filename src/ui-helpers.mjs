@@ -1,3 +1,9 @@
+export const ONBOARDING_VERSION = "1";
+
+export function shouldShowOnboarding(storedVersion) {
+  return String(storedVersion || "") !== ONBOARDING_VERSION;
+}
+
 export function isProvisionalLabel(label) {
   return /^VOICE\d+$/i.test((label || "").trim());
 }

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  ONBOARDING_VERSION,
   buildTranslationPlan,
   contentMode,
   filterSessions,
@@ -12,9 +13,17 @@ import {
   parseLanguageHints,
   parseNoTranslationLanguages,
   recapTabAvailability,
+  shouldShowOnboarding,
   translatedSegmentText,
   transcriptFromSegments,
 } from "./ui-helpers.mjs";
+
+test("onboarding is shown until the current copy version is acknowledged", () => {
+  assert.equal(shouldShowOnboarding(null), true);
+  assert.equal(shouldShowOnboarding(""), true);
+  assert.equal(shouldShowOnboarding("0"), true);
+  assert.equal(shouldShowOnboarding(ONBOARDING_VERSION), false);
+});
 
 test("workspace modes are mutually exclusive and recording takes priority", () => {
   assert.equal(contentMode(), "empty");

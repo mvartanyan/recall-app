@@ -34,12 +34,16 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../models/spkrec-ecapa-voxceleb.onnx": "models/spkrec-ecapa-voxceleb.onnx"
+      "../models/spkrec-ecapa-voxceleb.onnx": "models/spkrec-ecapa-voxceleb.onnx",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../LICENSE-MIT": "LICENSE-MIT",
+      "../LICENSE-APACHE": "LICENSE-APACHE"
     },
     "macOS": {
       "frameworks": [],
-      "minimumSystemVersion": "10.13",
-      "infoPlist": "Info.plist"
+      "minimumSystemVersion": "11.0",
+      "infoPlist": "Info.plist",
+      "entitlements": "Entitlements.plist"
     }
   }
 }

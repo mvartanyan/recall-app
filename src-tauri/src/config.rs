@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub live_transcription: bool,
     pub openai_model: String,
     pub no_translation_languages: Vec<String>,
+    pub onboarding_version: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -24,6 +25,7 @@ impl Default for AppConfig {
             live_transcription: true,
             openai_model: "gpt-5.6-terra".to_string(),
             no_translation_languages: Vec::new(),
+            onboarding_version: None,
         }
     }
 }

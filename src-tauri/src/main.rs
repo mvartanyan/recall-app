@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
 use base64::Engine;
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
@@ -49,6 +52,13 @@ const MATCH_THRESHOLD: f32 = 0.90;
 const MATCH_MARGIN: f32 = 0.06;
 const PROFILE_CLAIM_MARGIN: f32 = 0.05;
 const MAX_AGENDA_BYTES: usize = 50 * 1024 * 1024;
+const ONBOARDING_VERSION: &str = "1";
+const ALLOWED_EXTERNAL_URLS: &[&str] = &[
+    "https://console.soniox.com",
+    "https://platform.openai.com/api-keys",
+    "https://platform.openai.com/settings/organization/billing/overview",
+    "https://github.com/mvartanyan/recall-app",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 struct SpeakerMatch {
@@ -1264,6 +1274,19 @@ fn save_preferences(
 }
 
 #[tauri::command]
+fn complete_onboarding(version: String, app_state: State<AppState>) -> Result<(), String> {
+    if version != ONBOARDING_VERSION {
+        return Err("Unsupported onboarding version".into());
+    }
+    let mut config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned")?;
+    config.onboarding_version = Some(version);
+    config.save(&app_state.config_path)
+}
+
+#[tauri::command]
 fn unlock_db(password: String, app_state: State<AppState>) -> Result<(), String> {
     let config = app_state
         .config
@@ -1777,6 +1800,31 @@ fn merge_speakers(
     Ok(())
 }
 
+fn is_allowed_external_url(url: &str) -> bool {
+    ALLOWED_EXTERNAL_URLS.contains(&url)
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    if !is_allowed_external_url(&url) {
+        return Err("Recall refused to open an unapproved external URL".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("/usr/bin/open")
+            .arg(&url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Could not open the default browser: {error}"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("Opening setup links is currently supported only on macOS".into())
+    }
+}
+
 fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, MenuId::new("open"), "Open Recall", true, None::<&str>)?;
     let start = MenuItem::with_id(
@@ -1859,6 +1907,7 @@ fn main() {
             openai_key_status,
             get_preferences,
             save_preferences,
+            complete_onboarding,
             unlock_db,
             enable_encryption,
             app_status,
@@ -1881,6 +1930,7 @@ fn main() {
             delete_speaker,
             get_speaker_samples,
             merge_speakers,
+            open_external_url,
         ])
         .manage(RecordingManager::default())
         .setup(|app| {
@@ -1931,6 +1981,26 @@ mod tests {
             created_at: chrono::Utc::now(),
             model_version: EMBEDDING_VERSION.into(),
         }
+    }
+
+    #[test]
+    fn setup_links_are_restricted_to_the_documented_provider_and_source_pages() {
+        for url in ALLOWED_EXTERNAL_URLS {
+            assert!(is_allowed_external_url(url));
+        }
+        assert!(!is_allowed_external_url("javascript:alert(1)"));
+        assert!(!is_allowed_external_url(
+            "https://console.soniox.com.evil.example"
+        ));
+        assert!(!is_allowed_external_url(
+            "https://platform.openai.com/api-keys?next=evil"
+        ));
+    }
+
+    #[test]
+    fn onboarding_version_is_explicitly_versioned() {
+        assert_eq!(ONBOARDING_VERSION, "1");
+        assert_eq!(AppConfig::default().onboarding_version, None);
     }
 
     #[test]

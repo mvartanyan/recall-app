@@ -1,4 +1,5 @@
 import {
+  ONBOARDING_VERSION,
   buildTranslationPlan,
   contentMode,
   filterSessions,
@@ -9,6 +10,7 @@ import {
   parseLanguageHints,
   parseNoTranslationLanguages,
   recapTabAvailability,
+  shouldShowOnboarding,
   transcriptFromSegments,
   translatedSegmentText,
 } from "./ui-helpers.mjs";
@@ -119,6 +121,10 @@ const elements = {
   activityLog: document.getElementById("activityLog"),
   closeActivity: document.getElementById("closeActivity"),
   clearActivity: document.getElementById("clearActivity"),
+  onboardingDialog: document.getElementById("onboardingDialog"),
+  onboardingExploreButton: document.getElementById("onboardingExploreButton"),
+  onboardingSettingsButton: document.getElementById("onboardingSettingsButton"),
+  gettingStartedButton: document.getElementById("gettingStartedButton"),
   nameDialog: document.getElementById("nameDialog"),
   nameForm: document.getElementById("nameForm"),
   nameSpeakerId: document.getElementById("nameSpeakerId"),
@@ -175,6 +181,7 @@ const state = {
   generatedLanguage: "original",
   recapRequestSessionId: null,
   translationWarnings: new Set(),
+  onboardingAcknowledgedThisLaunch: false,
 };
 
 function errorText(error) {
@@ -215,6 +222,66 @@ function showToast(message, kind) {
   toast.textContent = message;
   elements.toastRegion.append(toast);
   window.setTimeout(() => toast.remove(), 5200);
+}
+
+function onboardingIsDue() {
+  if (state.onboardingAcknowledgedThisLaunch) return false;
+  return shouldShowOnboarding(state.preferences?.onboarding_version);
+}
+
+async function acknowledgeOnboarding() {
+  await invoke("complete_onboarding", { version: ONBOARDING_VERSION });
+  state.onboardingAcknowledgedThisLaunch = true;
+  state.preferences = {
+    ...state.preferences,
+    onboarding_version: ONBOARDING_VERSION,
+  };
+}
+
+function openOnboarding() {
+  if (elements.settingsDialog.open) elements.settingsDialog.close();
+  if (!elements.onboardingDialog.open) {
+    elements.onboardingDialog.showModal();
+    addActivity("Getting started guide opened");
+  }
+}
+
+async function finishOnboarding(openSettingsAfter) {
+  try {
+    await acknowledgeOnboarding();
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not save the getting started state: " + message, "error");
+    showToast(message, "error");
+    return;
+  }
+  if (elements.onboardingDialog.open) elements.onboardingDialog.close();
+  addActivity("Getting started guide completed", "success");
+  if (openSettingsAfter) await openSettings();
+}
+
+async function openExternalUrl(url, button) {
+  button.disabled = true;
+  try {
+    await invoke("open_external_url", { url });
+    addActivity("Opened an official setup page in the default browser", "success");
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not open the setup page: " + message, "error");
+    showToast(message, "error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function scheduleInitialSetupPrompt() {
+  window.setTimeout(() => {
+    if (onboardingIsDue()) {
+      openOnboarding();
+    } else if (!state.status.soniox_key_configured) {
+      void openSettings();
+    }
+  }, 250);
 }
 
 function requestConfirmation({ title, message, acceptLabel = "Delete" }) {
@@ -2140,6 +2207,7 @@ async function saveSettings(event) {
       live_transcription: liveTranscription,
       openai_model: openaiModel,
       no_translation_languages: noTranslationLanguages,
+      onboarding_version: state.preferences?.onboarding_version || null,
     };
     elements.settingsFeedback.textContent = "Saved.";
     elements.settingsDialog.close();
@@ -2173,7 +2241,7 @@ async function unlockDatabase(event) {
     elements.unlockFeedback.textContent = "";
     addActivity("Existing encrypted database unlocked", "success");
     updateContentVisibility();
-    if (!state.status.soniox_key_configured) await openSettings();
+    scheduleInitialSetupPrompt();
   } catch (error) {
     const message = errorText(error);
     elements.databasePassword.value = "";
@@ -2282,6 +2350,19 @@ function bindInterface() {
   });
   elements.deleteSessionButton.addEventListener("click", deleteSelectedSession);
   elements.settingsButton.addEventListener("click", openSettings);
+  elements.gettingStartedButton.addEventListener("click", openOnboarding);
+  elements.onboardingExploreButton.addEventListener("click", () => {
+    void finishOnboarding(false);
+  });
+  elements.onboardingSettingsButton.addEventListener("click", () => {
+    void finishOnboarding(true);
+  });
+  elements.onboardingDialog.addEventListener("cancel", (event) => event.preventDefault());
+  for (const button of document.querySelectorAll("[data-external-url]")) {
+    button.addEventListener("click", () => {
+      void openExternalUrl(button.dataset.externalUrl, button);
+    });
+  }
   elements.saveKeyButton.addEventListener("click", saveSonioxKey);
   elements.deleteKeyButton.addEventListener("click", deleteSonioxKey);
   elements.saveOpenAIKeyButton.addEventListener("click", saveOpenAIKey);
@@ -2347,11 +2428,7 @@ async function initialize() {
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     updateContentVisibility();
     addActivity("Recall is ready", "success");
-    if (!state.status.soniox_key_configured) {
-      window.setTimeout(() => {
-        if (!elements.settingsDialog.open) elements.settingsDialog.showModal();
-      }, 250);
-    }
+    scheduleInitialSetupPrompt();
   } catch (error) {
     const message = errorText(error);
     addActivity("Recall could not initialize: " + message, "error");
