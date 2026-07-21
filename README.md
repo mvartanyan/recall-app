@@ -156,7 +156,8 @@ After launching from source:
    on later launches without a Keychain prompt.
 3. Choose an audio input.
 4. Adjust likely languages if needed. The defaults are en, fr, de, es, ru; these are hints, not a restriction on code-switching.
-5. Leave live captions enabled unless you only want final transcription.
+5. Choose whether to enable live captions. They may increase STT charges because
+   final transcription still runs after recording.
 6. To use recaps, save an OpenAI key, choose the model, and optionally list
    source-language codes that should not receive inline English translations.
 

@@ -40,24 +40,24 @@ pub async fn generate_recap(request: RecapRequest<'_>) -> Result<RecapResponse, 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15 * 60))
         .build()
-        .map_err(|error| format!("Could not initialize the OpenAI client: {error}"))?;
+        .map_err(|error| format!("Could not initialize the LLM provider client: {error}"))?;
     let response = client
         .post(RESPONSES_URL)
         .bearer_auth(request.api_key)
         .json(&body)
         .send()
         .await
-        .map_err(|error| format!("OpenAI request failed: {error}"))?;
+        .map_err(|error| format!("LLM request failed: {error}"))?;
     let status = response.status();
     let response_body = response
         .text()
         .await
-        .map_err(|error| format!("Could not read OpenAI's response: {error}"))?;
+        .map_err(|error| format!("Could not read the LLM provider response: {error}"))?;
     let value: Value = serde_json::from_str(&response_body).map_err(|error| {
         if status.is_success() {
-            format!("OpenAI returned an unreadable response: {error}")
+            format!("The LLM provider returned an unreadable response: {error}")
         } else {
-            format!("OpenAI returned HTTP {status}")
+            format!("The LLM provider returned HTTP {status}")
         }
     })?;
     if !status.is_success() {
@@ -85,7 +85,7 @@ fn build_request_body(
         return Err("The conversation has no transcript segments to recap".into());
     }
     let transcript = serde_json::to_string_pretty(segments)
-        .map_err(|error| format!("Could not prepare the transcript for OpenAI: {error}"))?;
+        .map_err(|error| format!("Could not prepare the transcript for the LLM: {error}"))?;
     let mut excluded = no_translation_languages
         .iter()
         .map(|language| language.trim().to_lowercase())
@@ -179,7 +179,7 @@ fn parse_response(
             .or_else(|| value.pointer("/error/message").and_then(Value::as_str))
             .unwrap_or("the response did not complete");
         return Err(format!(
-            "OpenAI recap did not complete: {}",
+            "The LLM recap did not complete: {}",
             clean_detail(detail)
         ));
     }
@@ -208,7 +208,7 @@ fn parse_response(
                         .and_then(Value::as_str)
                         .unwrap_or("The model declined to create this recap");
                     return Err(format!(
-                        "OpenAI declined the recap: {}",
+                        "The LLM provider declined the recap: {}",
                         clean_detail(refusal)
                     ));
                 }
@@ -217,10 +217,11 @@ fn parse_response(
         }
     }
     let output_text = output_text.ok_or_else(|| {
-        "OpenAI returned a completed response without structured recap text".to_string()
+        "The LLM provider returned a completed response without structured recap text".to_string()
     })?;
-    let mut payload = serde_json::from_str::<RecapPayload>(output_text)
-        .map_err(|error| format!("OpenAI returned an invalid recap structure: {error}"))?;
+    let mut payload = serde_json::from_str::<RecapPayload>(output_text).map_err(|error| {
+        format!("The LLM provider returned an invalid recap structure: {error}")
+    })?;
     normalize_translation_coverage(&mut payload.translations, segments)?;
     let valid_segment_ids = segments
         .iter()
@@ -258,7 +259,7 @@ fn normalize_translation_coverage(
 ) -> Result<(), String> {
     if translations.len() != segments.len() {
         return Err(format!(
-            "OpenAI returned translation decisions for {} of {} transcript interventions",
+            "The LLM provider returned translation decisions for {} of {} transcript interventions",
             translations.len(),
             segments.len()
         ));
@@ -273,13 +274,13 @@ fn normalize_translation_coverage(
             .get(translation.segment_id.as_str())
             .ok_or_else(|| {
                 format!(
-                    "OpenAI translation references an unknown segment: {}",
+                    "The LLM translation references an unknown segment: {}",
                     translation.segment_id
                 )
             })?;
         if !seen.insert(translation.segment_id.clone()) {
             return Err(format!(
-                "OpenAI returned more than one translation decision for segment: {}",
+                "The LLM provider returned more than one translation decision for segment: {}",
                 translation.segment_id
             ));
         }
@@ -287,7 +288,7 @@ fn normalize_translation_coverage(
     }
     if let Some(missing) = segments.iter().find(|segment| !seen.contains(&segment.id)) {
         return Err(format!(
-            "OpenAI omitted a translation decision for segment: {}",
+            "The LLM provider omitted a translation decision for segment: {}",
             missing.id
         ));
     }
@@ -333,17 +334,20 @@ fn api_error_message(status: u16, value: &Value) -> String {
     let message = value
         .pointer("/error/message")
         .and_then(Value::as_str)
-        .unwrap_or("The OpenAI request was rejected");
+        .unwrap_or("The LLM request was rejected");
     let code = value
         .pointer("/error/code")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty());
     match code {
         Some(code) => format!(
-            "OpenAI returned HTTP {status} ({code}): {}",
+            "The LLM provider returned HTTP {status} ({code}): {}",
             clean_detail(message)
         ),
-        None => format!("OpenAI returned HTTP {status}: {}", clean_detail(message)),
+        None => format!(
+            "The LLM provider returned HTTP {status}: {}",
+            clean_detail(message)
+        ),
     }
 }
 
@@ -436,7 +440,7 @@ mod tests {
         let value = json!({ "error": { "code": "bad_request", "message": "Nope" } });
         assert_eq!(
             api_error_message(400, &value),
-            "OpenAI returned HTTP 400 (bad_request): Nope"
+            "The LLM provider returned HTTP 400 (bad_request): Nope"
         );
     }
 

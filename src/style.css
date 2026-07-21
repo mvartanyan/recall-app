@@ -1078,6 +1078,34 @@ button:disabled {
   margin: 0;
 }
 
+.settings-modal {
+  max-height: min(90vh, 820px);
+}
+
+.settings-modal form {
+  display: flex;
+  max-height: min(90vh, 820px);
+  flex-direction: column;
+}
+
+.settings-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.settings-modal .modal-header,
+.settings-modal .modal-footer {
+  flex: 0 0 auto;
+  background: white;
+}
+
+.settings-modal .modal-footer {
+  border-top: 1px solid var(--line);
+}
+
 .modal-header {
   padding: 21px 24px;
   border-bottom: 1px solid var(--line);
@@ -1158,6 +1186,10 @@ button:disabled {
   display: block;
 }
 
+.toggle-row > span {
+  min-width: 0;
+}
+
 .toggle-row strong {
   font-size: 14px;
 }
@@ -1169,8 +1201,10 @@ button:disabled {
 }
 
 .toggle-row input {
+  flex: 0 0 auto;
   width: 18px;
   height: 18px;
+  margin-left: auto;
   accent-color: var(--brand);
 }
 
@@ -1744,7 +1778,13 @@ button:disabled {
 
 .recap-settings-grid .toggle-row {
   grid-column: 1 / -1;
-  max-width: 330px;
+  width: 100%;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.recap-settings-grid {
+  row-gap: 14px;
 }
 
 .agenda-modal {

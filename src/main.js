@@ -568,7 +568,7 @@ async function startRecording() {
     addActivity(
       "Recording started from " +
         started.device_name +
-        (started.live_started ? "; live Soniox captions enabled" : ""),
+        (started.live_started ? "; live STT captions enabled" : ""),
       "success",
     );
   } catch (error) {
@@ -597,7 +597,7 @@ async function stopRecording() {
     trackRun(runId);
     state.queueingProcessing = false;
     addActivity("[" + runId.slice(0, 8) + "] Final transcription queued");
-    setProcessingDetail("Uploading the recording to Soniox…");
+    setProcessingDetail("Uploading the recording to the STT provider…");
   } catch (error) {
     state.queueingProcessing = false;
     const message = errorText(error);
@@ -638,15 +638,15 @@ function stageDescription(stage, detail) {
   const descriptions = {
     queued: "Queued for final transcription",
     "transcription:start": "Preparing final transcription",
-    "soniox:upload:start": "Uploading recording to Soniox",
-    "soniox:upload:done": "Upload finished",
-    "soniox:transcription:start": "Starting final Soniox transcription",
-    "soniox:transcription:waiting": "Waiting for Soniox",
-    "soniox:transcription:status": "Soniox processing",
-    "soniox:transcript:download:start": "Downloading diarized transcript",
-    "soniox:transcript:download:done": "Final transcript received",
-    "soniox:cleanup:start": "Removing temporary Soniox artifacts",
-    "soniox:cleanup:done": "Soniox artifacts removed",
+    "stt:upload:start": "Uploading recording to the STT provider",
+    "stt:upload:done": "Upload finished",
+    "stt:transcription:start": "Starting final STT transcription",
+    "stt:transcription:waiting": "Waiting for the STT provider",
+    "stt:transcription:status": "STT provider processing",
+    "stt:transcript:download:start": "Downloading diarized transcript",
+    "stt:transcript:download:done": "Final transcript received",
+    "stt:cleanup:start": "Removing temporary provider artifacts",
+    "stt:cleanup:done": "Provider artifacts removed",
     "audio:read:start": "Preparing audio for local speaker identification",
     "audio:read:done": "Local audio prepared",
     "voiceprints:start": "Extracting and matching voiceprints locally",
@@ -1915,7 +1915,7 @@ async function removeAgenda() {
 function updateRecapProgress(stage, detail) {
   const titles = {
     prepare: "Preparing conversation",
-    openai: "Waiting for OpenAI",
+    llm: "Waiting for the LLM provider",
     validate: "Checking the recap",
     save: "Saving locally",
     complete: "Recap ready",
@@ -1981,14 +1981,14 @@ async function runRecap(allowUnresolved) {
   updateRecapProgress("prepare", "Preparing transcript and agenda…");
   elements.recapProgressDialog.showModal();
   updateContentVisibility();
-  addActivity("Starting on-demand OpenAI recap");
+  addActivity("Starting on-demand LLM recap");
   try {
     const commandState = await invoke("generate_recap", { sessionId, allowUnresolved });
     await loadSessions(sessionId);
     if (state.selectedSessionId === sessionId) {
       const persistedState = await invoke("get_recap_state", { sessionId });
       if (!persistedState?.recap?.payload) {
-        throw new Error("OpenAI finished, but Recall could not load the saved recap.");
+        throw new Error("The LLM provider finished, but Recall could not load the saved recap.");
       }
       state.recapState = persistedState;
       state.activeRecapTab = "executive";
@@ -2002,7 +2002,7 @@ async function runRecap(allowUnresolved) {
     }
     const usage = commandState.recap;
     addActivity(
-      "OpenAI recap saved locally" +
+      "LLM recap saved locally" +
         (usage
           ? " (" + usage.input_tokens + " input / " + usage.output_tokens + " output tokens)"
           : ""),
@@ -2013,7 +2013,7 @@ async function runRecap(allowUnresolved) {
     failed = true;
     const message = errorText(error);
     updateRecapProgress("error", message);
-    addActivity("OpenAI recap failed: " + message, "error");
+    addActivity("LLM recap failed: " + message, "error");
     showToast(message, "error");
     if (state.selectedSessionId === sessionId) {
       try {
@@ -2189,7 +2189,7 @@ async function saveSettings(event) {
   const liveTranscription = elements.liveTranscription.checked;
   const openaiModel = elements.openaiModel.value.trim();
   if (!openaiModel) {
-    elements.settingsFeedback.textContent = "OpenAI model cannot be empty.";
+    elements.settingsFeedback.textContent = "LLM model cannot be empty.";
     return;
   }
   elements.settingsFeedback.textContent = "Saving…";
@@ -2279,7 +2279,7 @@ async function registerListeners() {
     trackRun(runId);
     state.queueingProcessing = false;
     addActivity("[" + runId.slice(0, 8) + "] Queued from the menu bar");
-    setProcessingDetail("Uploading the recording to Soniox…");
+    setProcessingDetail("Uploading the recording to the STT provider…");
   });
   await listen("recording:started", (event) => {
     state.queueingProcessing = false;

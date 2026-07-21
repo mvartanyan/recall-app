@@ -1247,7 +1247,7 @@ fn save_preferences(
 ) -> Result<(), String> {
     let openai_model = openai_model.trim();
     if openai_model.is_empty() {
-        return Err("OpenAI model cannot be empty".into());
+        return Err("LLM model cannot be empty".into());
     }
     let normalized_hints = language_hints
         .into_iter()
@@ -1633,7 +1633,7 @@ async fn generate_recap_inner(
         .clone();
     let model = config.openai_model.trim().to_string();
     if model.is_empty() {
-        return Err("Configure an OpenAI model in Settings before creating a recap".into());
+        return Err("Configure an LLM model in Settings before creating a recap".into());
     }
     let api_key = app_state.load_openai_key()?;
     let snapshot = recap_snapshot(&db, &config, session_id)?;
@@ -1648,7 +1648,12 @@ async fn generate_recap_inner(
             }
         ));
     }
-    emit_recap_progress(app_handle, session_id, "openai", "Waiting for OpenAI");
+    emit_recap_progress(
+        app_handle,
+        session_id,
+        "llm",
+        "Waiting for the LLM provider",
+    );
     let response = openai::generate_recap(openai::RecapRequest {
         api_key: &api_key,
         model: &model,
@@ -1674,7 +1679,7 @@ async fn generate_recap_inner(
     let current_snapshot = recap_snapshot(&db, &current_config, session_id)?;
     if current_snapshot.source_fingerprint != snapshot.source_fingerprint {
         return Err(
-            "The transcript, speakers, agenda, or translation policy changed while OpenAI was working. Nothing was replaced; run Recap again."
+            "The transcript, speakers, agenda, or translation policy changed while the LLM provider was working. Nothing was replaced; run Recap again."
                 .into(),
         );
     }

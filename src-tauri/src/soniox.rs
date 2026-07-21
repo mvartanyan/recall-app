@@ -139,12 +139,12 @@ where
         .timeout(Duration::from_secs(90))
         .user_agent("Recall/0.1")
         .build()
-        .map_err(|error| format!("Could not create Soniox client: {error}"))?;
+        .map_err(|error| format!("Could not create the STT provider client: {error}"))?;
     let mut file_id: Option<String> = None;
     let mut transcription_id: Option<String> = None;
 
     let result = (|| {
-        progress("soniox:upload:start", "Uploading recording".into());
+        progress("stt:upload:start", "Uploading recording".into());
         let bytes = std::fs::read(path)
             .map_err(|error| format!("Could not read the recording: {error}"))?;
         if bytes.is_empty() {
@@ -163,13 +163,13 @@ where
                     .part("file", multipart::Part::bytes(bytes).file_name(filename)),
             )
             .send()
-            .map_err(|error| format!("Soniox upload failed: {error}"))?;
+            .map_err(|error| format!("STT provider upload failed: {error}"))?;
         let uploaded: IdResponse = decode_response(upload, "upload recording")?;
         file_id = Some(uploaded.id.clone());
-        progress("soniox:upload:done", "Recording uploaded".into());
+        progress("stt:upload:done", "Recording uploaded".into());
 
         progress(
-            "soniox:transcription:start",
+            "stt:transcription:start",
             format!("Starting final transcription with {ASYNC_MODEL}"),
         );
         let hints = normalize_language_hints(language_hints);
@@ -187,31 +187,31 @@ where
             .bearer_auth(api_key)
             .json(&payload)
             .send()
-            .map_err(|error| format!("Could not start Soniox transcription: {error}"))?;
+            .map_err(|error| format!("Could not start STT transcription: {error}"))?;
         let created: IdResponse = decode_response(create, "start transcription")?;
         transcription_id = Some(created.id.clone());
         progress(
-            "soniox:transcription:waiting",
-            "Soniox is processing the recording".into(),
+            "stt:transcription:waiting",
+            "The STT provider is processing the recording".into(),
         );
 
         let deadline = Instant::now() + Duration::from_secs(20 * 60);
         let mut previous_status = String::new();
         loop {
             if Instant::now() >= deadline {
-                return Err("Soniox transcription timed out after 20 minutes".into());
+                return Err("STT transcription timed out after 20 minutes".into());
             }
             let response = client
                 .get(format!("{REST_BASE}/transcriptions/{}", created.id))
                 .bearer_auth(api_key)
                 .send()
-                .map_err(|error| format!("Could not poll Soniox transcription: {error}"))?;
+                .map_err(|error| format!("Could not poll the STT transcription: {error}"))?;
             let status: StatusResponse = decode_response(response, "poll transcription")?;
             if status.status != previous_status {
                 previous_status = status.status.clone();
                 progress(
-                    "soniox:transcription:status",
-                    format!("Soniox status: {}", status.status),
+                    "stt:transcription:status",
+                    format!("STT provider status: {}", status.status),
                 );
             }
             match status.status.as_str() {
@@ -221,14 +221,14 @@ where
                     let message = status
                         .error_message
                         .unwrap_or_else(|| "No details returned".into());
-                    return Err(format!("Soniox transcription failed ({kind}): {message}"));
+                    return Err(format!("STT transcription failed ({kind}): {message}"));
                 }
                 _ => thread::sleep(Duration::from_secs(2)),
             }
         }
 
         progress(
-            "soniox:transcript:download:start",
+            "stt:transcript:download:start",
             "Downloading final diarized transcript".into(),
         );
         let response = client
@@ -238,11 +238,11 @@ where
             ))
             .bearer_auth(api_key)
             .send()
-            .map_err(|error| format!("Could not download Soniox transcript: {error}"))?;
+            .map_err(|error| format!("Could not download the STT transcript: {error}"))?;
         let transcript: TranscriptResponse = decode_response(response, "download transcript")?;
         let parsed = parse_transcript(transcript);
         progress(
-            "soniox:transcript:download:done",
+            "stt:transcript:download:done",
             format!(
                 "Downloaded {} interventions from {} diarized speakers",
                 parsed.segments.len(),
@@ -253,7 +253,7 @@ where
     })();
 
     progress(
-        "soniox:cleanup:start",
+        "stt:cleanup:start",
         "Removing provider-side artifacts".into(),
     );
     let mut cleanup_errors = Vec::new();
@@ -268,13 +268,10 @@ where
         }
     }
     if cleanup_errors.is_empty() {
-        progress(
-            "soniox:cleanup:done",
-            "Provider-side artifacts removed".into(),
-        );
+        progress("stt:cleanup:done", "Provider-side artifacts removed".into());
     } else {
         progress(
-            "soniox:cleanup:warning",
+            "stt:cleanup:warning",
             format!("Cleanup incomplete: {}", cleanup_errors.join("; ")),
         );
     }
@@ -290,19 +287,17 @@ pub async fn run_realtime(
 ) -> Result<(), String> {
     ensure_tls_provider();
     emit_live(&app_handle, "Connecting live captions", "", "", false, None);
-    eprintln!("[live] connecting to Soniox realtime STT");
+    eprintln!("[live] connecting to the realtime STT provider");
     let (mut socket, _) =
         tokio::time::timeout(Duration::from_secs(10), connect_async(REALTIME_URL))
             .await
-            .map_err(|_| {
-                "Timed out connecting to Soniox live transcription after 10 seconds".to_string()
-            })?
-            .map_err(|error| format!("Could not connect to Soniox live transcription: {error}"))?;
+            .map_err(|_| "Timed out connecting to live STT after 10 seconds".to_string())?
+            .map_err(|error| format!("Could not connect to live STT: {error}"))?;
     let config = realtime_config(&api_key, &language_hints, sample_rate);
     socket
         .send(Message::Text(config.to_string()))
         .await
-        .map_err(|error| format!("Could not configure Soniox live transcription: {error}"))?;
+        .map_err(|error| format!("Could not configure live STT: {error}"))?;
     eprintln!("[live] connected and configured");
     emit_live(&app_handle, "Live captions connected", "", "", false, None);
 
@@ -312,10 +307,9 @@ pub async fn run_realtime(
         while let Some(message) = audio_rx.recv().await {
             match message {
                 LiveAudioMessage::Audio(bytes) => {
-                    writer
-                        .send(Message::Binary(bytes))
-                        .await
-                        .map_err(|error| format!("Could not stream audio to Soniox: {error}"))?;
+                    writer.send(Message::Binary(bytes)).await.map_err(|error| {
+                        format!("Could not stream audio to the STT provider: {error}")
+                    })?;
                     if !sent_audio {
                         sent_audio = true;
                         eprintln!("[live] streaming microphone audio");
@@ -325,7 +319,9 @@ pub async fn run_realtime(
                     writer
                         .send(Message::Text(String::new()))
                         .await
-                        .map_err(|error| format!("Could not finish Soniox live stream: {error}"))?;
+                        .map_err(|error| {
+                            format!("Could not finish the live STT stream: {error}")
+                        })?;
                     return Ok::<(), String>(());
                 }
             }
@@ -333,7 +329,7 @@ pub async fn run_realtime(
         writer
             .send(Message::Text(String::new()))
             .await
-            .map_err(|error| format!("Could not finish Soniox live stream: {error}"))?;
+            .map_err(|error| format!("Could not finish the live STT stream: {error}"))?;
         Ok::<(), String>(())
     };
 
@@ -342,16 +338,16 @@ pub async fn run_realtime(
         let mut received_response = false;
         while let Some(incoming) = reader.next().await {
             let incoming =
-                incoming.map_err(|error| format!("Soniox live connection error: {error}"))?;
+                incoming.map_err(|error| format!("Live STT connection error: {error}"))?;
             let text = match incoming {
                 Message::Text(value) => value.to_string(),
                 Message::Binary(value) => String::from_utf8(value.to_vec())
-                    .map_err(|_| "Soniox returned a non-UTF8 response".to_string())?,
+                    .map_err(|_| "The STT provider returned a non-UTF8 response".to_string())?,
                 Message::Close(_) => return Ok::<(), String>(()),
                 _ => continue,
             };
             let response: RealtimeResponse = serde_json::from_str(&text)
-                .map_err(|error| format!("Could not decode Soniox live response: {error}"))?;
+                .map_err(|error| format!("Could not decode the live STT response: {error}"))?;
             if !received_response {
                 received_response = true;
                 eprintln!("[live] receiving caption updates");
@@ -367,9 +363,7 @@ pub async fn run_realtime(
                     .request_id
                     .map(|id| format!(" Request ID: {id}"))
                     .unwrap_or_default();
-                return Err(format!(
-                    "Soniox live transcription failed ({kind}): {message}.{request}"
-                ));
+                return Err(format!("Live STT failed ({kind}): {message}.{request}"));
             }
             let mut non_final = Vec::new();
             for token in response.tokens {
@@ -584,7 +578,7 @@ fn display_speaker(speaker: &str) -> String {
 fn decode_response<T: DeserializeOwned>(response: Response, operation: &str) -> Result<T, String> {
     let status = response.status();
     let body = response.text().map_err(|error| {
-        format!("Could not read Soniox response while trying to {operation}: {error}")
+        format!("Could not read the STT provider response while trying to {operation}: {error}")
     })?;
     if !status.is_success() {
         let detail = if body.len() > 1_000 {
@@ -592,10 +586,12 @@ fn decode_response<T: DeserializeOwned>(response: Response, operation: &str) -> 
         } else {
             &body
         };
-        return Err(format!("Soniox could not {operation} ({status}): {detail}"));
+        return Err(format!(
+            "The STT provider could not {operation} ({status}): {detail}"
+        ));
     }
     serde_json::from_str(&body).map_err(|error| {
-        format!("Could not decode Soniox response while trying to {operation}: {error}")
+        format!("Could not decode the STT provider response while trying to {operation}: {error}")
     })
 }
 
@@ -604,12 +600,12 @@ fn delete_resource(client: &Client, api_key: &str, resource: &str, id: &str) -> 
         .delete(format!("{REST_BASE}/{resource}/{id}"))
         .bearer_auth(api_key)
         .send()
-        .map_err(|error| format!("Could not delete Soniox {resource}: {error}"))?;
+        .map_err(|error| format!("Could not delete STT provider {resource}: {error}"))?;
     if response.status().is_success() || response.status().as_u16() == 404 {
         Ok(())
     } else {
         Err(format!(
-            "Soniox returned {} while deleting {resource}",
+            "The STT provider returned {} while deleting {resource}",
             response.status()
         ))
     }

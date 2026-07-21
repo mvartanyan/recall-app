@@ -129,14 +129,14 @@ pub fn validate_payload(
     agenda_present: bool,
 ) -> Result<(), String> {
     if payload.meeting_title_english.trim().is_empty() {
-        return Err("OpenAI returned an empty meeting title".into());
+        return Err("The LLM provider returned an empty meeting title".into());
     }
     if payload.dominant_language.trim().is_empty() {
-        return Err("OpenAI returned no dominant meeting language".into());
+        return Err("The LLM provider returned no dominant meeting language".into());
     }
     validate_localized(&payload.executive_summary, "executive summary")?;
     if payload.full_summary.is_empty() {
-        return Err("OpenAI returned no full-summary sections".into());
+        return Err("The LLM provider returned no full-summary sections".into());
     }
     for (index, section) in payload.full_summary.iter().enumerate() {
         validate_localized(&section.heading, &format!("summary heading {}", index + 1))?;
@@ -153,19 +153,19 @@ pub fn validate_payload(
         .chain(payload.actions_already_taken.iter())
     {
         if item.participant.trim().is_empty() {
-            return Err("OpenAI returned an action without a participant".into());
+            return Err("The LLM provider returned an action without a participant".into());
         }
         validate_localized(&item.statement, "action statement")?;
         validate_required_evidence(&item.evidence_segment_ids, valid_segment_ids, "action item")?;
     }
     if payload.agenda_present != agenda_present {
-        return Err("OpenAI returned inconsistent agenda metadata".into());
+        return Err("The LLM provider returned inconsistent agenda metadata".into());
     }
     if !agenda_present && !payload.agenda_coverage.is_empty() {
-        return Err("OpenAI returned agenda coverage when no agenda was supplied".into());
+        return Err("The LLM provider returned agenda coverage when no agenda was supplied".into());
     }
     if agenda_present && payload.agenda_coverage.is_empty() {
-        return Err("OpenAI returned no agenda coverage for the supplied agenda".into());
+        return Err("The LLM provider returned no agenda coverage for the supplied agenda".into());
     }
     for item in &payload.agenda_coverage {
         if !matches!(
@@ -173,7 +173,7 @@ pub fn validate_payload(
             "covered" | "partial" | "not-covered" | "unreadable"
         ) {
             return Err(format!(
-                "OpenAI returned an unsupported agenda status: {}",
+                "The LLM provider returned an unsupported agenda status: {}",
                 item.status
             ));
         }
@@ -192,7 +192,7 @@ pub fn validate_payload(
     for translation in &payload.translations {
         if !valid_segment_ids.contains(&translation.segment_id) {
             return Err(format!(
-                "OpenAI translation references an unknown segment: {}",
+                "The LLM translation references an unknown segment: {}",
                 translation.segment_id
             ));
         }
@@ -200,7 +200,7 @@ pub fn validate_payload(
             || translation.language.trim().is_empty()
             || translation.english_translation.trim().is_empty()
         {
-            return Err("OpenAI returned an incomplete translation annotation".into());
+            return Err("The LLM provider returned an incomplete translation annotation".into());
         }
     }
     Ok(())
@@ -208,7 +208,7 @@ pub fn validate_payload(
 
 fn validate_localized(value: &LocalizedText, field: &str) -> Result<(), String> {
     if value.original.trim().is_empty() || value.english.trim().is_empty() {
-        Err(format!("OpenAI returned an incomplete {field}"))
+        Err(format!("The LLM provider returned an incomplete {field}"))
     } else {
         Ok(())
     }
@@ -217,7 +217,7 @@ fn validate_localized(value: &LocalizedText, field: &str) -> Result<(), String> 
 fn validate_evidence(ids: &[String], valid_segment_ids: &HashSet<String>) -> Result<(), String> {
     for id in ids {
         if !valid_segment_ids.contains(id) {
-            return Err(format!("OpenAI cited an unknown transcript segment: {id}"));
+            return Err(format!("The LLM cited an unknown transcript segment: {id}"));
         }
     }
     Ok(())
@@ -230,7 +230,7 @@ fn validate_required_evidence(
 ) -> Result<(), String> {
     if ids.is_empty() {
         return Err(format!(
-            "OpenAI returned a {field} without transcript evidence"
+            "The LLM provider returned a {field} without transcript evidence"
         ));
     }
     validate_evidence(ids, valid_segment_ids)

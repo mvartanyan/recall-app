@@ -324,67 +324,69 @@
           </div>
         </div>
 
-        <section class="settings-section">
-          <div class="setting-title-row">
-            <div>
-              <h3>Soniox API key</h3>
-              <p>Recall stores the key in a file readable only by your macOS user account. The app reuses it without Keychain prompts.</p>
+        <div class="settings-scroll">
+          <section class="settings-section">
+            <div class="setting-title-row">
+              <div>
+                <h3>Soniox API key</h3>
+                <p>Recall stores the key in a file readable only by your macOS user account. The app reuses it without Keychain prompts.</p>
+              </div>
+              <span id="keyStatus" class="service-badge warning" hidden>Not configured</span>
             </div>
-            <span id="keyStatus" class="service-badge warning" hidden>Not configured</span>
-          </div>
-          <label class="field-label" for="sonioxKey">New or replacement key</label>
-          <div class="key-row">
-            <input id="sonioxKey" type="password" placeholder="Paste a Soniox API key" autocomplete="off" spellcheck="false" />
-            <button id="saveKeyButton" class="secondary-button" type="button">Save key</button>
-            <button id="deleteKeyButton" class="text-button danger-text" type="button">Remove</button>
-          </div>
-        </section>
-
-        <section class="settings-section">
-          <div class="setting-title-row">
-            <div>
-              <h3>OpenAI API key (optional)</h3>
-              <p>OpenAI is optional and used for Recap requests. Recall sends the finalized transcript and optional agenda with <code>store: false</code>. OpenAI account-level data controls and retention terms still apply.</p>
+            <label class="field-label" for="sonioxKey">New or replacement key</label>
+            <div class="key-row">
+              <input id="sonioxKey" type="password" placeholder="Paste a Soniox API key" autocomplete="off" spellcheck="false" />
+              <button id="saveKeyButton" class="secondary-button" type="button">Save key</button>
+              <button id="deleteKeyButton" class="text-button danger-text" type="button">Remove</button>
             </div>
-            <span id="openaiKeyStatus" class="service-badge warning" hidden>Not configured</span>
-          </div>
-          <label class="field-label" for="openaiKey">New or replacement key</label>
-          <div class="key-row">
-            <input id="openaiKey" type="password" placeholder="Paste an OpenAI API key" autocomplete="off" spellcheck="false" />
-            <button id="saveOpenAIKeyButton" class="secondary-button" type="button">Save key</button>
-            <button id="deleteOpenAIKeyButton" class="text-button danger-text" type="button">Remove</button>
-          </div>
-          <label class="field-label model-field" for="openaiModel">Model</label>
-          <input id="openaiModel" type="text" value="gpt-5.6-terra" spellcheck="false" />
-          <p class="field-help">Enter any model available to your OpenAI project. Saved recaps remain readable after the key is removed.</p>
-        </section>
+          </section>
 
-        <section class="settings-section">
-          <h3>Audio input</h3>
-          <label class="field-label" for="inputDevice">Recording source</label>
-          <select id="inputDevice"></select>
-          <p class="field-help">Choose your microphone, or a virtual/aggregate input such as BlackHole to capture meeting audio. Native macOS system-audio capture is not implemented yet.</p>
-        </section>
+          <section class="settings-section">
+            <div class="setting-title-row">
+              <div>
+                <h3>OpenAI API key (optional)</h3>
+                <p>OpenAI is optional and used for Recap requests. Recall sends the finalized transcript and optional agenda with <code>store: false</code>. OpenAI account-level data controls and retention terms still apply.</p>
+              </div>
+              <span id="openaiKeyStatus" class="service-badge warning" hidden>Not configured</span>
+            </div>
+            <label class="field-label" for="openaiKey">New or replacement key</label>
+            <div class="key-row">
+              <input id="openaiKey" type="password" placeholder="Paste an OpenAI API key" autocomplete="off" spellcheck="false" />
+              <button id="saveOpenAIKeyButton" class="secondary-button" type="button">Save key</button>
+              <button id="deleteOpenAIKeyButton" class="text-button danger-text" type="button">Remove</button>
+            </div>
+            <label class="field-label model-field" for="openaiModel">Model</label>
+            <input id="openaiModel" type="text" value="gpt-5.6-terra" spellcheck="false" />
+            <p class="field-help">Enter any model available to your OpenAI project. Saved recaps remain readable after the key is removed.</p>
+          </section>
 
-        <section class="settings-section settings-grid recap-settings-grid">
-          <div>
-            <label class="field-label" for="languageHints">Likely languages</label>
-            <input id="languageHints" type="text" placeholder="en, fr, de, es, ru" />
-            <p class="field-help">Comma-separated hints improve recognition without preventing code-switching.</p>
-          </div>
-          <div>
-            <label class="field-label" for="noTranslationLanguages">No translation for languages</label>
-            <input id="noTranslationLanguages" type="text" placeholder="e.g. de, fr" />
-            <p class="field-help">Base language codes. English is always left untranslated and does not need to be listed.</p>
-          </div>
-          <label class="toggle-row">
-            <span>
-              <strong>Live captions</strong>
-              <small>Stream provisional text while recording</small>
-            </span>
-            <input id="liveTranscription" type="checkbox" />
-          </label>
-        </section>
+          <section class="settings-section">
+            <h3>Audio input</h3>
+            <label class="field-label" for="inputDevice">Recording source</label>
+            <select id="inputDevice"></select>
+            <p class="field-help">Choose your microphone, or a virtual/aggregate input such as BlackHole to capture meeting audio. Native macOS system-audio capture is not implemented yet.</p>
+          </section>
+
+          <section class="settings-section settings-grid recap-settings-grid">
+            <div>
+              <label class="field-label" for="languageHints">Likely languages</label>
+              <input id="languageHints" type="text" placeholder="en, fr, de, es, ru" />
+              <p class="field-help">Comma-separated hints improve recognition without preventing code-switching.</p>
+            </div>
+            <div>
+              <label class="field-label" for="noTranslationLanguages">No translation for languages</label>
+              <input id="noTranslationLanguages" type="text" placeholder="e.g. de, fr" />
+              <p class="field-help">Base language codes. English is always left untranslated and does not need to be listed.</p>
+            </div>
+            <label class="toggle-row">
+              <span>
+                <strong>Live captions</strong>
+                <small>Shows provisional text while recording. This may increase STT charges.</small>
+              </span>
+              <input id="liveTranscription" type="checkbox" />
+            </label>
+          </section>
+        </div>
 
         <div class="modal-footer">
           <span id="settingsFeedback" class="modal-feedback"></span>
@@ -442,7 +444,7 @@
     <dialog id="recapProgressDialog" class="modal compact-modal recap-progress-modal">
       <div class="recap-progress-body">
         <div id="recapProgressSpinner" class="spinner" aria-hidden="true"></div>
-        <span class="eyebrow">OpenAI recap</span>
+        <span class="eyebrow">LLM recap</span>
         <h2 id="recapProgressTitle">Preparing conversation</h2>
         <p id="recapProgressDetail">Preparing transcript and agenda…</p>
         <small>Recall makes one on-demand request. Closing the app will interrupt it.</small>

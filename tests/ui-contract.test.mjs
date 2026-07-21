@@ -164,6 +164,42 @@ test("first launch explains provider setup and remains reopenable", () => {
   assert.match(rustMain, /fn is_allowed_external_url/);
 });
 
+test("settings remain scrollable and explain the live-caption charge", () => {
+  assert.match(html, /class="settings-scroll"/);
+  assert.match(
+    stylesheet,
+    /\.settings-scroll\s*\{[\s\S]*?overflow-y:\s*auto;[\s\S]*?\}/,
+  );
+  assert.match(
+    stylesheet,
+    /\.settings-modal form\s*\{[\s\S]*?display:\s*flex;[\s\S]*?max-height:/,
+  );
+  assert.match(
+    html,
+    /This may increase STT charges/,
+  );
+  assert.match(
+    stylesheet,
+    /\.recap-settings-grid \.toggle-row\s*\{[\s\S]*?width:\s*100%;[\s\S]*?\}/,
+  );
+  assert.doesNotMatch(stylesheet, /\.recap-settings-grid \.toggle-row\s*\{[^}]*max-width:/);
+});
+
+test("runtime copy uses provider-neutral STT and LLM terms", () => {
+  assert.match(html, /LLM recap/);
+  assert.doesNotMatch(html, /OpenAI recap/);
+  assert.match(javascript, /"stt:upload:start": "Uploading recording to the STT provider"/);
+  assert.match(javascript, /llm: "Waiting for the LLM provider"/);
+  assert.doesNotMatch(javascript, /live Soniox captions|Uploading the recording to Soniox/);
+  assert.doesNotMatch(javascript, /Starting on-demand OpenAI recap|OpenAI recap saved locally/);
+  assert.match(rustSoniox, /progress\("stt:upload:start"/);
+  assert.doesNotMatch(rustSoniox, /progress\("soniox:/);
+  assert.match(rustMain, /emit_recap_progress\(\s*app_handle,\s*session_id,\s*"llm"/);
+  assert.doesNotMatch(rustSoniox, /Soniox/);
+  assert.doesNotMatch(rustOpenAI, /OpenAI/);
+  assert.doesNotMatch(rustRecap, /OpenAI/);
+});
+
 test("public copy avoids discarded slogans and staged contrasts", () => {
   const publicCopy = `${html}\n${appReadme}`;
   for (const expression of [
