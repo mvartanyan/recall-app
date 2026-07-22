@@ -18,6 +18,9 @@ const REST_BASE: &str = "https://api.soniox.com/v1";
 const REALTIME_URL: &str = "wss://stt-rt.soniox.com/transcribe-websocket";
 const ASYNC_MODEL: &str = "stt-async-v5";
 const REALTIME_MODEL: &str = "stt-rt-v5";
+const REST_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const REST_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const TRANSCRIPTION_DEADLINE: Duration = Duration::from_secs(2 * 60 * 60);
 static TLS_PROVIDER: Once = Once::new();
 
 fn ensure_tls_provider() {
@@ -136,7 +139,8 @@ where
     F: FnMut(&str, String),
 {
     let client = Client::builder()
-        .timeout(Duration::from_secs(90))
+        .connect_timeout(REST_CONNECT_TIMEOUT)
+        .timeout(REST_REQUEST_TIMEOUT)
         .user_agent("Recall/0.1")
         .build()
         .map_err(|error| format!("Could not create the STT provider client: {error}"))?;
@@ -145,9 +149,12 @@ where
 
     let result = (|| {
         progress("stt:upload:start", "Uploading recording".into());
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("Could not read the recording: {error}"))?;
-        if bytes.is_empty() {
+        if path
+            .metadata()
+            .map_err(|error| format!("Could not inspect the recording: {error}"))?
+            .len()
+            == 0
+        {
             return Err("The recording is empty".into());
         }
         let filename = path
@@ -155,13 +162,13 @@ where
             .and_then(|value| value.to_str())
             .unwrap_or("recording.wav")
             .to_string();
+        let file_part = multipart::Part::file(path)
+            .map_err(|error| format!("Could not open the recording for upload: {error}"))?
+            .file_name(filename);
         let upload = client
             .post(format!("{REST_BASE}/files"))
             .bearer_auth(api_key)
-            .multipart(
-                multipart::Form::new()
-                    .part("file", multipart::Part::bytes(bytes).file_name(filename)),
-            )
+            .multipart(multipart::Form::new().part("file", file_part))
             .send()
             .map_err(|error| format!("STT provider upload failed: {error}"))?;
         let uploaded: IdResponse = decode_response(upload, "upload recording")?;
@@ -195,11 +202,11 @@ where
             "The STT provider is processing the recording".into(),
         );
 
-        let deadline = Instant::now() + Duration::from_secs(20 * 60);
+        let deadline = Instant::now() + TRANSCRIPTION_DEADLINE;
         let mut previous_status = String::new();
         loop {
             if Instant::now() >= deadline {
-                return Err("STT transcription timed out after 20 minutes".into());
+                return Err("STT transcription timed out after 2 hours".into());
             }
             let response = client
                 .get(format!("{REST_BASE}/transcriptions/{}", created.id))

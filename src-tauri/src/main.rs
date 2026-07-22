@@ -2,6 +2,8 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
@@ -48,9 +50,16 @@ use state::AppState;
 
 const TARGET_SPEAKER_MS: u64 = 12_000;
 const MIN_SPEAKER_MS: u64 = 3_000;
-const MATCH_THRESHOLD: f32 = 0.90;
-const MATCH_MARGIN: f32 = 0.06;
-const PROFILE_CLAIM_MARGIN: f32 = 0.05;
+const SAMPLE_EDGE_TRIM_MS: u64 = 350;
+const SAMPLE_WINDOW_MS: u64 = 4_000;
+const SAMPLE_OVERLAP_TOLERANCE_MS: u64 = 200;
+const MAX_SAMPLE_WINDOWS_PER_SPEAKER: usize = 8;
+const MIN_SAMPLE_RMS: f32 = 0.002;
+const SAMPLE_CONSISTENCY_THRESHOLD: f32 = 0.90;
+const SAME_VOICE_SPLIT_THRESHOLD: f32 = 0.97;
+const MATCH_THRESHOLD: f32 = 0.94;
+const MATCH_MARGIN: f32 = 0.08;
+const PROFILE_CLAIM_MARGIN: f32 = 0.06;
 const MAX_AGENDA_BYTES: usize = 50 * 1024 * 1024;
 const ONBOARDING_VERSION: &str = "1";
 const ALLOWED_EXTERNAL_URLS: &[&str] = &[
@@ -71,6 +80,20 @@ struct SpeakerMatch {
 struct VoiceObservation {
     diarized_speaker: String,
     pcm: Vec<f32>,
+    embedding: Vec<f32>,
+    clean_window_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SampleWindow {
+    start_ms: u64,
+    end_ms: u64,
+    pcm: Vec<f32>,
+}
+
+#[derive(Debug)]
+struct VoiceObservationGroup {
+    observation_indices: Vec<usize>,
     embedding: Vec<f32>,
 }
 
@@ -106,6 +129,12 @@ struct RecordingStarted {
     device_name: String,
     sample_rate: u32,
     live_started: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct QueuedTranscription {
+    run_id: String,
+    session_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -545,8 +574,144 @@ fn stop_recording(
     Ok(path_string)
 }
 
+fn live_transcript_fallback(app_state: &AppState) -> String {
+    app_state
+        .live_transcript
+        .lock()
+        .map(|snapshot| {
+            if snapshot.text.trim().len() >= snapshot.final_text.trim().len() {
+                snapshot.text.trim().to_string()
+            } else {
+                snapshot.final_text.trim().to_string()
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn wav_duration_ms(path: &Path) -> Result<i64, String> {
+    let reader = hound::WavReader::open(path)
+        .map_err(|error| format!("Could not inspect the recorded WAV: {error}"))?;
+    let sample_rate = reader.spec().sample_rate;
+    if sample_rate == 0 {
+        return Err("The recorded WAV has an invalid sample rate".into());
+    }
+    Ok(((reader.duration() as u64 * 1_000) / sample_rate as u64) as i64)
+}
+
+#[cfg(unix)]
+fn set_private_permissions(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|error| {
+        format!(
+            "Could not restrict permissions for {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn set_private_permissions(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+fn persist_recording_audio(
+    source: &Path,
+    app_state: &AppState,
+    session_id: &str,
+) -> Result<PathBuf, String> {
+    let source_size = source
+        .metadata()
+        .map_err(|error| format!("Could not inspect the completed recording: {error}"))?
+        .len();
+    if source_size == 0 {
+        return Err("The completed recording is empty".into());
+    }
+    let directory = app_state.data_dir.join("processing");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create the recovery-audio directory: {error}"))?;
+    set_private_permissions(&directory, 0o700)?;
+    let target = directory.join(format!("{session_id}.wav"));
+    if target.exists() {
+        return Err("A recovery recording with this identifier already exists".into());
+    }
+
+    if let Err(rename_error) = fs::rename(source, &target) {
+        let copy_result = (|| -> Result<(), String> {
+            let mut input = File::open(source)
+                .map_err(|error| format!("Could not reopen the completed recording: {error}"))?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)
+                .map_err(|error| format!("Could not create the recovery recording: {error}"))?;
+            io::copy(&mut input, &mut output).map_err(|error| {
+                format!("Could not copy the recording into safe storage: {error}")
+            })?;
+            output
+                .sync_all()
+                .map_err(|error| format!("Could not flush the recovery recording: {error}"))?;
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            let _ = fs::remove_file(&target);
+            return Err(format!(
+                "Could not move the recording into safe storage ({rename_error}); {error}"
+            ));
+        }
+        if let Err(error) = fs::remove_file(source) {
+            eprintln!(
+                "[recording] durable copy saved at {}; original temporary copy could not be removed: {error}",
+                target.display()
+            );
+        }
+    }
+
+    set_private_permissions(&target, 0o600)?;
+    let target_size = target
+        .metadata()
+        .map_err(|error| format!("Could not verify the recovery recording: {error}"))?
+        .len();
+    if target_size != source_size {
+        return Err(format!(
+            "The recovery recording failed verification (expected {source_size} bytes, found {target_size})"
+        ));
+    }
+    File::open(&target)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| format!("Could not flush the recovery recording: {error}"))?;
+    if let Ok(directory_handle) = File::open(&directory) {
+        let _ = directory_handle.sync_all();
+    }
+    Ok(target)
+}
+
+fn validate_managed_audio_path(path: &Path, app_state: &AppState) -> Result<(), String> {
+    let directory = app_state.data_dir.join("processing");
+    let canonical_directory = directory
+        .canonicalize()
+        .map_err(|error| format!("Could not open the recovery-audio directory: {error}"))?;
+    let canonical_path = path
+        .canonicalize()
+        .map_err(|error| format!("The retained recording is unavailable: {error}"))?;
+    if !canonical_path.starts_with(&canonical_directory) {
+        return Err("Recall refused to access a recording outside its recovery directory".into());
+    }
+    Ok(())
+}
+
+fn remove_managed_audio(path: &Path, app_state: &AppState) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    validate_managed_audio_path(path, app_state)?;
+    fs::remove_file(path)
+        .map_err(|error| format!("Could not delete the retained recording: {error}"))
+}
+
 fn transcribe_file_inner(
     path: &str,
+    session_id: &str,
+    draft_transcript: &str,
     app_state: &AppState,
     app_handle: &tauri::AppHandle,
     run_id: &str,
@@ -592,11 +757,6 @@ fn transcribe_file_inner(
         &audio,
     ));
     let db = app_state.db_handle()?;
-    let initial_display = build_display_transcript(&segments, &result.transcript);
-    let title = make_conversation_title(&result.transcript);
-    let session_id = db
-        .insert_session(&title, &initial_display, audio.duration_ms() as i64)
-        .map_err(|error| format!("Could not save conversation: {error}"))?;
 
     emit_progress(
         app_handle,
@@ -637,22 +797,14 @@ fn transcribe_file_inner(
         process_segments(
             &audio,
             &segments,
-            &session_id,
+            session_id,
             &db,
             embedder.as_ref(),
             app_handle,
             run_id,
         )?;
     } else {
-        process_segments(
-            &audio,
-            &segments,
-            &session_id,
-            &db,
-            None,
-            app_handle,
-            run_id,
-        )?;
+        process_segments(&audio, &segments, session_id, &db, None, app_handle, run_id)?;
     }
     emit_progress(
         app_handle,
@@ -660,22 +812,216 @@ fn transcribe_file_inner(
         Some("Speaker attribution finished".into()),
         Some(run_id),
     );
-    let saved_segments = db.list_segments(&session_id)?;
-    let final_display = build_saved_transcript(&saved_segments, &result.transcript);
-    db.update_session_transcript(&session_id, &final_display)?;
+    let saved_segments = db.list_segments(session_id)?;
+    let provider_fallback = if result.transcript.trim().is_empty() {
+        draft_transcript
+    } else {
+        &result.transcript
+    };
+    let final_display = build_saved_transcript(&saved_segments, provider_fallback);
+    let title = make_conversation_title(provider_fallback);
+    db.finalize_processing_session(
+        session_id,
+        &title,
+        &final_display,
+        audio.duration_ms() as i64,
+    )?;
     emit_progress(
         app_handle,
         "transcription:done",
         Some("Conversation saved locally".into()),
         Some(run_id),
     );
-    Ok(session_id)
+    Ok(session_id.to_string())
 }
 
-fn queue_transcription(path: String, state: AppState, app_handle: tauri::AppHandle) -> String {
+fn spawn_transcription_worker(
+    path: String,
+    session_id: String,
+    draft_transcript: String,
+    state: AppState,
+    app_handle: tauri::AppHandle,
+    run_id: String,
+) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = transcribe_file_inner(
+            &path,
+            &session_id,
+            &draft_transcript,
+            &state,
+            &app_handle,
+            &run_id,
+        );
+        match result {
+            Ok(session_id) => {
+                let audio_path = Path::new(&path);
+                match remove_managed_audio(audio_path, &state) {
+                    Ok(()) => {
+                        if let Ok(db) = state.db_handle() {
+                            if let Err(error) = db.complete_processing_session(&session_id) {
+                                emit_progress(
+                                    &app_handle,
+                                    "audio:cleanup:warning",
+                                    Some(format!(
+                                        "The recording was removed, but cleanup bookkeeping failed: {error}"
+                                    )),
+                                    Some(&run_id),
+                                );
+                            }
+                        }
+                        emit_progress(
+                            &app_handle,
+                            "audio:cleanup:done",
+                            Some("Retained recording deleted after successful processing".into()),
+                            Some(&run_id),
+                        );
+                    }
+                    Err(error) => {
+                        if let Ok(db) = state.db_handle() {
+                            let _ = db.mark_processing_cleanup_failed(&session_id, &error);
+                        }
+                        emit_progress(
+                            &app_handle,
+                            "audio:cleanup:warning",
+                            Some(format!("{error}. The final transcript is safe.")),
+                            Some(&run_id),
+                        );
+                    }
+                }
+                emit_progress(&app_handle, "complete", Some(session_id), Some(&run_id));
+            }
+            Err(error) => {
+                let persisted_error = match state.db_handle() {
+                    Ok(db) => match db.fail_processing_session(&session_id, &error) {
+                        Ok(()) => error,
+                        Err(save_error) => format!(
+                            "{error}. Recall also could not persist the failure state: {save_error}"
+                        ),
+                    },
+                    Err(save_error) => format!(
+                        "{error}. Recall also could not reopen the local database: {save_error}"
+                    ),
+                };
+                emit_progress(
+                    &app_handle,
+                    "audio:retained",
+                    Some("The recording and live-caption draft were kept for retry".into()),
+                    Some(&run_id),
+                );
+                emit_progress(&app_handle, "error", Some(persisted_error), Some(&run_id));
+            }
+        }
+    });
+}
+
+fn queue_transcription(
+    path: String,
+    state: AppState,
+    app_handle: tauri::AppHandle,
+) -> Result<QueuedTranscription, String> {
+    let source = Path::new(&path);
+    if !source.is_file() {
+        return Err("Recording file does not exist".into());
+    }
+    let db = state.db_handle()?;
     let run_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
     if let Ok(mut progress) = state.progress.lock() {
         progress.entry(run_id.clone()).or_default();
+    }
+    emit_progress(
+        &app_handle,
+        "audio:persist:start",
+        Some("Saving a recovery copy before final transcription".into()),
+        Some(&run_id),
+    );
+    let draft_transcript = live_transcript_fallback(&state);
+    let title = make_conversation_title(&draft_transcript);
+    let expected_path = state
+        .data_dir
+        .join("processing")
+        .join(format!("{session_id}.wav"));
+    let retained_path = match persist_recording_audio(source, &state, &session_id) {
+        Ok(path) => path,
+        Err(error) if expected_path.is_file() => {
+            let durable_error = format!(
+                "The recording reached recovery storage but local verification failed: {error}"
+            );
+            if let Err(database_error) = db.create_processing_session(
+                &session_id,
+                &run_id,
+                &title,
+                &draft_transcript,
+                0,
+                &expected_path.to_string_lossy(),
+            ) {
+                let combined = format!(
+                    "{durable_error}. The recording remains at {}, but its conversation row could not be created: {database_error}",
+                    expected_path.display()
+                );
+                emit_progress(&app_handle, "error", Some(combined.clone()), Some(&run_id));
+                return Err(combined);
+            }
+            if let Err(database_error) = db.fail_processing_session(&session_id, &durable_error) {
+                let combined = format!(
+                    "{durable_error}. Recall could not mark the draft as failed: {database_error}"
+                );
+                emit_progress(&app_handle, "error", Some(combined.clone()), Some(&run_id));
+                return Err(combined);
+            }
+            emit_progress(
+                &app_handle,
+                "audio:retained",
+                Some("The recording and live-caption draft were kept for inspection".into()),
+                Some(&run_id),
+            );
+            emit_progress(&app_handle, "error", Some(durable_error), Some(&run_id));
+            return Ok(QueuedTranscription { run_id, session_id });
+        }
+        Err(error) => {
+            emit_progress(&app_handle, "error", Some(error.clone()), Some(&run_id));
+            return Err(error);
+        }
+    };
+    let duration_result = wav_duration_ms(&retained_path);
+    let duration_ms = duration_result.as_ref().copied().unwrap_or(0);
+    if let Err(error) = db.create_processing_session(
+        &session_id,
+        &run_id,
+        &title,
+        &draft_transcript,
+        duration_ms,
+        &retained_path.to_string_lossy(),
+    ) {
+        let message = format!(
+            "The recording is safe at {}, but Recall could not create its conversation record: {error}",
+            retained_path.display()
+        );
+        emit_progress(&app_handle, "error", Some(message.clone()), Some(&run_id));
+        return Err(message);
+    }
+    emit_progress(
+        &app_handle,
+        "audio:persisted",
+        Some("Recording and live-caption draft saved locally".into()),
+        Some(&run_id),
+    );
+    if let Err(error) = duration_result {
+        if let Err(database_error) = db.fail_processing_session(&session_id, &error) {
+            let combined = format!(
+                "{error}. Recall could not mark the saved draft as failed: {database_error}"
+            );
+            emit_progress(&app_handle, "error", Some(combined.clone()), Some(&run_id));
+            return Err(combined);
+        }
+        emit_progress(
+            &app_handle,
+            "audio:retained",
+            Some("The recording and live-caption draft were kept for inspection".into()),
+            Some(&run_id),
+        );
+        emit_progress(&app_handle, "error", Some(error), Some(&run_id));
+        return Ok(QueuedTranscription { run_id, session_id });
     }
     emit_progress(
         &app_handle,
@@ -683,37 +1029,15 @@ fn queue_transcription(path: String, state: AppState, app_handle: tauri::AppHand
         Some("Final transcription queued".into()),
         Some(&run_id),
     );
-    let worker_run_id = run_id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let result = transcribe_file_inner(&path, &state, &app_handle, &worker_run_id);
-        if let Err(error) = std::fs::remove_file(&path) {
-            if Path::new(&path).exists() {
-                emit_progress(
-                    &app_handle,
-                    "audio:cleanup:warning",
-                    Some(format!("Could not delete temporary recording: {error}")),
-                    Some(&worker_run_id),
-                );
-            }
-        } else {
-            emit_progress(
-                &app_handle,
-                "audio:cleanup:done",
-                Some("Temporary recording deleted".into()),
-                Some(&worker_run_id),
-            );
-        }
-        match result {
-            Ok(session_id) => emit_progress(
-                &app_handle,
-                "complete",
-                Some(session_id),
-                Some(&worker_run_id),
-            ),
-            Err(error) => emit_progress(&app_handle, "error", Some(error), Some(&worker_run_id)),
-        }
-    });
-    run_id
+    spawn_transcription_worker(
+        retained_path.to_string_lossy().to_string(),
+        session_id.clone(),
+        draft_transcript,
+        state,
+        app_handle,
+        run_id.clone(),
+    );
+    Ok(QueuedTranscription { run_id, session_id })
 }
 
 #[tauri::command]
@@ -721,15 +1045,63 @@ fn transcribe_file_async(
     path: String,
     app_state: State<AppState>,
     app_handle: tauri::AppHandle,
-) -> Result<String, String> {
-    if !Path::new(&path).is_file() {
-        return Err("Recording file does not exist".into());
+) -> Result<QueuedTranscription, String> {
+    queue_transcription(path, app_state.inner().clone(), app_handle)
+}
+
+#[tauri::command]
+fn retry_processing(
+    session_id: String,
+    app_state: State<AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<QueuedTranscription, String> {
+    let db = app_state.db_handle()?;
+    let job = db
+        .processing_job(&session_id)?
+        .ok_or_else(|| "This conversation has no retained recording to retry".to_string())?;
+    if job.status != "failed" {
+        return Err("This conversation is not waiting for a transcription retry".into());
     }
-    Ok(queue_transcription(
-        path,
+    let path = PathBuf::from(&job.audio_path);
+    validate_managed_audio_path(&path, app_state.inner())?;
+    let session = db
+        .list_sessions()?
+        .into_iter()
+        .find(|candidate| candidate.id == session_id)
+        .ok_or_else(|| "Conversation not found".to_string())?;
+    let run_id = Uuid::new_v4().to_string();
+    db.restart_processing_session(&session_id, &run_id)?;
+    if let Ok(mut progress) = app_state.progress.lock() {
+        progress.entry(run_id.clone()).or_default();
+    }
+    emit_progress(
+        &app_handle,
+        "retry:queued",
+        Some("Retrying final transcription from the retained recording".into()),
+        Some(&run_id),
+    );
+    spawn_transcription_worker(
+        job.audio_path,
+        session_id.clone(),
+        session.transcript,
         app_state.inner().clone(),
         app_handle,
-    ))
+        run_id.clone(),
+    );
+    Ok(QueuedTranscription { run_id, session_id })
+}
+
+#[tauri::command]
+fn discard_retained_audio(session_id: String, app_state: State<AppState>) -> Result<(), String> {
+    let db = app_state.db_handle()?;
+    let job = db
+        .processing_job(&session_id)?
+        .ok_or_else(|| "This conversation has no retained recording".to_string())?;
+    if !matches!(job.status.as_str(), "finalized" | "cleanup_failed") {
+        return Err("The retained recording is still needed to recover this conversation".into());
+    }
+    remove_managed_audio(Path::new(&job.audio_path), app_state.inner())?;
+    db.complete_processing_session(&session_id)
 }
 
 #[tauri::command]
@@ -843,19 +1215,6 @@ fn merge_segments(segments: &[TranscriptSegment]) -> Vec<TranscriptSegment> {
     merged
 }
 
-fn build_display_transcript(segments: &[TranscriptSegment], fallback: &str) -> String {
-    let lines = segments
-        .iter()
-        .filter(|segment| !segment.text.trim().is_empty())
-        .map(|segment| format!("{}: {}", segment.speaker, segment.text.trim()))
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        fallback.trim().to_string()
-    } else {
-        lines.join("\n")
-    }
-}
-
 fn build_saved_transcript(segments: &[SegmentRecord], fallback: &str) -> String {
     let lines = segments
         .iter()
@@ -884,6 +1243,30 @@ fn refresh_session_transcript(db: &Db, session_id: &str) -> Result<(), String> {
     db.update_session_transcript(session_id, &transcript)
 }
 
+fn ensure_sessions_not_recapping(
+    app_state: &AppState,
+    session_ids: &[String],
+) -> Result<(), String> {
+    let in_flight = app_state
+        .recap_in_flight
+        .lock()
+        .map_err(|_| "Recap lock poisoned".to_string())?;
+    if session_ids
+        .iter()
+        .any(|session_id| in_flight.contains(session_id))
+    {
+        return Err(
+            "That change is paused because an affected conversation is being recapped. Try again after the recap finishes."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn ensure_session_not_recapping(app_state: &AppState, session_id: &str) -> Result<(), String> {
+    ensure_sessions_not_recapping(app_state, &[session_id.to_string()])
+}
+
 fn make_conversation_title(transcript: &str) -> String {
     let words = transcript.split_whitespace().take(9).collect::<Vec<_>>();
     if words.is_empty() {
@@ -900,27 +1283,211 @@ fn make_conversation_title(transcript: &str) -> String {
     }
 }
 
-fn collect_audio_by_speaker(
+#[derive(Debug, Default)]
+struct SampleWindowSet {
+    windows: Vec<SampleWindow>,
+    overlapping_segments: usize,
+    short_segments: usize,
+    silent_windows: usize,
+}
+
+fn pcm_rms(pcm: &[f32]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    (pcm.iter().map(|sample| sample * sample).sum::<f32>() / pcm.len() as f32).sqrt()
+}
+
+fn overlaps_other_speaker(segment: &TranscriptSegment, segments: &[TranscriptSegment]) -> bool {
+    segments.iter().any(|other| {
+        if other.speaker == segment.speaker {
+            return false;
+        }
+        let overlap_start = segment.start_ms.max(other.start_ms);
+        let overlap_end = segment.end_ms.min(other.end_ms);
+        overlap_end.saturating_sub(overlap_start) > SAMPLE_OVERLAP_TOLERANCE_MS
+    })
+}
+
+fn sample_range(audio: &AudioClip, start_ms: u64, end_ms: u64) -> Option<Vec<f32>> {
+    if audio.sample_rate == 0 || end_ms <= start_ms {
+        return None;
+    }
+    let start = ((start_ms as u128 * audio.sample_rate as u128) / 1_000) as usize;
+    let end = ((end_ms as u128 * audio.sample_rate as u128) / 1_000) as usize;
+    let start = start.min(audio.samples.len());
+    let end = end.min(audio.samples.len());
+    (end > start).then(|| audio.samples[start..end].to_vec())
+}
+
+fn clean_sample_windows(
     audio: &AudioClip,
     segments: &[TranscriptSegment],
-) -> HashMap<String, Vec<f32>> {
-    let mut buckets = HashMap::new();
-    let target_samples = ((audio.sample_rate as u64 * TARGET_SPEAKER_MS) / 1_000) as usize;
-    for segment in segments {
-        let start = ((segment.start_ms as u128 * audio.sample_rate as u128) / 1_000) as usize;
-        let end = ((segment.end_ms as u128 * audio.sample_rate as u128) / 1_000) as usize;
-        let start = start.min(audio.samples.len());
-        let end = end.min(audio.samples.len());
-        if end <= start {
+    diarized_speaker: &str,
+) -> SampleWindowSet {
+    let mut speaker_segments = segments
+        .iter()
+        .filter(|segment| segment.speaker == diarized_speaker && segment.end_ms > segment.start_ms)
+        .collect::<Vec<_>>();
+    speaker_segments
+        .sort_by(|left, right| (right.end_ms - right.start_ms).cmp(&(left.end_ms - left.start_ms)));
+    let mut result = SampleWindowSet::default();
+
+    for segment in speaker_segments {
+        if result.windows.len() >= MAX_SAMPLE_WINDOWS_PER_SPEAKER {
+            break;
+        }
+        if overlaps_other_speaker(segment, segments) {
+            result.overlapping_segments += 1;
             continue;
         }
-        let bucket: &mut Vec<f32> = buckets.entry(segment.speaker.clone()).or_default();
-        let remaining = target_samples.saturating_sub(bucket.len());
-        if remaining > 0 {
-            bucket.extend_from_slice(&audio.samples[start..(start + remaining.min(end - start))]);
+        let duration_ms = segment.end_ms - segment.start_ms;
+        if duration_ms < MIN_SPEAKER_MS + (SAMPLE_EDGE_TRIM_MS * 2) {
+            result.short_segments += 1;
+            continue;
+        }
+        let safe_start = segment.start_ms + SAMPLE_EDGE_TRIM_MS;
+        let safe_end = segment.end_ms - SAMPLE_EDGE_TRIM_MS;
+        let safe_duration = safe_end.saturating_sub(safe_start);
+        if safe_duration < MIN_SPEAKER_MS {
+            result.short_segments += 1;
+            continue;
+        }
+
+        let full_windows = safe_duration / SAMPLE_WINDOW_MS;
+        let mut ranges = if full_windows == 0 {
+            vec![(safe_start, safe_end)]
+        } else {
+            let used = full_windows * SAMPLE_WINDOW_MS;
+            let offset = (safe_duration - used) / 2;
+            (0..full_windows)
+                .map(|index| {
+                    let start = safe_start + offset + (index * SAMPLE_WINDOW_MS);
+                    (start, start + SAMPLE_WINDOW_MS)
+                })
+                .collect::<Vec<_>>()
+        };
+        let segment_midpoint = segment.start_ms + (duration_ms / 2);
+        ranges.sort_by_key(|(start, end)| (start + ((end - start) / 2)).abs_diff(segment_midpoint));
+
+        for (start_ms, end_ms) in ranges {
+            if result.windows.len() >= MAX_SAMPLE_WINDOWS_PER_SPEAKER {
+                break;
+            }
+            let Some(pcm) = sample_range(audio, start_ms, end_ms) else {
+                continue;
+            };
+            if pcm_rms(&pcm) < MIN_SAMPLE_RMS {
+                result.silent_windows += 1;
+                continue;
+            }
+            result.windows.push(SampleWindow {
+                start_ms,
+                end_ms,
+                pcm,
+            });
         }
     }
-    buckets
+    result
+}
+
+fn dominant_consistent_indices(vectors: &[Vec<f32>]) -> Vec<usize> {
+    if vectors.is_empty() {
+        return Vec::new();
+    }
+    let mut best_members = Vec::new();
+    let mut best_similarity = f32::NEG_INFINITY;
+    for (index, vector) in vectors.iter().enumerate() {
+        let members = vectors
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate_index, candidate)| {
+                (embedding::cosine_similarity(vector, candidate) >= SAMPLE_CONSISTENCY_THRESHOLD)
+                    .then_some(candidate_index)
+            })
+            .collect::<Vec<_>>();
+        let similarity = members
+            .iter()
+            .map(|member| embedding::cosine_similarity(vector, &vectors[*member]))
+            .sum::<f32>();
+        if members.len() > best_members.len()
+            || (members.len() == best_members.len() && similarity > best_similarity)
+        {
+            best_members = members;
+            best_similarity = similarity;
+        }
+        if index + 1 == vectors.len()
+            && vectors.len() > 1
+            && best_members.len() * 2 <= vectors.len()
+        {
+            return Vec::new();
+        }
+    }
+    best_members
+}
+
+fn average_embeddings(vectors: impl Iterator<Item = Vec<f32>>) -> Vec<f32> {
+    let vectors = vectors.collect::<Vec<_>>();
+    let Some(first) = vectors.first() else {
+        return Vec::new();
+    };
+    let mut average = vec![0.0; first.len()];
+    let mut count = 0usize;
+    for vector in vectors {
+        if vector.len() != average.len() {
+            continue;
+        }
+        for (target, value) in average.iter_mut().zip(vector) {
+            *target += value;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+    for value in &mut average {
+        *value /= count as f32;
+    }
+    let norm = average
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut average {
+            *value /= norm;
+        }
+    }
+    average
+}
+
+fn group_voice_observations(observations: &[VoiceObservation]) -> Vec<VoiceObservationGroup> {
+    let mut groups: Vec<VoiceObservationGroup> = Vec::new();
+    for (index, observation) in observations.iter().enumerate() {
+        let compatible_group = groups.iter().position(|group| {
+            group.observation_indices.iter().all(|member| {
+                embedding::cosine_similarity(
+                    &observation.embedding,
+                    &observations[*member].embedding,
+                ) >= SAME_VOICE_SPLIT_THRESHOLD
+            })
+        });
+        if let Some(group_index) = compatible_group {
+            groups[group_index].observation_indices.push(index);
+            groups[group_index].embedding = average_embeddings(
+                groups[group_index]
+                    .observation_indices
+                    .iter()
+                    .map(|member| observations[*member].embedding.clone()),
+            );
+        } else {
+            groups.push(VoiceObservationGroup {
+                observation_indices: vec![index],
+                embedding: observation.embedding.clone(),
+            });
+        }
+    }
+    groups
 }
 
 fn process_segments(
@@ -932,7 +1499,6 @@ fn process_segments(
     app_handle: &tauri::AppHandle,
     run_id: &str,
 ) -> Result<(), String> {
-    let buckets = collect_audio_by_speaker(audio, segments);
     let known = db.list_embeddings(EMBEDDING_VERSION)?;
     let mut ordered_speakers = Vec::new();
     let mut seen = HashSet::new();
@@ -942,21 +1508,116 @@ fn process_segments(
         }
     }
     let mut observations = Vec::new();
+    let mut fallback_previews: HashMap<String, Vec<f32>> = HashMap::new();
 
-    for diarized_speaker in ordered_speakers {
-        let pcm = buckets.get(&diarized_speaker).cloned().unwrap_or_default();
+    for diarized_speaker in &ordered_speakers {
+        if diarized_speaker == "unknown" {
+            emit_progress(
+                app_handle,
+                "voiceprint:skipped",
+                Some("Provider audio without a speaker label remains Unknown speaker".into()),
+                Some(run_id),
+            );
+            continue;
+        }
+        let window_set = clean_sample_windows(audio, segments, diarized_speaker);
+        if window_set.windows.is_empty() {
+            emit_progress(
+                app_handle,
+                "voiceprint:skipped",
+                Some(format!(
+                    "{diarized_speaker}: no clean central excerpt of at least {:.1} seconds; keeping the provider voice for manual review ({} overlapping, {} short, {} silent candidates)",
+                    MIN_SPEAKER_MS as f64 / 1_000.0,
+                    window_set.overlapping_segments,
+                    window_set.short_segments,
+                    window_set.silent_windows,
+                )),
+                Some(run_id),
+            );
+            continue;
+        }
+        if let Some(window) = window_set.windows.first() {
+            fallback_previews.insert(diarized_speaker.clone(), window.pcm.clone());
+        }
+        let Some(embedder) = embedder else {
+            emit_progress(
+                app_handle,
+                "voiceprint:warning",
+                Some(format!(
+                    "{diarized_speaker}: local ECAPA model is unavailable; keeping the provider voice for manual review"
+                )),
+                Some(run_id),
+            );
+            continue;
+        };
+
+        let mut embedded_windows = Vec::new();
+        for window in window_set.windows {
+            match embedder.embed(&window.pcm, audio.sample_rate) {
+                Ok(embedding) => embedded_windows.push((window, embedding)),
+                Err(error) => emit_progress(
+                    app_handle,
+                    "voiceprint:warning",
+                    Some(format!(
+                        "{diarized_speaker}: rejected one candidate excerpt: {error}"
+                    )),
+                    Some(run_id),
+                ),
+            }
+        }
+        let vectors = embedded_windows
+            .iter()
+            .map(|(_, embedding)| embedding.clone())
+            .collect::<Vec<_>>();
+        let consistent_indices = dominant_consistent_indices(&vectors);
+        if consistent_indices.is_empty() {
+            emit_progress(
+                app_handle,
+                "voiceprint:skipped",
+                Some(format!(
+                    "{diarized_speaker}: candidate excerpts were not acoustically consistent; keeping the provider voice for manual review without a trusted voiceprint"
+                )),
+                Some(run_id),
+            );
+            continue;
+        }
+
+        let target_samples = ((audio.sample_rate as u64 * TARGET_SPEAKER_MS) / 1_000) as usize;
+        let mut pcm = Vec::with_capacity(target_samples);
+        let mut selected_windows = 0usize;
+        let mut selected_ms = 0u64;
+        for index in consistent_indices.iter().copied() {
+            let window = &embedded_windows[index].0;
+            let remaining = target_samples.saturating_sub(pcm.len());
+            if remaining == 0 {
+                break;
+            }
+            pcm.extend_from_slice(&window.pcm[..remaining.min(window.pcm.len())]);
+            selected_windows += 1;
+            selected_ms += window.end_ms.saturating_sub(window.start_ms);
+        }
         let sample_duration_ms = if audio.sample_rate == 0 {
             0
         } else {
             (pcm.len() as u64 * 1_000) / audio.sample_rate as u64
         };
-        let embedding = match (
-            embedder,
-            pcm.is_empty(),
-            sample_duration_ms >= MIN_SPEAKER_MS,
-        ) {
-            (Some(embedder), false, true) => match embedder.embed(&pcm, audio.sample_rate) {
-                Ok(value) => Some(value),
+        if sample_duration_ms < MIN_SPEAKER_MS {
+            emit_progress(
+                app_handle,
+                "voiceprint:skipped",
+                Some(format!(
+                    "{diarized_speaker}: consistent clean speech was shorter than {:.1} seconds; keeping the provider voice for manual review",
+                    MIN_SPEAKER_MS as f64 / 1_000.0,
+                )),
+                Some(run_id),
+            );
+            continue;
+        }
+        let embedding = if selected_windows == 1 {
+            embedded_windows[consistent_indices[0]].1.clone()
+        } else {
+            match embedder.embed(&pcm, audio.sample_rate) {
+                Ok(value) => value,
                 Err(error) => {
                     emit_progress(
                         app_handle,
@@ -964,77 +1625,80 @@ fn process_segments(
                         Some(format!("{diarized_speaker}: {error}")),
                         Some(run_id),
                     );
-                    None
+                    continue;
                 }
-            },
-            (None, _, _) => {
-                emit_progress(
-                    app_handle,
-                    "voiceprint:warning",
-                    Some(format!(
-                        "{diarized_speaker}: local ECAPA model is unavailable; leaving this intervention unattributed"
-                    )),
-                    Some(run_id),
-                );
-                None
             }
-            (_, _, false) => {
-                emit_progress(
-                    app_handle,
-                    "voiceprint:warning",
-                    Some(format!(
-                        "{diarized_speaker}: only {:.1} seconds of speech; at least {:.1} seconds is required for a voiceprint",
-                        sample_duration_ms as f64 / 1_000.0,
-                        MIN_SPEAKER_MS as f64 / 1_000.0,
-                    )),
-                    Some(run_id),
-                );
-                None
-            }
-            _ => None,
         };
-
-        let Some(embedding) = embedding else {
-            emit_progress(
-                app_handle,
-                "voiceprint:skipped",
-                Some(format!(
-                    "{diarized_speaker}: no persistent voice profile was created"
-                )),
-                Some(run_id),
-            );
-            continue;
-        };
+        let consistency_rejections = embedded_windows.len() - consistent_indices.len();
+        emit_progress(
+            app_handle,
+            "voiceprint:sample:selected",
+            Some(format!(
+                "{diarized_speaker}: selected {selected_windows} clean central excerpt{} ({:.1}s); rejected {} inconsistent, {} overlapping, {} short, and {} silent candidate{}",
+                if selected_windows == 1 { "" } else { "s" },
+                sample_duration_ms.min(selected_ms) as f64 / 1_000.0,
+                consistency_rejections,
+                window_set.overlapping_segments,
+                window_set.short_segments,
+                window_set.silent_windows,
+                if consistency_rejections
+                    + window_set.overlapping_segments
+                    + window_set.short_segments
+                    + window_set.silent_windows
+                    == 1
+                {
+                    ""
+                } else {
+                    "s"
+                },
+            )),
+            Some(run_id),
+        );
 
         observations.push(VoiceObservation {
-            diarized_speaker,
+            diarized_speaker: diarized_speaker.clone(),
             pcm,
             embedding,
+            clean_window_count: selected_windows,
         });
     }
 
-    let candidates = observations
+    let groups = group_voice_observations(&observations);
+    let candidates = groups
         .iter()
-        .map(|observation| best_speaker_match(&observation.embedding, &known))
+        .map(|group| best_speaker_match(&group.embedding, &known))
         .collect::<Vec<_>>();
     let resolved_matches = resolve_unique_profile_matches(&candidates);
     let mut mapping: HashMap<String, (String, String)> = HashMap::new();
 
-    for (observation, (candidate, matched)) in observations
+    for (group, (candidate, matched)) in groups
         .into_iter()
         .zip(candidates.into_iter().zip(resolved_matches))
     {
-        let VoiceObservation {
-            diarized_speaker,
-            pcm,
-            embedding,
-        } = observation;
+        let representative_index = group
+            .observation_indices
+            .iter()
+            .copied()
+            .max_by_key(|index| {
+                (
+                    observations[*index].clean_window_count,
+                    observations[*index].pcm.len(),
+                )
+            })
+            .ok_or_else(|| "Voice observation group was unexpectedly empty".to_string())?;
+        let representative = &observations[representative_index];
+        let diarized_speakers = group
+            .observation_indices
+            .iter()
+            .map(|index| observations[*index].diarized_speaker.clone())
+            .collect::<Vec<_>>();
+        let diarized_label = diarized_speakers.join(" + ");
         let (speaker_id, label, is_new) = if let Some(matched) = matched {
             emit_progress(
                 app_handle,
                 "voiceprint:matched",
                 Some(format!(
-                    "{diarized_speaker} → {} ({:.2}; reference left unchanged)",
+                    "{diarized_label} → {} ({:.2}; reference left unchanged)",
                     matched.label, matched.score
                 )),
                 Some(run_id),
@@ -1056,7 +1720,7 @@ fn process_segments(
             emit_progress(
                 app_handle,
                 "voiceprint:new",
-                Some(format!("{diarized_speaker} → {label} ({reason})")),
+                Some(format!("{diarized_label} → {label} ({reason})")),
                 Some(run_id),
             );
             (speaker_id, label, true)
@@ -1066,10 +1730,10 @@ fn process_segments(
         // intentionally not fed back into the reference library: only a human
         // naming or assigning a provisional profile can expand a known person.
         if is_new {
-            db.insert_embedding(&speaker_id, session_id, &embedding, EMBEDDING_VERSION)?;
+            db.insert_embedding(&speaker_id, session_id, &group.embedding, EMBEDDING_VERSION)?;
         }
-        if is_new && !pcm.is_empty() {
-            let sample = encode_wav_base64(&pcm, audio.sample_rate)?;
+        if is_new && !representative.pcm.is_empty() {
+            let sample = encode_wav_base64(&representative.pcm, audio.sample_rate)?;
             db.insert_sample(&speaker_id, &sample, audio.sample_rate)?;
             emit_progress(
                 app_handle,
@@ -1078,6 +1742,49 @@ fn process_segments(
                 Some(run_id),
             );
         }
+        if diarized_speakers.len() > 1 {
+            emit_progress(
+                app_handle,
+                "voiceprint:labels:coalesced",
+                Some(format!(
+                    "Combined {} provider speaker labels because their clean voiceprints agreed at {:.2} or higher",
+                    diarized_speakers.len(),
+                    SAME_VOICE_SPLIT_THRESHOLD,
+                )),
+                Some(run_id),
+            );
+        }
+        for diarized_speaker in diarized_speakers {
+            mapping.insert(diarized_speaker, (speaker_id.clone(), label.clone()));
+        }
+    }
+
+    for diarized_speaker in ordered_speakers {
+        if diarized_speaker == "unknown" || mapping.contains_key(&diarized_speaker) {
+            continue;
+        }
+        let label = db.next_voice_label()?;
+        let speaker_id = db.insert_speaker(Some(&label))?;
+        if let Some(pcm) = fallback_previews.get(&diarized_speaker) {
+            let sample = encode_wav_base64(pcm, audio.sample_rate)?;
+            db.insert_sample(&speaker_id, &sample, audio.sample_rate)?;
+            emit_progress(
+                app_handle,
+                "voiceprint:sample:stored",
+                Some(format!(
+                    "Stored a temporary preview for {label}; no trusted voiceprint was created"
+                )),
+                Some(run_id),
+            );
+        }
+        emit_progress(
+            app_handle,
+            "voiceprint:new",
+            Some(format!(
+                "{diarized_speaker} → {label} for manual review; no safe automatic match was available"
+            )),
+            Some(run_id),
+        );
         mapping.insert(diarized_speaker, (speaker_id, label));
     }
 
@@ -1356,6 +2063,7 @@ fn update_transcript(
     transcript: String,
     app_state: State<AppState>,
 ) -> Result<(), String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     app_state
         .db_handle()?
         .update_session_transcript(&session_id, &transcript)
@@ -1367,6 +2075,7 @@ fn update_session_title(
     title: String,
     app_state: State<AppState>,
 ) -> Result<(), String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     app_state
         .db_handle()?
         .update_session_title(&session_id, &title)
@@ -1379,6 +2088,7 @@ fn update_segment_text(
     text: String,
     app_state: State<AppState>,
 ) -> Result<(), String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     let db = app_state.db_handle()?;
     db.update_segment_text(&segment_id, &text)?;
     refresh_session_transcript(&db, &session_id)
@@ -1391,6 +2101,7 @@ fn assign_segment_speaker(
     speaker_id: Option<String>,
     app_state: State<AppState>,
 ) -> Result<(), String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     let db = app_state.db_handle()?;
     db.assign_segment_speaker(&segment_id, speaker_id.as_deref())?;
     refresh_session_transcript(&db, &session_id)
@@ -1398,7 +2109,18 @@ fn assign_segment_speaker(
 
 #[tauri::command]
 fn delete_session(session_id: String, app_state: State<AppState>) -> Result<usize, String> {
-    app_state.db_handle()?.delete_session(&session_id)
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
+    let db = app_state.db_handle()?;
+    if let Some(job) = db.processing_job(&session_id)? {
+        if matches!(job.status.as_str(), "queued" | "processing") {
+            return Err(
+                "This conversation is still being processed. Wait for it to finish or fail before deleting it."
+                    .into(),
+            );
+        }
+        remove_managed_audio(Path::new(&job.audio_path), app_state.inner())?;
+    }
+    db.delete_session(&session_id)
 }
 
 fn recap_snapshot(db: &Db, config: &AppConfig, session_id: &str) -> Result<RecapSnapshot, String> {
@@ -1509,6 +2231,7 @@ fn save_agenda_text(
     text: String,
     app_state: State<AppState>,
 ) -> Result<AgendaMetadata, String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     if text.trim().is_empty() {
         return Err("Paste some agenda text first".into());
     }
@@ -1532,6 +2255,7 @@ fn choose_agenda_file(
     session_id: String,
     app_state: State<AppState>,
 ) -> Result<Option<AgendaMetadata>, String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     let path = rfd::FileDialog::new()
         .set_title("Choose a meeting agenda")
         .add_filter(
@@ -1560,6 +2284,7 @@ fn choose_agenda_file(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| "The agenda filename is not valid Unicode".to_string())?;
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     app_state
         .db_handle()?
         .upsert_agenda(&session_id, "file", filename, mime_type, &content)
@@ -1568,6 +2293,7 @@ fn choose_agenda_file(
 
 #[tauri::command]
 fn remove_agenda(session_id: String, app_state: State<AppState>) -> Result<bool, String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     app_state.db_handle()?.delete_agenda(&session_id)
 }
 
@@ -1651,17 +2377,26 @@ async fn generate_recap_inner(
     emit_recap_progress(
         app_handle,
         session_id,
-        "llm",
-        "Waiting for the LLM provider",
+        "llm:start",
+        "Starting the on-demand LLM recap run",
     );
-    let response = openai::generate_recap(openai::RecapRequest {
-        api_key: &api_key,
-        model: &model,
-        segments: &snapshot.segments,
-        agenda: snapshot.agenda.as_ref(),
-        no_translation_languages: &config.no_translation_languages,
-    })
+    let response = openai::generate_recap(
+        openai::RecapRequest {
+            api_key: &api_key,
+            model: &model,
+            segments: &snapshot.segments,
+            agenda: snapshot.agenda.as_ref(),
+            no_translation_languages: &config.no_translation_languages,
+        },
+        |stage, detail| emit_recap_progress(app_handle, session_id, stage, detail),
+    )
     .await?;
+    emit_recap_progress(
+        app_handle,
+        session_id,
+        "llm:done",
+        "LLM recap requests complete",
+    );
     for warning in &response.warnings {
         emit_recap_progress(app_handle, session_id, "warning", warning);
     }
@@ -1756,6 +2491,29 @@ fn list_session_ids_for_speaker(
 }
 
 #[tauri::command]
+fn list_session_ids_for_speakers(
+    speaker_ids: Vec<String>,
+    app_state: State<AppState>,
+) -> Result<Vec<String>, String> {
+    let speaker_ids = speaker_ids.iter().map(String::as_str).collect::<Vec<_>>();
+    app_state
+        .db_handle()?
+        .session_ids_for_speakers(&speaker_ids)
+}
+
+#[tauri::command]
+fn create_profile_for_unknown_segments(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<String, String> {
+    ensure_session_not_recapping(app_state.inner(), &session_id)?;
+    let db = app_state.db_handle()?;
+    let (_, label, _) = db.create_speaker_for_unattributed_segments(&session_id)?;
+    refresh_session_transcript(&db, &session_id)?;
+    Ok(label)
+}
+
+#[tauri::command]
 fn rename_speaker(
     speaker_id: String,
     new_label: String,
@@ -1763,6 +2521,7 @@ fn rename_speaker(
 ) -> Result<(), String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
+    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
     db.rename_speaker(&speaker_id, &new_label)?;
     for session_id in sessions {
         refresh_session_transcript(&db, &session_id)?;
@@ -1774,6 +2533,7 @@ fn rename_speaker(
 fn delete_speaker(speaker_id: String, app_state: State<AppState>) -> Result<(), String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
+    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
     db.delete_speaker(&speaker_id)?;
     for session_id in sessions {
         refresh_session_transcript(&db, &session_id)?;
@@ -1798,6 +2558,7 @@ fn merge_speakers(
 ) -> Result<(), String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[source_id.as_str(), target_id.as_str()])?;
+    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
     db.merge_speakers(&source_id, &target_id, replace_embeddings)?;
     for session_id in sessions {
         refresh_session_transcript(&db, &session_id)?;
@@ -1880,8 +2641,14 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
                         let path = path.to_string_lossy().to_string();
                         let _ = app.emit("recording:stopped", path.clone());
                         let state = app.state::<AppState>().inner().clone();
-                        let run_id = queue_transcription(path, state, app.clone());
-                        let _ = app.emit("transcription:queued", run_id);
+                        match queue_transcription(path, state, app.clone()) {
+                            Ok(queued) => {
+                                let _ = app.emit("transcription:queued", queued);
+                            }
+                            Err(error) => {
+                                let _ = app.emit("recording:error", error);
+                            }
+                        }
                     }
                     Err(error) => {
                         let _ = app.emit("recording:error", error);
@@ -1902,6 +2669,8 @@ fn main() {
             start_recording,
             stop_recording,
             transcribe_file_async,
+            retry_processing,
+            discard_retained_audio,
             get_progress,
             get_live_transcription,
             save_soniox_key,
@@ -1931,6 +2700,8 @@ fn main() {
             list_speakers,
             list_speakers_with_stats,
             list_session_ids_for_speaker,
+            list_session_ids_for_speakers,
+            create_profile_for_unknown_segments,
             rename_speaker,
             delete_speaker,
             get_speaker_samples,
@@ -1971,6 +2742,20 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn write_test_wav(path: &Path, seconds: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for _ in 0..(16_000 * seconds) {
+            writer.write_sample(0_i16).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
     fn stored_embedding(
         id: &str,
         speaker_id: &str,
@@ -2003,9 +2788,76 @@ mod tests {
     }
 
     #[test]
+    fn completed_recording_is_verified_in_private_recovery_storage() {
+        let root = std::env::temp_dir().join(format!("recall-audio-persist-{}", Uuid::new_v4()));
+        let source = root.join("temporary.wav");
+        fs::create_dir_all(&root).unwrap();
+        write_test_wav(&source, 2);
+        let state = AppState::new(root.join("data"), root.join("missing-model.onnx"));
+
+        let retained = persist_recording_audio(&source, &state, "session-1").unwrap();
+
+        assert!(!source.exists());
+        assert!(retained.is_file());
+        assert_eq!(wav_duration_ms(&retained).unwrap(), 2_000);
+        assert!(retained.starts_with(state.data_dir.join("processing")));
+        remove_managed_audio(&retained, &state).unwrap();
+        assert!(!retained.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_refuses_to_delete_audio_outside_recovery_storage() {
+        let root = std::env::temp_dir().join(format!("recall-audio-scope-{}", Uuid::new_v4()));
+        let outside = root.join("outside.wav");
+        let state = AppState::new(root.join("data"), root.join("missing-model.onnx"));
+        fs::create_dir_all(state.data_dir.join("processing")).unwrap();
+        write_test_wav(&outside, 1);
+
+        let error = remove_managed_audio(&outside, &state).unwrap_err();
+
+        assert!(error.contains("outside its recovery directory"));
+        assert!(outside.is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_surfaces_an_orphaned_recovery_wav_for_retry() {
+        let root = std::env::temp_dir().join(format!("recall-orphan-recovery-{}", Uuid::new_v4()));
+        let data_dir = root.join("data");
+        let processing_dir = data_dir.join("processing");
+        let session_id = Uuid::new_v4().to_string();
+        let retained = processing_dir.join(format!("{session_id}.wav"));
+        fs::create_dir_all(&processing_dir).unwrap();
+        write_test_wav(&retained, 3);
+        let state = AppState::new(data_dir, root.join("missing-model.onnx"));
+
+        state.open_db(Crypto::new(None, None)).unwrap();
+
+        let sessions = state.db_handle().unwrap().list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        assert_eq!(sessions[0].title, "Recovered recording");
+        assert_eq!(sessions[0].processing_status.as_deref(), Some("failed"));
+        assert!(sessions[0].recoverable_audio);
+        assert_eq!(sessions[0].duration_ms, 3_000);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn onboarding_version_is_explicitly_versioned() {
         assert_eq!(ONBOARDING_VERSION, "1");
         assert_eq!(AppConfig::default().onboarding_version, None);
+    }
+
+    #[test]
+    fn recap_lock_is_scoped_to_the_conversation_being_processed() {
+        let root = std::env::temp_dir().join(format!("recall-recap-lock-{}", Uuid::new_v4()));
+        let state = AppState::new(root.clone(), root.join("missing-model.onnx"));
+        state.recap_in_flight.lock().unwrap().insert("busy".into());
+
+        assert!(ensure_session_not_recapping(&state, "busy").is_err());
+        assert!(ensure_session_not_recapping(&state, "available").is_ok());
     }
 
     #[test]
@@ -2049,8 +2901,93 @@ mod tests {
     #[test]
     fn strict_ecapa_threshold_accepts_high_confidence_repeat_voice() {
         let known = vec![stored_embedding("e1", "s1", "Alice", vec![1.0, 0.0])];
-        assert!(best_speaker_match(&[0.91, 0.414_608_24], &known).is_some());
-        assert!(best_speaker_match(&[0.89, 0.455_960_5], &known).is_none());
+        assert!(best_speaker_match(&[0.95, 0.312_249_9], &known).is_some());
+        assert!(best_speaker_match(&[0.93, 0.367_559_5], &known).is_none());
+    }
+
+    #[test]
+    fn voice_samples_use_centered_windows_away_from_intervention_edges() {
+        let audio = AudioClip {
+            samples: vec![1.0; 5_700],
+            sample_rate: 1_000,
+        };
+        let segments = vec![TranscriptSegment {
+            speaker: "speaker_1".into(),
+            start_ms: 0,
+            end_ms: 5_700,
+            text: "A long intervention".into(),
+        }];
+
+        let selected = clean_sample_windows(&audio, &segments, "speaker_1");
+
+        assert_eq!(selected.windows.len(), 1);
+        assert_eq!(selected.windows[0].start_ms, 850);
+        assert_eq!(selected.windows[0].end_ms, 4_850);
+        assert_eq!(selected.windows[0].pcm.len(), 4_000);
+    }
+
+    #[test]
+    fn voice_samples_reject_interventions_overlapping_another_provider_speaker() {
+        let audio = AudioClip {
+            samples: vec![1.0; 7_000],
+            sample_rate: 1_000,
+        };
+        let segments = vec![
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 0,
+                end_ms: 6_000,
+                text: "First".into(),
+            },
+            TranscriptSegment {
+                speaker: "speaker_2".into(),
+                start_ms: 3_000,
+                end_ms: 5_000,
+                text: "Overlap".into(),
+            },
+        ];
+
+        let selected = clean_sample_windows(&audio, &segments, "speaker_1");
+
+        assert!(selected.windows.is_empty());
+        assert_eq!(selected.overlapping_segments, 1);
+    }
+
+    #[test]
+    fn mixed_voice_windows_require_a_consistent_majority() {
+        let vectors = vec![vec![1.0, 0.0], vec![0.95, 0.312_249_9], vec![0.0, 1.0]];
+        assert_eq!(dominant_consistent_indices(&vectors), vec![0, 1]);
+        assert!(dominant_consistent_indices(&[vec![1.0, 0.0], vec![0.0, 1.0]]).is_empty());
+    }
+
+    #[test]
+    fn only_near_identical_clean_voiceprints_coalesce_split_provider_labels() {
+        let observations = vec![
+            VoiceObservation {
+                diarized_speaker: "speaker_1".into(),
+                pcm: vec![0.1; 10],
+                embedding: vec![1.0, 0.0],
+                clean_window_count: 1,
+            },
+            VoiceObservation {
+                diarized_speaker: "speaker_3".into(),
+                pcm: vec![0.1; 10],
+                embedding: vec![0.98, 0.198_997_5],
+                clean_window_count: 1,
+            },
+            VoiceObservation {
+                diarized_speaker: "speaker_2".into(),
+                pcm: vec![0.1; 10],
+                embedding: vec![0.0, 1.0],
+                clean_window_count: 1,
+            },
+        ];
+
+        let groups = group_voice_observations(&observations);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].observation_indices, vec![0, 1]);
+        assert_eq!(groups[1].observation_indices, vec![2]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 use crate::config::AppConfig;
 use crate::db::{Crypto, Db};
@@ -101,6 +102,9 @@ impl AppState {
         std::fs::create_dir_all(&self.data_dir).map_err(|e| e.to_string())?;
         let db_path = self.db_path();
         let db = Arc::new(Db::open(db_path, crypto)?);
+        if let Err(error) = self.recover_orphaned_recordings(&db) {
+            eprintln!("[recovery] could not reconcile retained recordings: {error}");
+        }
         let mut guard = self.db.lock().map_err(|_| "db lock".to_string())?;
         *guard = Some(db);
         Ok(())
@@ -112,9 +116,95 @@ impl AppState {
         candidate
             .list_sessions()
             .map_err(|_| "The database password is incorrect or the data is damaged".to_string())?;
+        if let Err(error) = self.recover_orphaned_recordings(&candidate) {
+            eprintln!("[recovery] could not reconcile retained recordings: {error}");
+        }
         let mut guard = self.db.lock().map_err(|_| "DB lock poisoned".to_string())?;
         *guard = Some(candidate);
         Ok(())
+    }
+
+    fn recover_orphaned_recordings(&self, db: &Db) -> Result<usize, String> {
+        let directory = self.data_dir.join("processing");
+        if !directory.is_dir() {
+            return Ok(0);
+        }
+        let known_sessions = db
+            .list_sessions()?
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<HashSet<_>>();
+        let mut recovered = 0;
+        for entry in std::fs::read_dir(&directory).map_err(|error| error.to_string())? {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => {
+                    eprintln!("[recovery] could not inspect a retained recording: {error}");
+                    continue;
+                }
+            };
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("wav") {
+                continue;
+            }
+            let Some(session_id) = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .filter(|value| Uuid::parse_str(value).is_ok())
+                .map(str::to_string)
+            else {
+                eprintln!(
+                    "[recovery] retained recording has an unrecognized name: {}",
+                    path.display()
+                );
+                continue;
+            };
+            if db.processing_job(&session_id)?.is_some() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+            let run_id = Uuid::new_v4().to_string();
+            if known_sessions.contains(&session_id) {
+                db.attach_cleanup_recording(
+                    &session_id,
+                    &run_id,
+                    &path.to_string_lossy(),
+                    "Recall found a retained recording after the final transcript was saved.",
+                )?;
+            } else {
+                let duration_ms = hound::WavReader::open(&path)
+                    .ok()
+                    .and_then(|reader| {
+                        let sample_rate = reader.spec().sample_rate;
+                        (sample_rate > 0).then(|| {
+                            ((reader.duration() as u64 * 1_000) / sample_rate as u64) as i64
+                        })
+                    })
+                    .unwrap_or(0);
+                db.create_processing_session(
+                    &session_id,
+                    &run_id,
+                    "Recovered recording",
+                    "",
+                    duration_ms,
+                    &path.to_string_lossy(),
+                )?;
+                db.fail_processing_session(
+                    &session_id,
+                    "Recall recovered this recording before final transcription had started. Retry to create the final transcript.",
+                )?;
+            }
+            recovered += 1;
+            eprintln!(
+                "[recovery] attached retained recording {} to conversation {}",
+                path.display(),
+                session_id
+            );
+        }
+        Ok(recovered)
     }
 
     pub fn load_embedder(&self) -> Result<(), String> {

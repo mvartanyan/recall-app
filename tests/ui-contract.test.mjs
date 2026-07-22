@@ -186,7 +186,7 @@ test("settings remain scrollable and explain the live-caption charge", () => {
 });
 
 test("runtime copy uses provider-neutral STT and LLM terms", () => {
-  assert.match(html, /LLM recap/);
+  assert.match(javascript, /LLM recap/);
   assert.doesNotMatch(html, /OpenAI recap/);
   assert.match(javascript, /"stt:upload:start": "Uploading recording to the STT provider"/);
   assert.match(javascript, /llm: "Waiting for the LLM provider"/);
@@ -194,7 +194,7 @@ test("runtime copy uses provider-neutral STT and LLM terms", () => {
   assert.doesNotMatch(javascript, /Starting on-demand OpenAI recap|OpenAI recap saved locally/);
   assert.match(rustSoniox, /progress\("stt:upload:start"/);
   assert.doesNotMatch(rustSoniox, /progress\("soniox:/);
-  assert.match(rustMain, /emit_recap_progress\(\s*app_handle,\s*session_id,\s*"llm"/);
+  assert.match(rustMain, /emit_recap_progress\(\s*app_handle,\s*session_id,\s*"llm:start"/);
   assert.doesNotMatch(rustSoniox, /Soniox/);
   assert.doesNotMatch(rustOpenAI, /OpenAI/);
   assert.doesNotMatch(rustRecap, /OpenAI/);
@@ -236,6 +236,29 @@ test("recording and processing replace rather than overlay the old transcript", 
   assert.match(javascript, /elements\.transcriptContent\.hidden = mode !== "conversation"/);
 });
 
+test("final transcription is recovery-safe and retryable", () => {
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS processing_jobs/);
+  assert.match(rustDb, /fn mark_interrupted_processing_jobs/);
+  assert.match(rustDb, /status='failed'[\s\S]*?interrupted when Recall closed/);
+  assert.match(rustMain, /fn persist_recording_audio/);
+  assert.match(rustMain, /create_processing_session\(/);
+  assert.match(rustMain, /"audio:retained"/);
+  assert.match(rustMain, /fn retry_processing/);
+  assert.match(javascript, /invoke\("retry_processing"/);
+  assert.match(html, /id="processingRecoveryBanner"/);
+  assert.match(html, /id="retryProcessingButton"/);
+  assert.match(javascript, /The recording and live-caption draft are still saved locally/);
+  assert.match(javascript, /Final transcript needs retry/);
+});
+
+test("long final uploads stream from disk and do not use the old 90-second limit", () => {
+  assert.match(rustSoniox, /multipart::Part::file\(path\)/);
+  assert.match(rustSoniox, /REST_REQUEST_TIMEOUT.*2 \* 60 \* 60/);
+  assert.match(rustSoniox, /TRANSCRIPTION_DEADLINE.*2 \* 60 \* 60/);
+  assert.doesNotMatch(rustSoniox, /std::fs::read\(path\)/);
+  assert.doesNotMatch(rustSoniox, /timeout\(Duration::from_secs\(90\)\)/);
+});
+
 test("people distinguish selected, historical, and matchable profiles", () => {
   assert.match(javascript, /In selected conversation/);
   assert.match(javascript, /Last heard/);
@@ -254,10 +277,31 @@ test("current voices and the full Voice Library are separate surfaces", () => {
   assert.match(javascript, /function renderVoiceLibrary\(\)/);
 });
 
+test("completed conversations are not masked by unrelated processing jobs", () => {
+  assert.match(javascript, /isSessionProcessing\(selectedSession\)/);
+  assert.match(javascript, /reconcileTrackedRuns\(state\.sessions\)/);
+  const speakerRenderer = javascript.slice(
+    javascript.indexOf("function renderSpeakers"),
+    javascript.indexOf("function renderVoiceLibrary"),
+  );
+  assert.doesNotMatch(speakerRenderer, /state\.activeRuns\.size/);
+});
+
+test("unknown interventions remain reviewable without inventing a voiceprint", () => {
+  assert.match(javascript, /function buildUnknownSpeakerCard/);
+  assert.match(javascript, /Group as one voice/);
+  assert.match(javascript, /invoke\("create_profile_for_unknown_segments"/);
+  assert.match(rustMain, /fn create_profile_for_unknown_segments/);
+  assert.match(rustDb, /create_speaker_for_unattributed_segments/);
+  assert.match(rustMain, /no safe automatic match was available/);
+  assert.match(rustMain, /no trusted voiceprint was created/);
+});
+
 test("conversation history can be filtered by a voice profile", () => {
   assert.match(html, /id="conversationSpeakerFilter"/);
-  assert.match(javascript, /invoke\("list_session_ids_for_speaker"/);
-  assert.match(rustMain, /fn list_session_ids_for_speaker/);
+  assert.match(javascript, /groupVoiceFilters\(state\.speakers\)/);
+  assert.match(javascript, /invoke\("list_session_ids_for_speakers"/);
+  assert.match(rustMain, /fn list_session_ids_for_speakers/);
 });
 
 test("interventions put time and a wide speaker selector above the text", () => {
@@ -305,6 +349,26 @@ test("speaker matching requires trusted names and unique meeting claims", () => 
   assert.match(rustMain, /if is_new \{\s*db\.insert_embedding/);
 });
 
+test("voice sampling uses clean central windows and quarantines the previous pipeline", () => {
+  assert.match(rustMain, /SAMPLE_EDGE_TRIM_MS/);
+  assert.match(rustMain, /fn clean_sample_windows/);
+  assert.match(rustMain, /overlaps_other_speaker/);
+  assert.match(rustMain, /dominant_consistent_indices/);
+  assert.match(rustMain, /SAME_VOICE_SPLIT_THRESHOLD/);
+  assert.match(rustMain, /voiceprint:labels:coalesced/);
+  assert.match(
+    fs.readFileSync(new URL("../src-tauri/src/embedding.rs", import.meta.url), "utf8"),
+    /wespeaker-ecapa512-lm-v3-clean-window/,
+  );
+});
+
+test("compact modal fields remain inside their horizontal inset", () => {
+  assert.match(
+    stylesheet,
+    /\.compact-modal form > input\[type="text"\][\s\S]*?width:\s*calc\(100% - 48px\)/,
+  );
+});
+
 test("the Soniox key stays in a local user-only file", () => {
   assert.match(rustCredentials, /SONIOX_KEY_FILENAME.*soniox-api-key/);
   assert.match(rustCredentials, /from_mode\(0o600\)/);
@@ -322,6 +386,10 @@ test("OpenAI recaps are explicit native Responses API calls with strict stateles
   assert.match(rustOpenAI, /"strict": true/);
   assert.match(javascript, /async function requestRecap\(\)/);
   assert.match(javascript, /invoke\("generate_recap"/);
+  assert.match(rustOpenAI, /translation_chunks\(request\.segments\)/);
+  assert.match(rustOpenAI, /TRANSLATION_CHUNK_MAX_CHARACTERS/);
+  assert.match(html, /id="recapStatusBanner"/);
+  assert.match(javascript, /recapJobs: new Map\(\)/);
   const initializeBlock = javascript.match(/async function initialize\(\) \{[\s\S]*?\n\}/);
   assert(initializeBlock);
   assert.doesNotMatch(initializeBlock[0], /generate_recap/);
@@ -374,8 +442,30 @@ test("recap UI exposes participant review, agenda, result tabs, translations, an
   assert.match(javascript, /invoke\("choose_agenda_file"/);
   assert.match(javascript, /const persistedState = await invoke\("get_recap_state"/);
   assert.match(javascript, /Recap interface ready with/);
-  assert.match(javascript, /if \(!failed && elements\.recapProgressDialog\.open\)/);
-  assert.match(html, /id="recapProgressClose"[^>]*hidden/);
+  assert.match(javascript, /state\.recapJobs\.set\(sessionId/);
+  assert.match(html, /id="recapStatusDismiss"[^>]*hidden/);
+  assert.doesNotMatch(html, /id="recapProgressDialog"/);
+});
+
+test("recap and final transcription status are scoped without taking over unrelated work", () => {
+  assert.match(javascript, /sessionRecapJob\?\.status === "running"/);
+  assert.match(javascript, /recapIsRunning\(session\.id\)/);
+  assert.match(javascript, /await Promise\.all\(\[loadSpeakers\(\), loadSessions\(\)\]\)/);
+  assert.match(javascript, /selectedBeforeRefresh === sessionId \|\| !selectedBeforeRefresh/);
+  assert.match(rustState, /recap_in_flight: Arc<Mutex<HashSet<String>>>/);
+  assert.match(rustMain, /ensure_sessions_not_recapping/);
+  const runRecapBlock = javascript.slice(
+    javascript.indexOf("async function runRecap"),
+    javascript.indexOf("async function loadSettingsData"),
+  );
+  assert.doesNotMatch(runRecapBlock, /showModal\(/);
+});
+
+test("recording uses the sidebar stop control and live captions fill the remaining viewport", () => {
+  assert.doesNotMatch(html, /id="stopButton"|Stop &amp; process|Stop and process/);
+  assert.match(javascript, /recordButtonLabel\.textContent = recording \? "Stop recording"/);
+  assert.match(stylesheet, /body\.recording-active \.content-grid[\s\S]*?flex:\s*1 1 0/);
+  assert.match(stylesheet, /body\.recording-active \.live-transcript[\s\S]*?max-height:\s*none/);
 });
 
 test("summaries and actions keep evidence internal instead of displaying links", () => {

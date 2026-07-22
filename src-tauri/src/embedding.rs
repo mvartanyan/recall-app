@@ -1,6 +1,6 @@
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 
-pub const EMBEDDING_VERSION: &str = "wespeaker-ecapa512-lm-v2";
+pub const EMBEDDING_VERSION: &str = "wespeaker-ecapa512-lm-v3-clean-window";
 const MODEL_SAMPLE_RATE: u32 = 16_000;
 
 pub struct Embedder {
@@ -74,6 +74,7 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn resampler_changes_length_and_preserves_endpoints() {
@@ -86,5 +87,24 @@ mod tests {
     #[test]
     fn cosine_rejects_mismatched_vectors() {
         assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+    }
+
+    #[test]
+    fn packaged_model_embeds_a_four_second_clean_window() {
+        let model =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../models/spkrec-ecapa-voxceleb.onnx");
+        assert!(model.is_file(), "packaged speaker model is missing");
+        let embedder = Embedder::new(model.to_string_lossy().as_ref()).unwrap();
+        let pcm = (0..(MODEL_SAMPLE_RATE * 4))
+            .map(|index| {
+                let phase = index as f32 * 220.0 * std::f32::consts::TAU / MODEL_SAMPLE_RATE as f32;
+                phase.sin() * 0.1
+            })
+            .collect::<Vec<_>>();
+
+        let embedding = embedder.embed(&pcm, MODEL_SAMPLE_RATE).unwrap();
+
+        assert_eq!(embedding.len(), 192);
+        assert!(embedding.iter().all(|value| value.is_finite()));
     }
 }

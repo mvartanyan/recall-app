@@ -100,6 +100,21 @@ pub struct Session {
     pub title: String,
     pub duration_ms: i64,
     pub transcript: String,
+    pub processing_status: Option<String>,
+    pub processing_error: Option<String>,
+    pub processing_run_id: Option<String>,
+    pub recoverable_audio: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessingJob {
+    pub session_id: String,
+    pub run_id: String,
+    pub audio_path: String,
+    pub status: String,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,11 +241,16 @@ impl Db {
         let path = path.as_ref();
         Self::backup_before_migration(path)?;
         let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        if path != Path::new(":memory:") {
+            Self::restrict_file_permissions(path)?;
+            Self::restrict_existing_backup_permissions(path)?;
+        }
         let db = Db {
             conn: std::sync::Mutex::new(conn),
             crypto,
         };
         db.init_schema()?;
+        db.mark_interrupted_processing_jobs()?;
         db.persist_salt_if_missing()?;
         Ok(db)
     }
@@ -252,8 +272,27 @@ impl Db {
                         backup.display()
                     )
                 })?;
+                Self::restrict_file_permissions(&backup)?;
                 eprintln!(
                     "[database] backed up the pre-recap database to {}",
+                    backup.display()
+                );
+            }
+        }
+        let processing_migration_needed = Self::table_exists(&conn, "sessions")?
+            && !Self::table_exists(&conn, "processing_jobs")?;
+        if processing_migration_needed {
+            let backup = Self::processing_migration_backup_path(path);
+            if !backup.exists() {
+                std::fs::copy(path, &backup).map_err(|error| {
+                    format!(
+                        "Could not back up the existing Recall database to {} before adding recoverable processing jobs: {error}",
+                        backup.display()
+                    )
+                })?;
+                Self::restrict_file_permissions(&backup)?;
+                eprintln!(
+                    "[database] backed up the pre-processing-job database to {}",
                     backup.display()
                 );
             }
@@ -290,10 +329,46 @@ impl Db {
                 backup.display()
             )
         })?;
+        Self::restrict_file_permissions(&backup)?;
         eprintln!(
             "[database] backed up the pre-migration database to {}",
             backup.display()
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn restrict_file_permissions(path: &Path) -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
+            format!(
+                "Could not restrict database permissions for {}: {error}",
+                path.display()
+            )
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn restrict_file_permissions(_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn restrict_existing_backup_permissions(path: &Path) -> Result<(), String> {
+        if path.file_name().and_then(|value| value.to_str()) != Some("recall.db") {
+            return Ok(());
+        }
+        let Some(directory) = path.parent() else {
+            return Ok(());
+        };
+        for entry in std::fs::read_dir(directory).map_err(|error| error.to_string())? {
+            let candidate = entry.map_err(|error| error.to_string())?.path();
+            let Some(filename) = candidate.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if filename.starts_with("recall.pre-") && filename.ends_with(".db") {
+                Self::restrict_file_permissions(&candidate)?;
+            }
+        }
         Ok(())
     }
 
@@ -319,6 +394,14 @@ impl Db {
             .and_then(|value| value.to_str())
             .unwrap_or("recall");
         path.with_file_name(format!("{stem}.pre-recap-v1.db"))
+    }
+
+    fn processing_migration_backup_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        path.with_file_name(format!("{stem}.pre-processing-v1.db"))
     }
 
     fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
@@ -433,6 +516,15 @@ impl Db {
                     payload_ct TEXT NOT NULL,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS processing_jobs (
+                    session_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    audio_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                  );",
             )
             .map_err(|e| e.to_string())?;
@@ -486,6 +578,121 @@ impl Db {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        Ok(())
+    }
+
+    fn clear_processing_artifacts_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+    ) -> Result<usize, String> {
+        let affected_speakers = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT s.id, s.label
+                       FROM speakers s
+                      WHERE s.id IN (
+                            SELECT speaker_id FROM segments
+                             WHERE session_id=?1 AND speaker_id IS NOT NULL
+                            UNION
+                            SELECT speaker_id FROM embeddings
+                             WHERE source_session_id=?1 AND speaker_id IS NOT NULL
+                      )",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut speakers = Vec::new();
+            for row in rows {
+                speakers.push(row.map_err(|error| error.to_string())?);
+            }
+            speakers
+        };
+
+        tx.execute(
+            "DELETE FROM segments WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+
+        let mut removed_voices = 0;
+        for (speaker_id, label) in affected_speakers {
+            let provisional = label
+                .as_deref()
+                .map(|value| value.trim().is_empty() || is_provisional_label(value))
+                .unwrap_or(true);
+            if !provisional {
+                continue;
+            }
+            let still_referenced: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM segments WHERE speaker_id=?1)",
+                    params![speaker_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            if still_referenced {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM embeddings WHERE speaker_id=?1",
+                params![speaker_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
+                "DELETE FROM speaker_samples WHERE speaker_id=?1",
+                params![speaker_id],
+            )
+            .map_err(|error| error.to_string())?;
+            removed_voices += tx
+                .execute("DELETE FROM speakers WHERE id=?1", params![speaker_id])
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(removed_voices)
+    }
+
+    fn mark_interrupted_processing_jobs(&self) -> Result<(), String> {
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let interrupted = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT session_id FROM processing_jobs
+                      WHERE status IN ('queued', 'processing')",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            let mut session_ids = Vec::new();
+            for row in rows {
+                session_ids.push(row.map_err(|error| error.to_string())?);
+            }
+            session_ids
+        };
+        if interrupted.is_empty() {
+            return Ok(());
+        }
+        let now: DateTime<Utc> = SystemTime::now().into();
+        for session_id in &interrupted {
+            Self::clear_processing_artifacts_in_transaction(&tx, session_id)?;
+            tx.execute(
+                "UPDATE processing_jobs
+                    SET status='failed',
+                        error='Final transcription was interrupted when Recall closed. The recording is still available and can be retried.',
+                        updated_at=?1
+                  WHERE session_id=?2",
+                params![now.to_rfc3339(), session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        eprintln!(
+            "[database] marked {} interrupted transcription job(s) as recoverable failures",
+            interrupted.len()
+        );
         Ok(())
     }
 
@@ -549,6 +756,7 @@ impl Db {
         Ok(salt_opt)
     }
 
+    #[allow(dead_code)]
     pub fn insert_session(
         &self,
         title: &str,
@@ -567,6 +775,214 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(id)
+    }
+
+    pub fn create_processing_session(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        title: &str,
+        transcript: &str,
+        duration_ms: i64,
+        audio_path: &str,
+    ) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let (nonce, ct) = self.crypto.encrypt(transcript.as_bytes());
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO sessions(id, created_at, title, duration_ms, transcript_nonce, transcript_ct)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_id,
+                now.to_rfc3339(),
+                title,
+                duration_ms,
+                nonce,
+                ct
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO processing_jobs(session_id, run_id, audio_path, status, error, created_at, updated_at)
+             VALUES(?1, ?2, ?3, 'processing', NULL, ?4, ?4)",
+            params![session_id, run_id, audio_path, now.to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn attach_cleanup_recording(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        audio_path: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "INSERT INTO processing_jobs(session_id, run_id, audio_path, status, error, created_at, updated_at)
+                 VALUES(?1, ?2, ?3, 'cleanup_failed', ?4, ?5, ?5)",
+                params![session_id, run_id, audio_path, error, now.to_rfc3339()],
+            )
+            .map_err(|failure| failure.to_string())?;
+        Ok(())
+    }
+
+    pub fn processing_job(&self, session_id: &str) -> Result<Option<ProcessingJob>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT session_id, run_id, audio_path, status, error, created_at, updated_at
+                   FROM processing_jobs WHERE session_id=?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((session_id, run_id, audio_path, status, error, created_at, updated_at)) = row
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ProcessingJob {
+            session_id,
+            run_id,
+            audio_path,
+            status,
+            error,
+            created_at: DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|error| error.to_string())?
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                .map_err(|error| error.to_string())?
+                .with_timezone(&Utc),
+        }))
+    }
+
+    pub fn restart_processing_session(&self, session_id: &str, run_id: &str) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        Self::clear_processing_artifacts_in_transaction(&tx, session_id)?;
+        let changed = tx
+            .execute(
+                "UPDATE processing_jobs
+                    SET run_id=?1, status='processing', error=NULL, updated_at=?2
+                  WHERE session_id=?3 AND status='failed'",
+                params![run_id, now.to_rfc3339(), session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("This conversation is not waiting for a transcription retry".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn fail_processing_session(&self, session_id: &str, error: &str) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|failure| failure.to_string())?;
+        Self::clear_processing_artifacts_in_transaction(&tx, session_id)?;
+        let changed = tx
+            .execute(
+                "UPDATE processing_jobs
+                    SET status='failed', error=?1, updated_at=?2
+                  WHERE session_id=?3",
+                params![error, now.to_rfc3339(), session_id],
+            )
+            .map_err(|failure| failure.to_string())?;
+        if changed == 0 {
+            return Err("Processing job not found".into());
+        }
+        tx.commit().map_err(|failure| failure.to_string())?;
+        Ok(())
+    }
+
+    pub fn finalize_processing_session(
+        &self,
+        session_id: &str,
+        title: &str,
+        transcript: &str,
+        duration_ms: i64,
+    ) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let (nonce, ct) = self.crypto.encrypt(transcript.as_bytes());
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let session_changed = tx
+            .execute(
+                "UPDATE sessions
+                    SET title=?1, duration_ms=?2, transcript_nonce=?3, transcript_ct=?4
+                  WHERE id=?5",
+                params![title, duration_ms, nonce, ct, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if session_changed == 0 {
+            return Err("Conversation not found".into());
+        }
+        let job_changed = tx
+            .execute(
+                "UPDATE processing_jobs
+                    SET status='finalized', error=NULL, updated_at=?1
+                  WHERE session_id=?2",
+                params![now.to_rfc3339(), session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if job_changed == 0 {
+            return Err("Processing job not found".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn mark_processing_cleanup_failed(
+        &self,
+        session_id: &str,
+        error: &str,
+    ) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE processing_jobs
+                    SET status='cleanup_failed', error=?1, updated_at=?2
+                  WHERE session_id=?3",
+                params![error, now.to_rfc3339(), session_id],
+            )
+            .map_err(|failure| failure.to_string())?;
+        if changed == 0 {
+            return Err("Processing job not found".into());
+        }
+        Ok(())
+    }
+
+    pub fn complete_processing_session(&self, session_id: &str) -> Result<(), String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "DELETE FROM processing_jobs WHERE session_id=?1",
+                params![session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<usize, String> {
@@ -604,6 +1020,11 @@ impl Db {
         .map_err(|error| error.to_string())?;
         tx.execute(
             "DELETE FROM session_agendas WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM processing_jobs WHERE session_id=?1",
             params![session_id],
         )
         .map_err(|error| error.to_string())?;
@@ -686,7 +1107,14 @@ impl Db {
     pub fn list_sessions(&self) -> Result<Vec<Session>, String> {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let mut stmt = conn
-            .prepare("SELECT id, created_at, COALESCE(title, ''), COALESCE(duration_ms, 0), transcript_nonce, transcript_ct FROM sessions ORDER BY created_at DESC")
+            .prepare(
+                "SELECT s.id, s.created_at, COALESCE(s.title, ''),
+                        COALESCE(s.duration_ms, 0), s.transcript_nonce, s.transcript_ct,
+                        p.status, p.error, p.run_id, p.audio_path
+                   FROM sessions s
+                   LEFT JOIN processing_jobs p ON p.session_id = s.id
+                  ORDER BY s.created_at DESC",
+            )
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |row| {
@@ -696,24 +1124,58 @@ impl Db {
                 let duration_ms: i64 = row.get(3)?;
                 let nonce: String = row.get(4)?;
                 let ct: String = row.get(5)?;
-                Ok((id, created_at, title, duration_ms, nonce, ct))
+                let processing_status: Option<String> = row.get(6)?;
+                let processing_error: Option<String> = row.get(7)?;
+                let processing_run_id: Option<String> = row.get(8)?;
+                let audio_path: Option<String> = row.get(9)?;
+                Ok((
+                    id,
+                    created_at,
+                    title,
+                    duration_ms,
+                    nonce,
+                    ct,
+                    processing_status,
+                    processing_error,
+                    processing_run_id,
+                    audio_path,
+                ))
             })
             .map_err(|e| e.to_string())?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            let (id, created_at, title, duration_ms, nonce, ct) = row.map_err(|e| e.to_string())?;
+            let (
+                id,
+                created_at,
+                title,
+                duration_ms,
+                nonce,
+                ct,
+                processing_status,
+                processing_error,
+                processing_run_id,
+                audio_path,
+            ) = row.map_err(|e| e.to_string())?;
             let ts = DateTime::parse_from_rfc3339(&created_at)
                 .map_err(|e| e.to_string())?
                 .with_timezone(&Utc);
             let transcript_bytes = self.crypto.decrypt(&nonce, &ct)?;
             let transcript = String::from_utf8(transcript_bytes).unwrap_or_default();
+            let recoverable_audio = audio_path
+                .as_deref()
+                .map(|path| Path::new(path).is_file())
+                .unwrap_or(false);
             sessions.push(Session {
                 id,
                 created_at: ts,
                 title,
                 duration_ms,
                 transcript,
+                processing_status,
+                processing_error,
+                processing_run_id,
+                recoverable_audio,
             });
         }
         Ok(sessions)
@@ -1078,6 +1540,66 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(format!("VOICE{}", maximum.unwrap_or(0) + 1))
+    }
+
+    pub fn create_speaker_for_unattributed_segments(
+        &self,
+        session_id: &str,
+    ) -> Result<(String, String, usize), String> {
+        let id = Uuid::new_v4().to_string();
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let session_exists: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !session_exists {
+            return Err("Conversation not found".into());
+        }
+        let processing: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM processing_jobs
+                     WHERE session_id=?1 AND status IN ('queued', 'processing')
+                 )",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if processing {
+            return Err("Wait for final transcription before grouping unknown voices".into());
+        }
+        let maximum: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(CAST(SUBSTR(label, 6) AS INTEGER))
+                   FROM speakers WHERE label GLOB 'VOICE[0-9]*'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let label = format!("VOICE{}", maximum.unwrap_or(0) + 1);
+        tx.execute(
+            "INSERT INTO speakers(id, label, created_at) VALUES(?1, ?2, ?3)",
+            params![id, label, now.to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE segments
+                    SET speaker_id=?1, speaker_label=?2
+                  WHERE session_id=?3 AND speaker_id IS NULL",
+                params![id, label, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("This conversation has no unknown interventions".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((id, label, changed))
     }
 
     pub fn list_speakers(&self) -> Result<Vec<Speaker>, String> {
@@ -1544,6 +2066,42 @@ mod tests {
     }
 
     #[test]
+    fn unknown_interventions_can_be_grouped_into_one_reviewable_voice() {
+        let db = memory_db();
+        let session = db.insert_session("Test", "", 2_000).unwrap();
+        db.insert_speaker(Some("VOICE9")).unwrap();
+        db.insert_segment(&session, 0, 1_000, None, Some("Unknown speaker"), "Hello")
+            .unwrap();
+        db.insert_segment(
+            &session,
+            1_000,
+            2_000,
+            None,
+            Some("Unknown speaker"),
+            "Again",
+        )
+        .unwrap();
+
+        let (speaker_id, label, changed) = db
+            .create_speaker_for_unattributed_segments(&session)
+            .unwrap();
+
+        assert_eq!(label, "VOICE10");
+        assert_eq!(changed, 2);
+        let segments = db.list_segments(&session).unwrap();
+        assert!(segments
+            .iter()
+            .all(|segment| segment.speaker_id.as_deref() == Some(speaker_id.as_str())));
+        assert!(segments
+            .iter()
+            .all(|segment| segment.speaker_label.as_deref() == Some("VOICE10")));
+        assert!(db
+            .create_speaker_for_unattributed_segments(&session)
+            .is_err());
+        assert_eq!(db.list_speakers().unwrap().len(), 2);
+    }
+
+    #[test]
     fn speaker_stats_report_when_a_voice_was_last_heard() {
         let db = memory_db();
         let session = db.insert_session("Test", "", 1_000).unwrap();
@@ -1555,6 +2113,167 @@ mod tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].conversation_count, 1);
         assert!(stats[0].last_seen_at.is_some());
+    }
+
+    #[test]
+    fn failed_processing_keeps_the_draft_and_removes_partial_voice_artifacts() {
+        let db = memory_db();
+        let audio_path =
+            std::env::temp_dir().join(format!("recall-processing-audio-{}.wav", Uuid::new_v4()));
+        std::fs::write(&audio_path, b"retained audio").unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        db.create_processing_session(
+            &session_id,
+            "run-1",
+            "Draft meeting",
+            "Speaker 1: live caption draft",
+            42_000,
+            &audio_path.to_string_lossy(),
+        )
+        .unwrap();
+        let speaker = db.insert_speaker(Some("VOICE1")).unwrap();
+        db.insert_embedding(
+            &speaker,
+            &session_id,
+            &[1.0, 0.0],
+            crate::embedding::EMBEDDING_VERSION,
+        )
+        .unwrap();
+        db.insert_sample(&speaker, "dGVzdA==", 16_000).unwrap();
+        db.insert_segment(
+            &session_id,
+            0,
+            1_000,
+            Some(&speaker),
+            Some("VOICE1"),
+            "partial final segment",
+        )
+        .unwrap();
+
+        db.fail_processing_session(&session_id, "upload timed out")
+            .unwrap();
+
+        let session = db.list_sessions().unwrap().remove(0);
+        assert_eq!(session.transcript, "Speaker 1: live caption draft");
+        assert_eq!(session.processing_status.as_deref(), Some("failed"));
+        assert_eq!(
+            session.processing_error.as_deref(),
+            Some("upload timed out")
+        );
+        assert_eq!(session.processing_run_id.as_deref(), Some("run-1"));
+        assert!(session.recoverable_audio);
+        assert!(db.list_segments(&session_id).unwrap().is_empty());
+        assert!(db.list_speakers().unwrap().is_empty());
+        assert!(db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap()
+            .is_empty());
+
+        db.restart_processing_session(&session_id, "run-2").unwrap();
+        let restarted = db.list_sessions().unwrap().remove(0);
+        assert_eq!(restarted.processing_status.as_deref(), Some("processing"));
+        assert_eq!(restarted.processing_run_id.as_deref(), Some("run-2"));
+        assert!(restarted.processing_error.is_none());
+
+        db.finalize_processing_session(
+            &session_id,
+            "Final meeting",
+            "Alice: final transcript",
+            42_000,
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_sessions().unwrap()[0].processing_status.as_deref(),
+            Some("finalized")
+        );
+        db.complete_processing_session(&session_id).unwrap();
+        let complete = db.list_sessions().unwrap().remove(0);
+        assert_eq!(complete.title, "Final meeting");
+        assert_eq!(complete.transcript, "Alice: final transcript");
+        assert!(complete.processing_status.is_none());
+        std::fs::remove_file(audio_path).unwrap();
+    }
+
+    #[test]
+    fn reopening_marks_an_interrupted_processing_job_as_retryable() {
+        let path = std::env::temp_dir().join(format!(
+            "recall-processing-restart-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let audio_path = std::env::temp_dir().join(format!(
+            "recall-processing-restart-audio-{}.wav",
+            Uuid::new_v4()
+        ));
+        std::fs::write(&audio_path, b"retained audio").unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        {
+            let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+            db.create_processing_session(
+                &session_id,
+                "run-before-quit",
+                "Draft",
+                "Live-caption draft",
+                12_000,
+                &audio_path.to_string_lossy(),
+            )
+            .unwrap();
+        }
+
+        let reopened = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let session = reopened.list_sessions().unwrap().remove(0);
+        assert_eq!(session.processing_status.as_deref(), Some("failed"));
+        assert!(session
+            .processing_error
+            .as_deref()
+            .unwrap()
+            .contains("interrupted"));
+        assert_eq!(session.transcript, "Live-caption draft");
+        assert!(session.recoverable_audio);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(audio_path).unwrap();
+    }
+
+    #[test]
+    fn processing_job_migration_backs_up_and_preserves_existing_conversations() {
+        let path = std::env::temp_dir().join(format!(
+            "recall-processing-migration-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let backup = Db::processing_migration_backup_path(&path);
+        {
+            let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+            db.insert_session("Existing meeting", "Existing transcript", 9_000)
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("DROP TABLE processing_jobs", []).unwrap();
+        }
+
+        let migrated = Db::open(&path, Crypto::new(None, None)).unwrap();
+
+        assert!(backup.is_file());
+        let sessions = migrated.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Existing meeting");
+        assert_eq!(sessions[0].transcript, "Existing transcript");
+        assert!(sessions[0].processing_status.is_none());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(migrated);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(backup).unwrap();
     }
 
     #[test]
@@ -1896,6 +2615,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("recall-db-test-{}.sqlite", Uuid::new_v4()));
         let backup = Db::migration_backup_path(&path);
         let recap_backup = Db::recap_migration_backup_path(&path);
+        let processing_backup = Db::processing_migration_backup_path(&path);
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
@@ -1962,5 +2682,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(backup).unwrap();
         std::fs::remove_file(recap_backup).unwrap();
+        std::fs::remove_file(processing_backup).unwrap();
     }
 }

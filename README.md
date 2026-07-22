@@ -26,7 +26,9 @@ The active app is standalone:
   be reused without recurring macOS Keychain password prompts.
 - The desktop app runs without FastAPI, Uvicorn, Azure, Blob Storage, or a localhost service.
 - Conversations, transcript interventions, speaker names, and voiceprints stay in local SQLite.
-- Temporary raw audio is deleted after final transcription and local voiceprint extraction.
+- Raw audio moves into private recovery storage before final transcription. It
+  is deleted after the final conversation commits; failed or interrupted jobs
+  retain it for an explicit retry.
 - OpenAI is optional. Recall sends transcript and agenda content to it when the user chooses **Recap**.
 
 Recall stores its archive locally. During transcription, it sends audio directly to Soniox. When the user chooses **Recap**, it sends the finalized meeting material directly to OpenAI. Recall has no hosted service between the app and these providers. Recall adds no fee; provider charges depend on usage and current pricing.
@@ -49,6 +51,9 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Build 192-dimensional ECAPA voiceprints locally through sherpa-onnx.
 - Match only named people, conservatively and at most once per recording;
   unmatched or ambiguous voices become VOICE1, VOICE2, and so on.
+- Build references only from clean central windows in longer interventions;
+  reject overlapping, silent, short, or acoustically inconsistent candidates,
+  and combine obvious split provider labels only at very high agreement.
 - Preview the temporary excerpt for a new voice, give it a name, or assign it to an existing named person.
 - Show provisional profiles as `Not auto-matched`; **Name person** enables
   recognition, while **Rename person** changes a human-readable name later.
@@ -56,6 +61,8 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Show only voices attributed in the selected conversation in the right pane,
   while keeping every profile manageable in a separate **Voice Library**.
 - Filter historical conversations by a selected named or provisional voice.
+  Duplicate profiles with the same display name appear once, alphabetically,
+  and the filter includes conversations attached to any of those profile IDs.
 - Delete profiles and conversations. Conversation deletion transactionally
   removes orphan unnamed `VOICE<n>` profiles, samples, and voiceprints, while
   preserving named people and provisional voices referenced by another
@@ -67,11 +74,22 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Confirm destructive actions in a visible app-owned overlay, including when
   the Voice Library modal is already open.
 - Record again while one or more completed recordings are still being processed.
+- Navigate and use unrelated features while a final transcript or recap runs.
+  Status stays with the affected conversation; only conflicting changes to
+  that conversation are disabled, and different conversations may be recapped
+  concurrently.
 - Replace the previous transcript with a dedicated live-recording surface while
-  capturing, then with a full animated processing surface until the new final
-  conversation is ready.
+  capturing, then create a durable draft conversation from the live captions
+  before final STT starts. Active and failed jobs remain in the conversation
+  list with persistent status, exact errors, and retry controls.
+- Keep every stopped WAV in a private app-owned recovery directory until the
+  final transcript transaction commits. Interrupted jobs become retryable after
+  restart, and an orphan WAV from a crash between file persistence and database
+  insertion is surfaced as a recovered conversation.
 - Inspect all transcription and attribution stages in the in-app Activity drawer.
-- Keep live captions in the central workspace while recording, recover missed
+- Keep live captions at the full remaining viewport height while recording,
+  use the sidebar **Stop recording** control as the only in-window stop action,
+  recover missed
   native events by polling an in-memory snapshot, and log connection,
   first-text, no-text, and error states in Activity.
 - Follow the latest live caption by default; scrolling upward pauses auto-follow
@@ -87,7 +105,10 @@ Recall stores its archive locally. During transcription, it sends audio directly
   **Recap anyway** override for meetings that cannot be fully attributed.
 - Generate an English meeting title, executive summary, sectioned full summary,
   participant commitments, actions already reported as taken, and
-  point-by-point agenda coverage through one native OpenAI Responses API call.
+  point-by-point agenda coverage through an explicit native OpenAI Responses
+  API recap run. The holistic meeting analysis is separate from bounded
+  per-intervention translation batches, so long meetings do not require one
+  ever-growing structured response.
 - View generated material in the meeting's original/dominant language or in
   English. Every intervention receives one validated translation decision;
   applicable non-English interventions show a complete English rendering while
@@ -230,6 +251,9 @@ can open a downloaded build without a Gatekeeper warning. See
 [PACKAGING.md](PACKAGING.md) for artifact paths, verification, release
 credentials, architecture choices, and the external-release checklist.
 
+The latest explicitly unsigned Apple-silicon preview is
+[Recall v0.1.1](https://github.com/mvartanyan/recall-app/releases/tag/v0.1.1).
+
 Speaker-model smoke test with a mono WAV:
 
 ~~~sh
@@ -263,9 +287,14 @@ Model provenance and both checksums are recorded in models/README.md.
 - OpenAI credential: `openai-api-key` in the same directory, with the same
   local-only `0600` contract; never returned to JavaScript or stored in SQLite
 - Pre-recap migration backup: recall.pre-recap-v1.db
+- Pre-processing-job migration backup: recall.pre-processing-v1.db
+- SQLite archive and migration-backup permissions: user-only `0600`, enforced
+  whenever Recall opens the archive
 - Agenda originals and structured recap payloads: stored with the conversation
   in encrypted-capable SQLite fields
-- Temporary recordings: the macOS temporary directory; deleted after processing or failure
+- Active/failed processing recordings: the app-data `processing/` directory,
+  with directory mode `0700` and WAV mode `0600`; deleted after successful
+  final commit, successful retry, or explicit conversation deletion
 - Soniox uploads/transcriptions: deleted after final transcript retrieval on a best-effort basis
 - New-speaker preview: retained locally only while the profile remains an unnamed VOICE<n>; deleted on naming or assignment to a named profile
 
@@ -273,10 +302,13 @@ Transcript fields and embedding vectors have application-level AES-GCM support i
 
 OpenAI privacy boundary: no meeting content is sent during recording, Soniox
 processing, voice matching, agenda attachment, or ordinary browsing. Choosing
-**Recap** sends the final speaker-attributed transcript and optional agenda in a
-single Responses API request with `store: false`. This request-level setting is
-not itself a Zero Data Retention guarantee; the OpenAI account's applicable
-data controls and policy still govern provider handling.
+**Recap** sends the final speaker-attributed transcript and optional agenda in
+an on-demand Responses API run with `store: false`. The meeting analysis uses
+one request; translations use fixed-size batches and may therefore use several
+additional requests for a long transcript. Nothing is sent automatically. The
+request-level `store: false` setting is not itself a Zero Data Retention
+guarantee; the OpenAI account's applicable data controls and policy still
+govern provider handling.
 
 To repeat first-run testing without deleting data, quit Recall and move the app-data directory aside:
 
@@ -296,34 +328,51 @@ already exists.
 Soniox assigns speaker labels within a recording. Recall handles persistent identity across meetings locally:
 
 1. Final Soniox tokens are grouped into contiguous speaker interventions.
-2. Up to about 12 seconds of audio is gathered for each diarized speaker.
+2. Recall examines the longest interventions first, rejects intervals that
+   overlap another provider speaker, trims turn boundaries, and extracts
+   centered four-second windows.
 3. sherpa-onnx computes a 192-dimensional official WeSpeaker ECAPA-TDNN-512
    embedding with the correct feature-extraction frontend.
-4. Recall compares it only with reference voiceprints produced by this
+4. Candidate windows must contain audible speech and form a consistent
+   acoustic majority. Recall retains at most about 12 seconds from that
+   majority. Mixed or tied candidates are excluded from matching, while the
+   provider speaker remains available as a reviewable VOICE profile without a
+   trusted reference.
+5. Recall compares the result only with reference voiceprints produced by this
    versioned pipeline and belonging to people the user has named.
-5. At least three seconds of usable speech is required; shorter or failed
-   samples remain unattributed and do not create a VOICE profile.
-6. A match requires cosine similarity of at least 0.90 and a margin of at least
-   0.06 over the runner-up named person.
-7. A named person can claim at most one diarized voice in a recording. If two
-   voices compete for that person within 0.05, neither claim is trusted.
-8. Automatic matches do not add their vectors back to the person's references.
+6. At least three seconds of usable speech is required for a trusted
+   voiceprint. Shorter or failed samples produce a manual-review VOICE profile
+   rather than a matchable reference.
+7. A match requires cosine similarity of at least 0.94 and a margin of at least
+   0.08 over the runner-up named person.
+8. A named person can claim at most one diarized voice in a recording. If two
+   voices compete for that person within 0.06, neither claim is trusted.
+9. Separate provider labels are treated as one voice only when every clean
+   label voiceprint agrees with every other at 0.97 or better.
+10. Automatic matches do not add their vectors back to the person's references.
    Only naming or explicitly assigning a provisional profile expands the
    reference library.
 
 These rules favor precision. A duplicate `VOICE<n>` profile is safer than an
 incorrect automatic identity. The user can preview and name a voice or assign
 a duplicate while choosing whether to preserve or replace the prior reference
-pattern.
+pattern. A no-voiceprint profile labels the current transcript but does not
+participate in later automatic recognition until a clean profile is assigned
+to it. Existing generic Unknown turns can be grouped into one provisional
+profile or assigned intervention by intervention.
 
-The current pipeline version is `wespeaker-ecapa512-lm-v2`. Embeddings from the
-replaced v1 model are preserved but ignored. The database now distinguishes
-reference vectors from unconfirmed observations. During the additive migration,
-the oldest vector for each existing profile/model is retained as its reference;
-later accumulated vectors are preserved but quarantined from matching. This
-repairs the earlier self-training contamination without deleting history. A
-current database copy is created as `recall.pre-voice-reference-v1.db` before
-that migration and is never overwritten.
+The current pipeline version is
+`wespeaker-ecapa512-lm-v3-clean-window`. Embeddings from the replaced v1 and v2
+pipelines are preserved but ignored. This intentionally quarantines references
+created under the old sampling and 0.90 matching policy; measured current-data
+cross-person similarity reached 0.904. Existing names and history remain, but a
+clean v3 provisional occurrence must be assigned once to establish a reviewed
+current reference. The database distinguishes reference vectors from
+unconfirmed observations. During the earlier additive migration, the oldest
+vector for each existing profile/model was retained as its reference; later
+accumulated vectors were preserved but quarantined from matching. A current
+database copy was created as `recall.pre-voice-reference-v1.db` before that
+migration and is never overwritten.
 
 ## Known limitations
 
@@ -333,9 +382,12 @@ that migration and is never overwritten.
   conversation cleanup have automated coverage and still need one native visual
   smoke test.
 - Live speaker labels are provisional and may shift; final async diarization is authoritative.
-- The stricter named-only/unique-claim voice policy has unit and migration
-  coverage but still needs a real one-person repeat test and a multi-person
-  false-accept test.
+- The v3 clean-window, named-only, and unique-claim voice policy has model,
+  unit, and migration coverage but still needs a real one-person re-enrolment
+  test and a labelled multi-person false-accept test. Provider diarization has
+  no exposed sensitivity or expected-speaker-count setting. Recall can repair
+  only very high-confidence split labels; it cannot recover a provider
+  intervention that already mixes or mislabels speakers.
 - Native macOS system-audio capture is pending; virtual/aggregate input is the current route.
 - Local database encryption migration is pending.
 - The legacy bundle identifier com.example.recall is retained to avoid silently moving existing user data.

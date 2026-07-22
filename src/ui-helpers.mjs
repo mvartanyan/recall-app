@@ -137,6 +137,43 @@ export function filterSessions(sessions, query, allowedSessionIds = null) {
   });
 }
 
+export function groupVoiceFilters(speakers) {
+  const groups = new Map();
+  for (const speaker of speakers || []) {
+    if (!(Number(speaker.conversation_count) > 0)) continue;
+    const label = String(speaker.label || "Unnamed voice").trim() || "Unnamed voice";
+    const key = label.toLocaleLowerCase();
+    const existing = groups.get(key);
+    if (existing) {
+      existing.speakerIds.push(speaker.id);
+      continue;
+    }
+    groups.set(key, {
+      key,
+      label,
+      speakerIds: [speaker.id],
+    });
+  }
+  return Array.from(groups.values()).sort((left, right) =>
+    left.label.localeCompare(right.label, undefined, {
+      sensitivity: "base",
+      numeric: true,
+    }),
+  );
+}
+
+export function isSessionProcessing(session) {
+  return ["queued", "processing"].includes(String(session?.processing_status || ""));
+}
+
+export function processingRunIds(sessions) {
+  return new Set(
+    (sessions || [])
+      .filter((session) => isSessionProcessing(session) && session.processing_run_id)
+      .map((session) => session.processing_run_id),
+  );
+}
+
 export function contentMode({
   recording = false,
   queueing = false,
@@ -144,7 +181,8 @@ export function contentMode({
   selectedSessionId = null,
 } = {}) {
   if (recording) return "recording";
-  if (queueing || Number(processingCount) > 0) return "processing";
+  if (queueing) return "processing";
   if (selectedSessionId) return "conversation";
+  if (Number(processingCount) > 0) return "processing";
   return "empty";
 }

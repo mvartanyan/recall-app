@@ -79,7 +79,6 @@
           <div class="level-track" aria-label="Microphone level">
             <span id="levelBar"></span>
           </div>
-          <button id="stopButton" class="stop-button" type="button">Stop &amp; process</button>
         </section>
 
         <div class="content-grid">
@@ -119,6 +118,26 @@
             </div>
 
             <div id="transcriptContent" hidden>
+              <div id="recapStatusBanner" class="recap-status-banner" hidden role="status" aria-live="polite">
+                <div id="recapStatusSpinner" class="recap-status-spinner" aria-hidden="true"></div>
+                <div class="recap-status-copy">
+                  <strong id="recapStatusTitle">Creating recap</strong>
+                  <span id="recapStatusDetail">Preparing transcript and agenda…</span>
+                </div>
+                <button id="recapStatusDismiss" class="text-button" type="button" hidden>Dismiss</button>
+              </div>
+
+              <div id="processingRecoveryBanner" class="processing-recovery-banner" hidden role="status" aria-live="polite">
+                <div class="processing-recovery-copy">
+                  <strong id="processingRecoveryTitle">Final transcript is processing</strong>
+                  <span id="processingRecoveryDetail">The recording and live-caption draft are saved locally.</span>
+                </div>
+                <div class="processing-recovery-actions">
+                  <button id="retryProcessingButton" class="primary-button compact-action" type="button" hidden>Retry final transcription</button>
+                  <button id="discardRetainedAudioButton" class="secondary-button compact-action" type="button" hidden>Remove retained audio</button>
+                </div>
+              </div>
+
               <div id="recapStaleBanner" class="recap-stale-banner" hidden>
                 <div>
                   <strong>This recap is out of date.</strong>
@@ -441,17 +460,6 @@
       </div>
     </dialog>
 
-    <dialog id="recapProgressDialog" class="modal compact-modal recap-progress-modal">
-      <div class="recap-progress-body">
-        <div id="recapProgressSpinner" class="spinner" aria-hidden="true"></div>
-        <span class="eyebrow">LLM recap</span>
-        <h2 id="recapProgressTitle">Preparing conversation</h2>
-        <p id="recapProgressDetail">Preparing transcript and agenda…</p>
-        <small>Recall makes one on-demand request. Closing the app will interrupt it.</small>
-        <button id="recapProgressClose" class="primary-button" type="button" data-close-dialog="recapProgressDialog" hidden>Close</button>
-      </div>
-    </dialog>
-
     <dialog id="nameDialog" class="modal compact-modal">
       <form id="nameForm" method="dialog">
         <div class="modal-header">
@@ -464,7 +472,7 @@
         <input id="nameSpeakerId" type="hidden" />
         <label class="field-label" for="speakerName">Display name</label>
         <input id="speakerName" type="text" placeholder="e.g. Michael" required />
-        <p class="field-help">Naming enables automatic recognition for this person. The temporary voice excerpt is then deleted; only the local reference voiceprint remains.</p>
+        <p id="nameDialogHelp" class="field-help">Naming enables automatic recognition for this person. The temporary voice excerpt is then deleted; only the local reference voiceprint remains.</p>
         <div class="modal-footer">
           <button class="text-button" type="button" data-close-dialog="nameDialog">Cancel</button>
           <button id="saveSpeakerNameButton" class="primary-button" type="submit">Save name</button>

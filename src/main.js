@@ -5,10 +5,13 @@ import {
   filterSessions,
   formatDuration,
   formatTimestamp,
+  groupVoiceFilters,
   isNearScrollBottom,
   isProvisionalLabel,
+  isSessionProcessing,
   parseLanguageHints,
   parseNoTranslationLanguages,
+  processingRunIds,
   recapTabAvailability,
   shouldShowOnboarding,
   transcriptFromSegments,
@@ -22,7 +25,6 @@ const elements = {
   recordButton: document.getElementById("recordButton"),
   recordButtonLabel: document.getElementById("recordButtonLabel"),
   emptyRecordButton: document.getElementById("emptyRecordButton"),
-  stopButton: document.getElementById("stopButton"),
   recordingBanner: document.getElementById("recordingBanner"),
   recordingTimer: document.getElementById("recordingTimer"),
   levelBar: document.getElementById("levelBar"),
@@ -46,8 +48,18 @@ const elements = {
   processingTitle: document.getElementById("processingTitle"),
   processingDetail: document.getElementById("processingDetail"),
   transcriptContent: document.getElementById("transcriptContent"),
+  processingRecoveryBanner: document.getElementById("processingRecoveryBanner"),
+  processingRecoveryTitle: document.getElementById("processingRecoveryTitle"),
+  processingRecoveryDetail: document.getElementById("processingRecoveryDetail"),
+  retryProcessingButton: document.getElementById("retryProcessingButton"),
+  discardRetainedAudioButton: document.getElementById("discardRetainedAudioButton"),
   recapStaleBanner: document.getElementById("recapStaleBanner"),
   staleRegenerateButton: document.getElementById("staleRegenerateButton"),
+  recapStatusBanner: document.getElementById("recapStatusBanner"),
+  recapStatusSpinner: document.getElementById("recapStatusSpinner"),
+  recapStatusTitle: document.getElementById("recapStatusTitle"),
+  recapStatusDetail: document.getElementById("recapStatusDetail"),
+  recapStatusDismiss: document.getElementById("recapStatusDismiss"),
   recapTabs: document.getElementById("recapTabs"),
   transcriptTab: document.getElementById("transcriptTab"),
   executiveTab: document.getElementById("executiveTab"),
@@ -110,11 +122,6 @@ const elements = {
   cancelUnresolvedButton: document.getElementById("cancelUnresolvedButton"),
   reviewUnresolvedButton: document.getElementById("reviewUnresolvedButton"),
   recapAnywayButton: document.getElementById("recapAnywayButton"),
-  recapProgressDialog: document.getElementById("recapProgressDialog"),
-  recapProgressTitle: document.getElementById("recapProgressTitle"),
-  recapProgressDetail: document.getElementById("recapProgressDetail"),
-  recapProgressSpinner: document.getElementById("recapProgressSpinner"),
-  recapProgressClose: document.getElementById("recapProgressClose"),
   activityButton: document.getElementById("activityButton"),
   activityBadge: document.getElementById("activityBadge"),
   activityDrawer: document.getElementById("activityDrawer"),
@@ -129,6 +136,7 @@ const elements = {
   nameForm: document.getElementById("nameForm"),
   nameSpeakerId: document.getElementById("nameSpeakerId"),
   nameDialogTitle: document.getElementById("nameDialogTitle"),
+  nameDialogHelp: document.getElementById("nameDialogHelp"),
   speakerName: document.getElementById("speakerName"),
   saveSpeakerNameButton: document.getElementById("saveSpeakerNameButton"),
   assignDialog: document.getElementById("assignDialog"),
@@ -179,7 +187,7 @@ const state = {
   recapState: null,
   activeRecapTab: "transcript",
   generatedLanguage: "original",
-  recapRequestSessionId: null,
+  recapJobs: new Map(),
   translationWarnings: new Set(),
   onboardingAcknowledgedThisLaunch: false,
 };
@@ -334,6 +342,111 @@ function setOpenAIStatus(configured) {
   elements.deleteOpenAIKeyButton.disabled = !configured;
 }
 
+function recapProgressTitle(stage) {
+  const titles = {
+    prepare: "Preparing conversation",
+    llm: "Waiting for the LLM provider",
+    "llm:start": "Starting the recap",
+    "llm:done": "LLM work complete",
+    "analysis:start": "Analysing the meeting",
+    "analysis:done": "Meeting analysis complete",
+    "translations:start": "Preparing translations",
+    "translations:batch:start": "Translating the transcript",
+    "translations:batch:done": "Translation batch complete",
+    "translations:done": "Translations complete",
+    validate: "Checking the recap",
+    save: "Saving locally",
+    complete: "Recap ready",
+    warning: "Finishing the recap",
+    error: "Recap failed",
+  };
+  return titles[stage] || "Creating recap";
+}
+
+function recapJob(sessionId) {
+  return sessionId ? state.recapJobs.get(sessionId) || null : null;
+}
+
+function recapIsRunning(sessionId) {
+  const job = recapJob(sessionId);
+  if (job?.status === "running") return true;
+  return Boolean(
+    sessionId === state.selectedSessionId &&
+      state.recapState &&
+      state.recapState.in_flight,
+  );
+}
+
+function rememberNativeRecapState(sessionId, recapState) {
+  if (!sessionId || !recapState?.in_flight || recapJob(sessionId)) return;
+  state.recapJobs.set(sessionId, {
+    status: "running",
+    stage: "prepare",
+    detail: "This conversation is being processed in the background. You can use the rest of Recall.",
+  });
+}
+
+function renderSelectedRecapStatus() {
+  const sessionId = state.selectedSessionId;
+  const job = recapJob(sessionId);
+  const nativeInFlight = Boolean(state.recapState && state.recapState.in_flight);
+  const visible = Boolean(job || nativeInFlight);
+  elements.recapStatusBanner.hidden = !visible;
+  elements.recapStatusBanner.classList.remove("failed");
+  if (!visible) return;
+
+  const failed = job?.status === "error";
+  const stage = job?.stage || "prepare";
+  elements.recapStatusBanner.classList.toggle("failed", failed);
+  elements.recapStatusSpinner.hidden = failed;
+  elements.recapStatusDismiss.hidden = !failed;
+  elements.recapStatusTitle.textContent = recapProgressTitle(failed ? "error" : stage);
+  elements.recapStatusDetail.textContent =
+    job?.detail ||
+    (nativeInFlight
+      ? "This conversation is being processed in the background. You can use the rest of Recall."
+      : "Working…");
+}
+
+function renderProcessingRecovery(session) {
+  const status = session && session.processing_status;
+  elements.processingRecoveryBanner.hidden = !status;
+  elements.processingRecoveryBanner.classList.remove("failed", "cleanup");
+  elements.retryProcessingButton.hidden = true;
+  elements.discardRetainedAudioButton.hidden = true;
+  if (!status) return;
+
+  if (status === "queued" || status === "processing") {
+    elements.processingRecoveryTitle.textContent = "Final transcript is processing";
+    elements.processingRecoveryDetail.textContent =
+      "The recording and live-caption draft are saved locally. You can record another meeting while this continues.";
+    return;
+  }
+
+  if (status === "failed") {
+    elements.processingRecoveryBanner.classList.add("failed");
+    elements.processingRecoveryTitle.textContent = "Final transcription needs a retry";
+    const error = String(session.processing_error || "Final STT processing did not finish.");
+    elements.processingRecoveryDetail.textContent = session.recoverable_audio
+      ? error + " The recording and live-caption draft are still saved locally."
+      : error + " The live-caption draft is saved, but the retained recording could not be found.";
+    elements.retryProcessingButton.hidden = !session.recoverable_audio;
+    return;
+  }
+
+  if (status === "finalized" || status === "cleanup_failed") {
+    elements.processingRecoveryBanner.classList.add("cleanup");
+    elements.processingRecoveryTitle.textContent = "Final transcript saved";
+    elements.processingRecoveryDetail.textContent = session.recoverable_audio
+      ? String(session.processing_error || "Recall could not remove the retained recording after processing.")
+      : "The final transcript is complete. Finish cleanup to clear the stale recovery record.";
+    elements.discardRetainedAudioButton.textContent = session.recoverable_audio
+      ? "Remove retained audio"
+      : "Finish cleanup";
+    elements.discardRetainedAudioButton.hidden = false;
+  }
+}
+
 function updateContentVisibility() {
   const mode = contentMode({
     recording: state.recording,
@@ -345,6 +458,7 @@ function updateContentVisibility() {
   elements.processingState.hidden = mode !== "processing";
   elements.transcriptContent.hidden = mode !== "conversation";
   elements.emptyState.hidden = mode !== "empty";
+  document.body.classList.toggle("recording-active", mode === "recording");
   if (mode === "conversation") scheduleTranscriptResize();
 
   if (mode === "processing") {
@@ -362,6 +476,7 @@ function updateContentVisibility() {
     elements.deleteSessionButton.hidden = true;
     elements.agendaButton.hidden = true;
     elements.recapButton.hidden = true;
+    renderSelectedRecapStatus();
   } else if (mode === "processing") {
     elements.conversationTitle.disabled = true;
     elements.conversationTitle.value =
@@ -370,25 +485,36 @@ function updateContentVisibility() {
     elements.deleteSessionButton.hidden = true;
     elements.agendaButton.hidden = true;
     elements.recapButton.hidden = true;
+    renderSelectedRecapStatus();
   } else if (mode === "conversation") {
     const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
     if (session) {
-      elements.conversationTitle.disabled = false;
+      const processingStatus = session.processing_status;
+      const finalTranscriptPending = isSessionProcessing(session) || processingStatus === "failed";
+      const recapInFlight = recapIsRunning(session.id);
+      const conversationLocked = isSessionProcessing(session) || recapInFlight;
+      elements.conversationTitle.disabled = conversationLocked;
       elements.conversationTitle.value = sessionTitle(session);
       const parts = [sessionDate(session)];
       if (session.duration_ms > 0) parts.push(formatDuration(session.duration_ms));
       elements.conversationMeta.textContent = parts.filter(Boolean).join(" · ");
-      elements.deleteSessionButton.hidden = false;
-      elements.agendaButton.hidden = false;
-      elements.recapButton.hidden = false;
+      elements.deleteSessionButton.hidden = isSessionProcessing(session);
+      elements.deleteSessionButton.disabled = recapInFlight;
+      elements.agendaButton.hidden = finalTranscriptPending;
+      elements.recapButton.hidden = finalTranscriptPending;
       const hasRecap = Boolean(state.recapState && state.recapState.recap);
       elements.agendaButton.textContent =
         state.recapState && state.recapState.agenda ? "Edit agenda" : "Add agenda";
-      elements.recapButton.textContent = hasRecap ? "Regenerate recap" : "Recap";
-      elements.recapButton.disabled = Boolean(
-        state.recapRequestSessionId === state.selectedSessionId ||
-          (state.recapState && state.recapState.in_flight),
-      );
+      elements.recapButton.textContent = recapInFlight
+        ? "Recapping…"
+        : hasRecap
+          ? "Regenerate recap"
+          : "Recap";
+      elements.recapButton.disabled = recapInFlight;
+      elements.agendaButton.disabled = recapInFlight;
+      elements.staleRegenerateButton.disabled = recapInFlight;
+      renderProcessingRecovery(session);
+      renderSelectedRecapStatus();
     }
   } else {
     elements.conversationTitle.disabled = true;
@@ -397,6 +523,8 @@ function updateContentVisibility() {
     elements.deleteSessionButton.hidden = true;
     elements.agendaButton.hidden = true;
     elements.recapButton.hidden = true;
+    renderProcessingRecovery(null);
+    renderSelectedRecapStatus();
   }
   scheduleConversationTitleResize();
 }
@@ -585,19 +713,29 @@ async function startRecording() {
 async function stopRecording() {
   if (!state.recording) return;
   elements.recordButton.disabled = true;
-  elements.stopButton.disabled = true;
   state.queueingProcessing = true;
   setProcessingDetail("Finalizing the recording…");
   addActivity("Stopping recording");
   try {
     const path = await invoke("stop_recording");
     setRecordingUi(false);
+    elements.recordButton.disabled = false;
     addActivity("Recording stopped; queueing final transcription");
-    const runId = await invoke("transcribe_file_async", { path });
-    trackRun(runId);
+    const queued = await invoke("transcribe_file_async", { path });
+    const runId = queued.run_id;
+    const sessionId = queued.session_id;
     state.queueingProcessing = false;
     addActivity("[" + runId.slice(0, 8) + "] Final transcription queued");
-    setProcessingDetail("Uploading the recording to the STT provider…");
+    setProcessingDetail("Uploading the retained recording to the STT provider…");
+    const shouldOpenDraft = !state.recording;
+    await loadSessions(shouldOpenDraft ? sessionId : undefined);
+    const stored = state.sessions.find((session) => session.id === sessionId);
+    if (stored && ["queued", "processing"].includes(stored.processing_status)) {
+      trackRun(runId);
+    } else {
+      finishRun(runId);
+    }
+    if (sessionId && shouldOpenDraft && !state.recording) await selectSession(sessionId);
   } catch (error) {
     state.queueingProcessing = false;
     const message = errorText(error);
@@ -607,7 +745,6 @@ async function stopRecording() {
     updateContentVisibility();
   } finally {
     elements.recordButton.disabled = false;
-    elements.stopButton.disabled = false;
   }
 }
 
@@ -634,9 +771,32 @@ function finishRun(runId) {
   updateContentVisibility();
 }
 
+function reconcileTrackedRuns(sessions) {
+  const persistedRunIds = processingRunIds(sessions);
+  for (const runId of Array.from(state.activeRuns)) {
+    if (persistedRunIds.has(runId)) continue;
+    state.activeRuns.delete(runId);
+    state.progressCounts.delete(runId);
+  }
+  for (const runId of persistedRunIds) {
+    state.activeRuns.add(runId);
+    if (!state.progressCounts.has(runId)) state.progressCounts.set(runId, 0);
+  }
+  if (state.activeRuns.size > 0) {
+    ensurePolling();
+  } else if (state.pollTimer) {
+    window.clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+}
+
 function stageDescription(stage, detail) {
   const descriptions = {
     queued: "Queued for final transcription",
+    "retry:queued": "Retry queued from the retained recording",
+    "audio:persist:start": "Saving a recovery copy locally",
+    "audio:persisted": "Recording and live-caption draft saved locally",
+    "audio:retained": "Recording retained for retry",
     "transcription:start": "Preparing final transcription",
     "stt:upload:start": "Uploading recording to the STT provider",
     "stt:upload:done": "Upload finished",
@@ -653,6 +813,8 @@ function stageDescription(stage, detail) {
     "voiceprint:new": "New voice profile created",
     "voiceprint:matched": "Known voice identified",
     "voiceprint:skipped": "Voiceprint skipped; transcript left unattributed",
+    "voiceprint:sample:selected": "Clean voice excerpts selected",
+    "voiceprint:labels:coalesced": "Split provider voice labels combined",
     "voiceprint:sample:stored": "Temporary voice preview saved",
     "voiceprints:done": "Speaker attribution finished",
     "transcription:done": "Conversation saved locally",
@@ -684,14 +846,40 @@ async function handleProgressEvent(event) {
 
   if (event.stage === "complete") {
     const sessionId = event.detail;
-    setProcessingDetail("Opening the final transcript…");
-    await Promise.all([loadSpeakers(), loadSessions(sessionId)]);
-    if (sessionId) await selectSession(sessionId);
+    const selectedBeforeRefresh = state.selectedSessionId;
+    setProcessingDetail("Final transcript saved locally");
+    await Promise.all([loadSpeakers(), loadSessions()]);
+    if (
+      sessionId &&
+      !state.recording &&
+      state.selectedSessionId === selectedBeforeRefresh &&
+      (selectedBeforeRefresh === sessionId || !selectedBeforeRefresh)
+    ) {
+      await selectSession(sessionId);
+    }
     finishRun(runId);
     showToast("Conversation transcribed and attributed.");
   } else if (event.stage === "error") {
     finishRun(runId);
-    showToast(detail, "error");
+    const selectedBeforeRefresh = state.selectedSessionId;
+    await loadSessions();
+    const failedSession = state.sessions.find(
+      (session) => session.processing_run_id === runId && session.processing_status === "failed",
+    );
+    if (
+      failedSession &&
+      !state.recording &&
+      state.selectedSessionId === selectedBeforeRefresh &&
+      (!selectedBeforeRefresh || selectedBeforeRefresh === failedSession.id)
+    ) {
+      await selectSession(failedSession.id);
+    }
+    showToast(
+      failedSession && failedSession.recoverable_audio
+        ? "Final transcription failed. The recording is safe and ready to retry."
+        : detail,
+      "error",
+    );
   } else if (event.stage === "voiceprint:new") {
     showToast("A new voice needs a name.");
   }
@@ -732,6 +920,7 @@ function sessionDate(session) {
 async function loadSessions(preferredId) {
   try {
     state.sessions = await invoke("list_sessions");
+    reconcileTrackedRuns(state.sessions);
     renderSessions();
     if (preferredId && state.sessions.some((session) => session.id === preferredId)) {
       state.selectedSessionId = preferredId;
@@ -769,11 +958,23 @@ function renderSessions() {
     button.type = "button";
     button.className =
       "session-item" + (session.id === state.selectedSessionId ? " selected" : "");
+    if (isSessionProcessing(session)) {
+      button.classList.add("processing");
+    } else if (session.processing_status === "failed") {
+      button.classList.add("failed");
+    }
+    const sessionRecapJob = recapJob(session.id);
+    if (sessionRecapJob?.status === "running") button.classList.add("recapping");
+    if (sessionRecapJob?.status === "error") button.classList.add("recap-failed");
     const title = document.createElement("strong");
     title.textContent = sessionTitle(session);
     const meta = document.createElement("span");
     const parts = [sessionDate(session)];
     if (session.duration_ms > 0) parts.push(formatDuration(session.duration_ms));
+    if (session.processing_status === "failed") parts.push("Final transcript needs retry");
+    if (session.processing_status === "cleanup_failed") parts.push("Audio cleanup needed");
+    if (sessionRecapJob?.status === "running") parts.push("Recap in progress");
+    if (sessionRecapJob?.status === "error") parts.push("Recap failed");
     meta.textContent = parts.filter(Boolean).join(" · ");
     button.append(title, meta);
     button.addEventListener("click", () => selectSession(session.id));
@@ -806,6 +1007,7 @@ async function selectSession(sessionId) {
     state.selectedSegments = segmentsResult.value;
     if (recapResult.status === "fulfilled") {
       state.recapState = recapResult.value;
+      rememberNativeRecapState(sessionId, state.recapState);
     } else {
       addActivity("Could not load recap data: " + errorText(recapResult.reason), "error");
     }
@@ -830,6 +1032,7 @@ async function refreshRecapState({ rerenderTranscript = true } = {}) {
   const recapState = await invoke("get_recap_state", { sessionId });
   if (sessionId !== state.selectedSessionId) return;
   state.recapState = recapState;
+  rememberNativeRecapState(sessionId, recapState);
   renderRecapShell();
   if (rerenderTranscript) {
     const session = state.sessions.find((candidate) => candidate.id === sessionId);
@@ -1011,6 +1214,12 @@ function renderActionGroup(title, items) {
 
 function renderTranscript(session) {
   elements.segmentsList.replaceChildren();
+  const conversationLocked = Boolean(session && recapIsRunning(session.id));
+  if (conversationLocked) {
+    elements.saveState.textContent = "Edits paused while recap runs";
+  } else {
+    elements.saveState.textContent = "Saved locally";
+  }
   if (!state.selectedSegments.length) {
     elements.legacyTranscript.hidden = false;
     const legacyText = (session && session.transcript) || "This conversation has no transcript.";
@@ -1030,6 +1239,7 @@ function renderTranscript(session) {
     speakerColumn.className = "segment-speaker";
     const select = buildSpeakerSelect(segment.speaker_id, segment.speaker_label);
     select.setAttribute("aria-label", "Speaker for this intervention");
+    select.disabled = conversationLocked;
     select.addEventListener("change", async () => {
       await assignSegmentSpeaker(segment, select.value || null);
     });
@@ -1043,6 +1253,7 @@ function renderTranscript(session) {
     text.className = "segment-text";
     text.value = segment.text || "";
     text.setAttribute("aria-label", "Transcript intervention");
+    text.disabled = conversationLocked;
     text.addEventListener("input", () => {
       autoResize(text);
       elements.saveState.textContent = "Unsaved changes";
@@ -1099,6 +1310,7 @@ function renderTranscript(session) {
       edit.type = "button";
       edit.className = "text-button segment-edit-button";
       edit.textContent = "Edit transcript";
+      edit.disabled = conversationLocked;
       text.hidden = true;
       edit.addEventListener("click", () => {
         rich.hidden = true;
@@ -1172,6 +1384,7 @@ function scheduleTranscriptResize() {
 }
 
 async function saveSegmentText(segment, text) {
+  if (recapIsRunning(segment.session_id)) return;
   elements.saveState.textContent = "Saving…";
   try {
     await invoke("update_segment_text", {
@@ -1194,6 +1407,7 @@ async function saveSegmentText(segment, text) {
 }
 
 async function assignSegmentSpeaker(segment, speakerId) {
+  if (recapIsRunning(segment.session_id)) return;
   elements.saveState.textContent = "Saving…";
   try {
     await invoke("assign_segment_speaker", {
@@ -1229,6 +1443,7 @@ function syncSelectedSessionTranscript() {
 
 async function saveConversationTitle() {
   if (!state.selectedSessionId) return;
+  if (recapIsRunning(state.selectedSessionId)) return;
   const title = elements.conversationTitle.value.trim();
   if (!title) {
     const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
@@ -1250,6 +1465,63 @@ async function saveConversationTitle() {
   }
 }
 
+async function retrySelectedProcessing() {
+  if (!state.selectedSessionId) return;
+  const sessionId = state.selectedSessionId;
+  elements.retryProcessingButton.disabled = true;
+  addActivity("Retrying final transcription from the retained recording");
+  try {
+    const queued = await invoke("retry_processing", { sessionId });
+    await loadSessions(sessionId);
+    const stored = state.sessions.find((session) => session.id === sessionId);
+    if (stored && ["queued", "processing"].includes(stored.processing_status)) {
+      trackRun(queued.run_id);
+    } else {
+      finishRun(queued.run_id);
+    }
+    await selectSession(sessionId);
+    addActivity(
+      "[" + queued.run_id.slice(0, 8) + "] Final transcription retry queued",
+      "success",
+    );
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not retry final transcription: " + message, "error");
+    showToast(message, "error");
+    await loadSessions(sessionId);
+  } finally {
+    elements.retryProcessingButton.disabled = false;
+  }
+}
+
+async function discardSelectedRetainedAudio() {
+  if (!state.selectedSessionId) return;
+  const sessionId = state.selectedSessionId;
+  const session = state.sessions.find((candidate) => candidate.id === sessionId);
+  if (session && session.recoverable_audio) {
+    const confirmed = await requestConfirmation({
+      title: "Remove the retained recording?",
+      message:
+        "The final transcript will stay in Recall, but the recovery WAV cannot be restored after deletion.",
+      acceptLabel: "Remove recording",
+    });
+    if (!confirmed) return;
+  }
+  elements.discardRetainedAudioButton.disabled = true;
+  try {
+    await invoke("discard_retained_audio", { sessionId });
+    addActivity("Retained recording removed", "success");
+    await loadSessions(sessionId);
+    await selectSession(sessionId);
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not remove the retained recording: " + message, "error");
+    showToast(message, "error");
+  } finally {
+    elements.discardRetainedAudioButton.disabled = false;
+  }
+}
+
 async function deleteSelectedSession() {
   if (!state.selectedSessionId) return;
   const sessionId = state.selectedSessionId;
@@ -1259,7 +1531,7 @@ async function deleteSelectedSession() {
     message:
       "“" +
       sessionTitle(session) +
-      "” and its transcript will be deleted. Named people are kept. Any unnamed VOICE profiles used only by this conversation will also be removed.",
+      "” and its transcript will be deleted. Any retained recovery recording will also be removed. Named people are kept. Any unnamed VOICE profiles used only by this conversation will also be removed.",
     acceptLabel: "Delete conversation",
   });
   if (!confirmed) return;
@@ -1312,40 +1584,44 @@ async function loadSpeakers() {
 }
 
 function renderConversationSpeakerFilter() {
-  const selectedId = elements.conversationSpeakerFilter.value;
+  const selectedKey = elements.conversationSpeakerFilter.value;
   elements.conversationSpeakerFilter.replaceChildren();
   const all = document.createElement("option");
   all.value = "";
   all.textContent = "All voices";
   elements.conversationSpeakerFilter.append(all);
-  const filterableSpeakers = state.speakers.filter(
-    (candidate) => candidate.conversation_count > 0,
-  );
-  for (const speaker of filterableSpeakers) {
+  const filterGroups = groupVoiceFilters(state.speakers);
+  for (const group of filterGroups) {
     const option = document.createElement("option");
-    option.value = speaker.id;
-    option.textContent = speaker.label || "Unnamed voice";
+    option.value = group.key;
+    option.textContent = group.label;
+    option.dataset.speakerIds = JSON.stringify(group.speakerIds);
     elements.conversationSpeakerFilter.append(option);
   }
-  const selectedStillExists = filterableSpeakers.some((speaker) => speaker.id === selectedId);
-  if (selectedId && selectedStillExists) {
-    elements.conversationSpeakerFilter.value = selectedId;
-  } else if (selectedId) {
+  const selectedStillExists = filterGroups.some((group) => group.key === selectedKey);
+  if (selectedKey && selectedStillExists) {
+    elements.conversationSpeakerFilter.value = selectedKey;
+  } else if (selectedKey) {
     state.voiceFilterSequence += 1;
     state.voiceFilteredSessionIds = null;
   }
 }
 
 async function applyConversationVoiceFilter() {
-  const speakerId = elements.conversationSpeakerFilter.value;
+  const selectedOption = elements.conversationSpeakerFilter.selectedOptions[0];
+  const filterKey = elements.conversationSpeakerFilter.value;
   const sequence = ++state.voiceFilterSequence;
-  if (!speakerId) {
+  if (!filterKey) {
     state.voiceFilteredSessionIds = null;
     renderSessions();
     return;
   }
   try {
-    const sessionIds = await invoke("list_session_ids_for_speaker", { speakerId });
+    const speakerIds = JSON.parse(selectedOption?.dataset.speakerIds || "[]");
+    if (!Array.isArray(speakerIds) || !speakerIds.length) {
+      throw new Error("The selected voice filter has no profiles.");
+    }
+    const sessionIds = await invoke("list_session_ids_for_speakers", { speakerIds });
     if (sequence !== state.voiceFilterSequence) return;
     state.voiceFilteredSessionIds = new Set(sessionIds);
     renderSessions();
@@ -1385,10 +1661,13 @@ function renderSpeakers() {
     elements.speakersList.append(empty);
     return;
   }
-  if (state.queueingProcessing || state.activeRuns.size > 0) {
+  const selectedSession = state.sessions.find(
+    (session) => session.id === state.selectedSessionId,
+  );
+  if (state.queueingProcessing || isSessionProcessing(selectedSession)) {
     const empty = document.createElement("div");
     empty.className = "people-empty";
-    empty.textContent = "Detecting and identifying voices for the current recording…";
+    empty.textContent = "Detecting and identifying voices for this conversation…";
     elements.speakersList.append(empty);
     return;
   }
@@ -1402,13 +1681,17 @@ function renderSpeakers() {
   const selectedSpeakerIds = new Set(
     state.selectedSegments.map((segment) => segment.speaker_id).filter(Boolean),
   );
+  const unknownSegments = state.selectedSegments.filter((segment) => !segment.speaker_id);
   const currentSpeakers = state.speakers.filter((speaker) => selectedSpeakerIds.has(speaker.id));
-  if (!currentSpeakers.length) {
+  if (!currentSpeakers.length && !unknownSegments.length) {
     const empty = document.createElement("div");
     empty.className = "people-empty";
     empty.textContent = "No manageable voice profiles are attributed in this conversation.";
     elements.speakersList.append(empty);
     return;
+  }
+  if (unknownSegments.length) {
+    elements.speakersList.append(buildUnknownSpeakerCard(unknownSegments));
   }
   for (const speaker of currentSpeakers) {
     elements.speakersList.append(buildSpeakerCard(speaker, true, false));
@@ -1425,8 +1708,11 @@ function renderVoiceLibrary() {
     elements.voiceLibraryList.append(empty);
     return;
   }
+  const selectedSession = state.sessions.find(
+    (session) => session.id === state.selectedSessionId,
+  );
   const selectedSpeakerIds = new Set(
-    state.recording || state.queueingProcessing || state.activeRuns.size > 0
+    state.recording || state.queueingProcessing || isSessionProcessing(selectedSession)
       ? []
       : state.selectedSegments.map((segment) => segment.speaker_id).filter(Boolean),
   );
@@ -1434,6 +1720,99 @@ function renderVoiceLibrary() {
     elements.voiceLibraryList.append(
       buildSpeakerCard(speaker, selectedSpeakerIds.has(speaker.id), true),
     );
+  }
+}
+
+function buildUnknownSpeakerCard(segments) {
+  const card = document.createElement("article");
+  card.className = "speaker-card unresolved";
+  const header = document.createElement("div");
+  header.className = "speaker-header";
+  const identity = document.createElement("div");
+  identity.className = "speaker-identity";
+  const avatar = document.createElement("div");
+  avatar.className = "speaker-avatar";
+  avatar.textContent = "?";
+  const copy = document.createElement("div");
+  const name = document.createElement("div");
+  name.className = "speaker-name";
+  name.textContent = "Unknown speaker";
+  const duration = segments.reduce(
+    (total, segment) => total + Math.max(0, Number(segment.end_ms) - Number(segment.start_ms)),
+    0,
+  );
+  const meta = document.createElement("div");
+  meta.className = "speaker-meta";
+  meta.textContent =
+    segments.length +
+    (segments.length === 1 ? " intervention" : " interventions") +
+    " · " +
+    formatDuration(duration);
+  copy.append(name, meta);
+  identity.append(avatar, copy);
+  header.append(identity);
+  card.append(header);
+
+  const tag = document.createElement("span");
+  tag.className = "new-voice-tag";
+  tag.textContent = "Needs review";
+  const tags = document.createElement("div");
+  tags.className = "speaker-tags";
+  tags.append(tag);
+  card.append(tags);
+
+  const explanation = document.createElement("p");
+  explanation.className = "speaker-card-explanation";
+  explanation.textContent =
+    "No safe voiceprint was available. If these turns belong to one person, group them into a VOICE profile; otherwise assign them individually in the transcript.";
+  card.append(explanation);
+
+  const actions = document.createElement("div");
+  actions.className = "speaker-actions";
+  actions.append(
+    actionButton("Group as one voice…", createProfileForUnknownSegments, "primary-mini"),
+    actionButton("Review turns", reviewUnknownInterventions),
+  );
+  card.append(actions);
+  return card;
+}
+
+function reviewUnknownInterventions() {
+  const segment = state.selectedSegments.find((candidate) => !candidate.speaker_id);
+  const row = segment
+    ? Array.from(elements.segmentsList.children).find(
+        (candidate) => candidate.dataset.segmentId === segment.id,
+      )
+    : null;
+  if (!row) return;
+  row.scrollIntoView({ behavior: "smooth", block: "center" });
+  const select = row.querySelector("select");
+  if (select) window.setTimeout(() => select.focus(), 250);
+}
+
+async function createProfileForUnknownSegments() {
+  const sessionId = state.selectedSessionId;
+  const unknownCount = state.selectedSegments.filter((segment) => !segment.speaker_id).length;
+  if (!sessionId || !unknownCount) return;
+  const confirmed = await requestConfirmation({
+    title: "Group unknown turns as one voice?",
+    message:
+      "This will assign all " +
+      unknownCount +
+      " currently unknown interventions in this conversation to one new VOICE profile. Continue only if they belong to the same person; otherwise use the speaker dropdown on each intervention.",
+    acceptLabel: "Create VOICE profile",
+  });
+  if (!confirmed) return;
+  try {
+    const label = await invoke("create_profile_for_unknown_segments", { sessionId });
+    await loadSpeakers();
+    await selectSession(sessionId);
+    addActivity(label + " created for previously unknown interventions", "success");
+    showToast(label + " is ready to name or assign.");
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not group unknown interventions: " + message, "error");
+    showToast(message, "error");
   }
 }
 
@@ -1585,10 +1964,16 @@ async function previewSpeaker(speaker) {
 
 function openNameDialog(speaker) {
   const provisional = isProvisionalLabel(speaker.label);
+  const hasVoiceprint = Number(speaker.embedding_count) > 0;
   elements.nameSpeakerId.value = speaker.id;
   elements.nameDialogTitle.textContent = provisional ? "Name this person" : "Rename this person";
   elements.saveSpeakerNameButton.textContent = provisional ? "Save name" : "Save new name";
   elements.speakerName.value = provisional ? "" : speaker.label || "";
+  elements.nameDialogHelp.textContent = !hasVoiceprint
+    ? provisional
+      ? "This labels the selected interventions, but no safe voiceprint was available. Automatic recognition will begin only after you later assign a clean VOICE profile to this person."
+      : "This changes the name used in saved transcripts. This person has no current voiceprint, so the name is not used for automatic recognition yet."
+    : "Naming enables automatic recognition for this person. The temporary voice excerpt is then deleted; only the local reference voiceprint remains.";
   elements.nameDialog.showModal();
   window.setTimeout(() => elements.speakerName.focus(), 0);
 }
@@ -1912,25 +2297,8 @@ async function removeAgenda() {
   }
 }
 
-function updateRecapProgress(stage, detail) {
-  const titles = {
-    prepare: "Preparing conversation",
-    llm: "Waiting for the LLM provider",
-    validate: "Checking the recap",
-    save: "Saving locally",
-    complete: "Recap ready",
-    warning: "Finishing the recap",
-    error: "Recap failed",
-  };
-  elements.recapProgressTitle.textContent = titles[stage] || "Creating recap";
-  elements.recapProgressDetail.textContent = detail || "Working…";
-  const failed = stage === "error";
-  elements.recapProgressSpinner.hidden = failed;
-  elements.recapProgressClose.hidden = !failed;
-}
-
 async function requestRecap() {
-  if (!state.selectedSessionId || state.recapRequestSessionId) return;
+  if (!state.selectedSessionId || recapIsRunning(state.selectedSessionId)) return;
   if (!state.status?.openai_key_configured || !String(state.preferences?.openai_model || "").trim()) {
     await openSettings();
     elements.settingsFeedback.textContent =
@@ -1948,7 +2316,7 @@ async function requestRecap() {
     elements.unresolvedDialog.showModal();
     return;
   }
-  await runRecap(false);
+  void runRecap(false);
 }
 
 function reviewUnresolvedParticipants() {
@@ -1974,17 +2342,24 @@ function reviewUnresolvedParticipants() {
 
 async function runRecap(allowUnresolved) {
   const sessionId = state.selectedSessionId;
-  if (!sessionId || state.recapRequestSessionId) return;
-  state.recapRequestSessionId = sessionId;
-  let failed = false;
-  if (elements.recapProgressDialog.open) elements.recapProgressDialog.close();
-  updateRecapProgress("prepare", "Preparing transcript and agenda…");
-  elements.recapProgressDialog.showModal();
+  if (!sessionId || recapIsRunning(sessionId)) return;
+  const session = state.sessions.find((candidate) => candidate.id === sessionId);
+  const label = sessionTitle(session);
+  state.recapJobs.set(sessionId, {
+    status: "running",
+    stage: "prepare",
+    detail: "Preparing transcript and agenda…",
+  });
+  if (state.selectedSessionId === sessionId && state.recapState) {
+    state.recapState.in_flight = true;
+  }
+  renderSessions();
   updateContentVisibility();
-  addActivity("Starting on-demand LLM recap");
+  renderTranscript(session);
+  addActivity("[recap · " + label + "] Starting on-demand LLM recap");
   try {
     const commandState = await invoke("generate_recap", { sessionId, allowUnresolved });
-    await loadSessions(sessionId);
+    await loadSessions();
     if (state.selectedSessionId === sessionId) {
       const persistedState = await invoke("get_recap_state", { sessionId });
       if (!persistedState?.recap?.payload) {
@@ -2002,18 +2377,22 @@ async function runRecap(allowUnresolved) {
     }
     const usage = commandState.recap;
     addActivity(
-      "LLM recap saved locally" +
+      "[recap · " + label + "] LLM recap saved locally" +
         (usage
           ? " (" + usage.input_tokens + " input / " + usage.output_tokens + " output tokens)"
           : ""),
       "success",
     );
-    showToast("Recap ready.");
+    state.recapJobs.delete(sessionId);
+    showToast("Recap ready for “" + label + "”.");
   } catch (error) {
-    failed = true;
     const message = errorText(error);
-    updateRecapProgress("error", message);
-    addActivity("LLM recap failed: " + message, "error");
+    state.recapJobs.set(sessionId, {
+      status: "error",
+      stage: "error",
+      detail: message,
+    });
+    addActivity("[recap · " + label + "] LLM recap failed: " + message, "error");
     showToast(message, "error");
     if (state.selectedSessionId === sessionId) {
       try {
@@ -2023,9 +2402,15 @@ async function runRecap(allowUnresolved) {
       }
     }
   } finally {
-    state.recapRequestSessionId = null;
-    if (!failed && elements.recapProgressDialog.open) elements.recapProgressDialog.close();
+    if (state.selectedSessionId === sessionId && state.recapState) {
+      state.recapState.in_flight = recapJob(sessionId)?.status === "running";
+    }
+    renderSessions();
     updateContentVisibility();
+    if (state.selectedSessionId === sessionId) {
+      const selected = state.sessions.find((candidate) => candidate.id === sessionId);
+      if (selected) renderTranscript(selected);
+    }
   }
 }
 
@@ -2266,20 +2651,50 @@ async function registerListeners() {
     const progress = event.payload || {};
     if (!progress.stage) return;
     const kind = progress.stage === "error" ? "error" : progress.stage === "complete" ? "success" : "";
-    addActivity("[recap] " + progress.stage + ": " + (progress.detail || "Working…"), kind);
-    if (progress.session_id === state.recapRequestSessionId) {
-      updateRecapProgress(progress.stage, progress.detail);
+    const session = state.sessions.find((candidate) => candidate.id === progress.session_id);
+    const label = session ? sessionTitle(session) : String(progress.session_id || "").slice(0, 8);
+    addActivity(
+      "[recap · " + label + "] " + progress.stage + ": " + (progress.detail || "Working…"),
+      kind,
+    );
+    if (progress.session_id) {
+      state.recapJobs.set(progress.session_id, {
+        status: progress.stage === "error" ? "error" : "running",
+        stage: progress.stage,
+        detail: progress.detail || "Working…",
+      });
+      renderSessions();
+      updateContentVisibility();
+      if (progress.session_id === state.selectedSessionId) {
+        const selected = state.sessions.find(
+          (candidate) => candidate.id === state.selectedSessionId,
+        );
+        if (selected) renderTranscript(selected);
+      }
     }
   });
   await listen("transcription:progress", (event) => {
     void handleProgressEvent(event.payload);
   });
   await listen("transcription:queued", (event) => {
-    const runId = event.payload;
+    const queued = event.payload || {};
+    const runId = queued.run_id;
+    const sessionId = queued.session_id;
+    if (!runId) return;
+    const shouldOpenDraft = state.queueingProcessing || !state.selectedSessionId;
     trackRun(runId);
     state.queueingProcessing = false;
     addActivity("[" + runId.slice(0, 8) + "] Queued from the menu bar");
-    setProcessingDetail("Uploading the recording to the STT provider…");
+    setProcessingDetail("Uploading the retained recording to the STT provider…");
+    void loadSessions(sessionId).then(() => {
+      const stored = state.sessions.find((session) => session.id === sessionId);
+      if (!stored || !["queued", "processing"].includes(stored.processing_status)) {
+        finishRun(runId);
+      }
+      return sessionId && shouldOpenDraft && !state.recording
+        ? selectSession(sessionId)
+        : undefined;
+    });
   });
   await listen("recording:started", (event) => {
     state.queueingProcessing = false;
@@ -2307,7 +2722,6 @@ async function registerListeners() {
 function bindInterface() {
   elements.recordButton.addEventListener("click", startRecording);
   elements.emptyRecordButton.addEventListener("click", startRecording);
-  elements.stopButton.addEventListener("click", stopRecording);
   elements.refreshSessions.addEventListener("click", () => loadSessions());
   elements.refreshSpeakers.addEventListener("click", loadSpeakers);
   elements.conversationSearch.addEventListener("input", renderSessions);
@@ -2318,6 +2732,11 @@ function bindInterface() {
   elements.agendaButton.addEventListener("click", openAgendaDialog);
   elements.recapButton.addEventListener("click", requestRecap);
   elements.staleRegenerateButton.addEventListener("click", requestRecap);
+  elements.retryProcessingButton.addEventListener("click", retrySelectedProcessing);
+  elements.discardRetainedAudioButton.addEventListener(
+    "click",
+    discardSelectedRetainedAudio,
+  );
   for (const button of elements.recapTabs.querySelectorAll("[data-recap-tab]")) {
     button.addEventListener("click", () => selectRecapTab(button.dataset.recapTab));
   }
@@ -2380,7 +2799,13 @@ function bindInterface() {
     elements.unresolvedDialog.close();
     void runRecap(true);
   });
-  elements.recapProgressDialog.addEventListener("cancel", (event) => event.preventDefault());
+  elements.recapStatusDismiss.addEventListener("click", () => {
+    const job = recapJob(state.selectedSessionId);
+    if (job?.status !== "error") return;
+    state.recapJobs.delete(state.selectedSessionId);
+    renderSessions();
+    updateContentVisibility();
+  });
   elements.nameForm.addEventListener("submit", saveSpeakerName);
   elements.assignForm.addEventListener("submit", assignVoiceProfile);
   elements.confirmationForm.addEventListener("submit", (event) => {

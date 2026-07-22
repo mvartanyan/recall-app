@@ -3,8 +3,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const PROMPT_VERSION: &str = "recall-recap-v3";
-pub const SCHEMA_VERSION: &str = "recall-recap-schema-v3";
+pub const PROMPT_VERSION: &str = "recall-recap-v4";
+pub const SCHEMA_VERSION: &str = "recall-recap-schema-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalizedText {
@@ -236,7 +236,7 @@ fn validate_required_evidence(
     validate_evidence(ids, valid_segment_ids)
 }
 
-pub fn response_schema(valid_segment_ids: &[String]) -> Value {
+pub fn analysis_response_schema(valid_segment_ids: &[String]) -> Value {
     let localized = || {
         json!({
             "type": "object",
@@ -299,17 +299,6 @@ pub fn response_schema(valid_segment_ids: &[String]) -> Value {
         },
         "required": ["agenda_item", "status", "statement", "evidence_segment_ids"]
     });
-    let translation = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "segment_id": { "$ref": "#/$defs/segment_id" },
-            "source_excerpt": { "type": "string" },
-            "language": { "type": "string" },
-            "english_translation": { "type": "string" }
-        },
-        "required": ["segment_id", "source_excerpt", "language", "english_translation"]
-    });
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -327,13 +316,7 @@ pub fn response_schema(valid_segment_ids: &[String]) -> Value {
             "commitments": { "type": "array", "items": action_item.clone() },
             "actions_already_taken": { "type": "array", "items": action_item },
             "agenda_present": { "type": "boolean" },
-            "agenda_coverage": { "type": "array", "items": agenda_item },
-            "translations": {
-                "type": "array",
-                "items": translation,
-                "minItems": valid_segment_ids.len(),
-                "maxItems": valid_segment_ids.len()
-            }
+            "agenda_coverage": { "type": "array", "items": agenda_item }
         },
         "required": [
             "meeting_title_english",
@@ -343,9 +326,41 @@ pub fn response_schema(valid_segment_ids: &[String]) -> Value {
             "commitments",
             "actions_already_taken",
             "agenda_present",
-            "agenda_coverage",
-            "translations"
+            "agenda_coverage"
         ]
+    })
+}
+
+pub fn translation_response_schema(valid_segment_ids: &[String]) -> Value {
+    let translation = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "segment_id": { "$ref": "#/$defs/segment_id" },
+            "source_excerpt": { "type": "string", "enum": [""] },
+            "language": { "type": "string" },
+            "english_translation": { "type": "string" }
+        },
+        "required": ["segment_id", "source_excerpt", "language", "english_translation"]
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "$defs": {
+            "segment_id": {
+                "type": "string",
+                "enum": valid_segment_ids
+            }
+        },
+        "properties": {
+            "translations": {
+                "type": "array",
+                "items": translation,
+                "minItems": valid_segment_ids.len(),
+                "maxItems": valid_segment_ids.len()
+            }
+        },
+        "required": ["translations"]
     })
 }
 
@@ -415,7 +430,9 @@ mod tests {
                 _ => {}
             }
         }
-        inspect(&response_schema(&["segment-1".into()]));
+        let ids = ["segment-1".into()];
+        inspect(&analysis_response_schema(&ids));
+        inspect(&translation_response_schema(&ids));
     }
 
     #[test]
@@ -429,7 +446,7 @@ mod tests {
 
     #[test]
     fn strict_schema_requires_evidence_for_summaries_and_actions() {
-        let schema = response_schema(&["segment-1".into()]);
+        let schema = analysis_response_schema(&["segment-1".into()]);
         assert_eq!(
             schema
                 .pointer("/properties/full_summary/items/properties/evidence_segment_ids/minItems"),
@@ -448,28 +465,34 @@ mod tests {
     #[test]
     fn strict_schema_limits_every_segment_reference_to_supplied_ids() {
         let valid_ids = vec!["segment-1".to_string(), "segment-2".to_string()];
-        let schema = response_schema(&valid_ids);
+        let analysis_schema = analysis_response_schema(&valid_ids);
         assert_eq!(
-            schema.pointer("/$defs/segment_id/enum"),
+            analysis_schema.pointer("/$defs/segment_id/enum"),
             Some(&json!(["segment-1", "segment-2"]))
         );
         assert_eq!(
-            schema.pointer(
+            analysis_schema.pointer(
                 "/properties/full_summary/items/properties/evidence_segment_ids/items/$ref"
             ),
             Some(&Value::String("#/$defs/segment_id".into()))
         );
+        let translation_schema = translation_response_schema(&valid_ids);
         assert_eq!(
-            schema.pointer("/properties/translations/items/properties/segment_id/$ref"),
+            translation_schema.pointer("/properties/translations/items/properties/segment_id/$ref"),
             Some(&Value::String("#/$defs/segment_id".into()))
         );
         assert_eq!(
-            schema.pointer("/properties/translations/minItems"),
+            translation_schema.pointer("/properties/translations/minItems"),
             Some(&Value::from(2))
         );
         assert_eq!(
-            schema.pointer("/properties/translations/maxItems"),
+            translation_schema.pointer("/properties/translations/maxItems"),
             Some(&Value::from(2))
+        );
+        assert_eq!(
+            translation_schema
+                .pointer("/properties/translations/items/properties/source_excerpt/enum"),
+            Some(&json!([""]))
         );
     }
 }

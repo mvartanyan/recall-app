@@ -1,6 +1,6 @@
 {
   "name": "recall",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Recall desktop app (Tauri + Rust).",
   "license": "MIT OR Apache-2.0",
   "repository": {

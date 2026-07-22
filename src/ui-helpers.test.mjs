@@ -8,10 +8,13 @@ import {
   filterSessions,
   formatDuration,
   formatTimestamp,
+  groupVoiceFilters,
   isNearScrollBottom,
   isProvisionalLabel,
+  isSessionProcessing,
   parseLanguageHints,
   parseNoTranslationLanguages,
+  processingRunIds,
   recapTabAvailability,
   shouldShowOnboarding,
   translatedSegmentText,
@@ -30,13 +33,14 @@ test("workspace modes are mutually exclusive and recording takes priority", () =
   assert.equal(contentMode({ selectedSessionId: "old" }), "conversation");
   assert.equal(
     contentMode({ selectedSessionId: "old", processingCount: 1 }),
-    "processing",
+    "conversation",
   );
   assert.equal(
     contentMode({ selectedSessionId: "old", processingCount: 2, recording: true }),
     "recording",
   );
   assert.equal(contentMode({ selectedSessionId: "old", queueing: true }), "processing");
+  assert.equal(contentMode({ processingCount: 1 }), "processing");
 });
 
 test("VOICE labels are provisional but human names are not", () => {
@@ -146,4 +150,35 @@ test("conversation filtering combines text and selected voice", () => {
     ["two"],
   );
   assert.deepEqual(filterSessions(sessions, "planning", new Set(["two"])), []);
+});
+
+test("voice filters collapse duplicate labels, include every profile id, and sort names", () => {
+  assert.deepEqual(
+    groupVoiceFilters([
+      { id: "z", label: "Zoë", conversation_count: 1 },
+      { id: "a1", label: "Alice", conversation_count: 2 },
+      { id: "unused", label: "Nobody", conversation_count: 0 },
+      { id: "a2", label: "alice", conversation_count: 1 },
+      { id: "v2", label: "VOICE10", conversation_count: 1 },
+      { id: "v1", label: "VOICE2", conversation_count: 1 },
+    ]),
+    [
+      { key: "alice", label: "Alice", speakerIds: ["a1", "a2"] },
+      { key: "voice2", label: "VOICE2", speakerIds: ["v1"] },
+      { key: "voice10", label: "VOICE10", speakerIds: ["v2"] },
+      { key: "zoë", label: "Zoë", speakerIds: ["z"] },
+    ],
+  );
+});
+
+test("processing state is derived from persisted conversations, not unrelated stale runs", () => {
+  const sessions = [
+    { id: "done", processing_status: null, processing_run_id: null },
+    { id: "active", processing_status: "processing", processing_run_id: "run-active" },
+    { id: "failed", processing_status: "failed", processing_run_id: "run-failed" },
+  ];
+  assert.equal(isSessionProcessing(sessions[0]), false);
+  assert.equal(isSessionProcessing(sessions[1]), true);
+  assert.equal(isSessionProcessing(sessions[2]), false);
+  assert.deepEqual(Array.from(processingRunIds(sessions)), ["run-active"]);
 });
