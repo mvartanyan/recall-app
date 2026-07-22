@@ -3,6 +3,8 @@ target/
 .DS_Store
 .vscode/
 dist/
+test-results/
+playwright-report/
 src-tauri/target/
 src-tauri/.fingerprint/
 src-tauri/.cargo/

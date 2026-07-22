@@ -3,13 +3,18 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const PROMPT_VERSION: &str = "recall-recap-v4";
-pub const SCHEMA_VERSION: &str = "recall-recap-schema-v4";
+pub const PROMPT_VERSION: &str = "recall-recap-v5";
+pub const SCHEMA_VERSION: &str = "recall-recap-schema-v5";
+
+fn default_target_language() -> String {
+    "en".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LocalizedText {
     pub original: String,
-    pub english: String,
+    #[serde(alias = "english")]
+    pub translated: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -41,12 +46,16 @@ pub struct TranslationAnnotation {
     pub segment_id: String,
     pub source_excerpt: String,
     pub language: String,
-    pub english_translation: String,
+    #[serde(alias = "english_translation")]
+    pub translated_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecapPayload {
-    pub meeting_title_english: String,
+    #[serde(default = "default_target_language")]
+    pub target_language: String,
+    #[serde(alias = "meeting_title_english")]
+    pub meeting_title: String,
     pub dominant_language: String,
     pub executive_summary: LocalizedText,
     pub full_summary: Vec<SummarySection>,
@@ -79,6 +88,12 @@ pub struct AgendaFingerprint<'a> {
 struct FingerprintInput<'a> {
     segments: &'a [RecapSourceSegment],
     agenda: Option<FingerprintAgenda<'a>>,
+}
+
+#[derive(Serialize)]
+struct LegacyFingerprintInput<'a> {
+    segments: &'a [RecapSourceSegment],
+    agenda: Option<FingerprintAgenda<'a>>,
     no_translation_languages: Vec<String>,
 }
 
@@ -91,6 +106,22 @@ struct FingerprintAgenda<'a> {
 }
 
 pub fn source_fingerprint(
+    segments: &[RecapSourceSegment],
+    agenda: Option<AgendaFingerprint<'_>>,
+) -> Result<String, String> {
+    let agenda = agenda.map(|value| FingerprintAgenda {
+        source_kind: value.source_kind,
+        filename: value.filename,
+        mime_type: value.mime_type,
+        content_sha256: hex_sha256(value.content),
+    });
+    let input = FingerprintInput { segments, agenda };
+    let bytes = serde_json::to_vec(&input)
+        .map_err(|error| format!("Could not fingerprint recap sources: {error}"))?;
+    Ok(hex_sha256(&bytes))
+}
+
+pub fn legacy_source_fingerprint(
     segments: &[RecapSourceSegment],
     agenda: Option<AgendaFingerprint<'_>>,
     no_translation_languages: &[String],
@@ -108,13 +139,13 @@ pub fn source_fingerprint(
         .collect::<Vec<_>>();
     languages.sort();
     languages.dedup();
-    let input = FingerprintInput {
+    let input = LegacyFingerprintInput {
         segments,
         agenda,
         no_translation_languages: languages,
     };
     let bytes = serde_json::to_vec(&input)
-        .map_err(|error| format!("Could not fingerprint recap sources: {error}"))?;
+        .map_err(|error| format!("Could not fingerprint legacy recap sources: {error}"))?;
     Ok(hex_sha256(&bytes))
 }
 
@@ -128,7 +159,10 @@ pub fn validate_payload(
     valid_segment_ids: &HashSet<String>,
     agenda_present: bool,
 ) -> Result<(), String> {
-    if payload.meeting_title_english.trim().is_empty() {
+    if payload.target_language.trim().is_empty() {
+        return Err("The LLM provider returned no target language".into());
+    }
+    if payload.meeting_title.trim().is_empty() {
         return Err("The LLM provider returned an empty meeting title".into());
     }
     if payload.dominant_language.trim().is_empty() {
@@ -198,7 +232,7 @@ pub fn validate_payload(
         }
         if translation.source_excerpt.trim().is_empty()
             || translation.language.trim().is_empty()
-            || translation.english_translation.trim().is_empty()
+            || translation.translated_text.trim().is_empty()
         {
             return Err("The LLM provider returned an incomplete translation annotation".into());
         }
@@ -207,7 +241,7 @@ pub fn validate_payload(
 }
 
 fn validate_localized(value: &LocalizedText, field: &str) -> Result<(), String> {
-    if value.original.trim().is_empty() || value.english.trim().is_empty() {
+    if value.original.trim().is_empty() || value.translated.trim().is_empty() {
         Err(format!("The LLM provider returned an incomplete {field}"))
     } else {
         Ok(())
@@ -236,16 +270,16 @@ fn validate_required_evidence(
     validate_evidence(ids, valid_segment_ids)
 }
 
-pub fn analysis_response_schema(valid_segment_ids: &[String]) -> Value {
+pub fn analysis_response_schema(valid_segment_ids: &[String], target_language: &str) -> Value {
     let localized = || {
         json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "original": { "type": "string" },
-                "english": { "type": "string" }
+                "translated": { "type": "string" }
             },
-            "required": ["original", "english"]
+            "required": ["original", "translated"]
         })
     };
     let evidence = || {
@@ -309,7 +343,8 @@ pub fn analysis_response_schema(valid_segment_ids: &[String]) -> Value {
             }
         },
         "properties": {
-            "meeting_title_english": { "type": "string" },
+            "target_language": { "type": "string", "enum": [target_language] },
+            "meeting_title": { "type": "string" },
             "dominant_language": { "type": "string" },
             "executive_summary": localized(),
             "full_summary": { "type": "array", "items": summary_section },
@@ -319,7 +354,8 @@ pub fn analysis_response_schema(valid_segment_ids: &[String]) -> Value {
             "agenda_coverage": { "type": "array", "items": agenda_item }
         },
         "required": [
-            "meeting_title_english",
+            "target_language",
+            "meeting_title",
             "dominant_language",
             "executive_summary",
             "full_summary",
@@ -339,9 +375,9 @@ pub fn translation_response_schema(valid_segment_ids: &[String]) -> Value {
             "segment_id": { "$ref": "#/$defs/segment_id" },
             "source_excerpt": { "type": "string", "enum": [""] },
             "language": { "type": "string" },
-            "english_translation": { "type": "string" }
+            "translated_text": { "type": "string" }
         },
-        "required": ["segment_id", "source_excerpt", "language", "english_translation"]
+        "required": ["segment_id", "source_excerpt", "language", "translated_text"]
     });
     json!({
         "type": "object",
@@ -369,7 +405,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_changes_for_transcript_agenda_or_translation_policy() {
+    fn fingerprint_changes_for_transcript_or_agenda() {
         let segment = RecapSourceSegment {
             id: "seg-1".into(),
             start_ms: 0,
@@ -378,9 +414,7 @@ mod tests {
             speaker_label: "Alice".into(),
             text: "Bonjour".into(),
         };
-        let baseline = source_fingerprint(std::slice::from_ref(&segment), None, &[]).unwrap();
-        let with_policy =
-            source_fingerprint(std::slice::from_ref(&segment), None, &["fr".into()]).unwrap();
+        let baseline = source_fingerprint(std::slice::from_ref(&segment), None).unwrap();
         let with_agenda = source_fingerprint(
             std::slice::from_ref(&segment),
             Some(AgendaFingerprint {
@@ -389,23 +423,22 @@ mod tests {
                 mime_type: "text/plain",
                 content: b"Introductions",
             }),
-            &[],
         )
         .unwrap();
         let mut changed = segment;
         changed.text = "Bonsoir".into();
-        let with_edit = source_fingerprint(&[changed], None, &[]).unwrap();
-        assert_ne!(baseline, with_policy);
+        let with_edit = source_fingerprint(&[changed], None).unwrap();
         assert_ne!(baseline, with_agenda);
         assert_ne!(baseline, with_edit);
     }
 
     #[test]
-    fn english_is_implicit_and_does_not_change_translation_policy_hash() {
+    fn translation_preferences_do_not_participate_in_the_source_fingerprint() {
         let segments = Vec::new();
-        assert_eq!(
-            source_fingerprint(&segments, None, &[]).unwrap(),
-            source_fingerprint(&segments, None, &["en".into(), "EN".into()]).unwrap()
+        assert_eq!(source_fingerprint(&segments, None).unwrap().len(), 64);
+        assert_ne!(
+            legacy_source_fingerprint(&segments, None, &[]).unwrap(),
+            legacy_source_fingerprint(&segments, None, &["de".into()]).unwrap()
         );
     }
 
@@ -431,7 +464,7 @@ mod tests {
             }
         }
         let ids = ["segment-1".into()];
-        inspect(&analysis_response_schema(&ids));
+        inspect(&analysis_response_schema(&ids, "de"));
         inspect(&translation_response_schema(&ids));
     }
 
@@ -446,7 +479,7 @@ mod tests {
 
     #[test]
     fn strict_schema_requires_evidence_for_summaries_and_actions() {
-        let schema = analysis_response_schema(&["segment-1".into()]);
+        let schema = analysis_response_schema(&["segment-1".into()], "de");
         assert_eq!(
             schema
                 .pointer("/properties/full_summary/items/properties/evidence_segment_ids/minItems"),
@@ -465,7 +498,7 @@ mod tests {
     #[test]
     fn strict_schema_limits_every_segment_reference_to_supplied_ids() {
         let valid_ids = vec!["segment-1".to_string(), "segment-2".to_string()];
-        let analysis_schema = analysis_response_schema(&valid_ids);
+        let analysis_schema = analysis_response_schema(&valid_ids, "de");
         assert_eq!(
             analysis_schema.pointer("/$defs/segment_id/enum"),
             Some(&json!(["segment-1", "segment-2"]))
@@ -494,5 +527,38 @@ mod tests {
                 .pointer("/properties/translations/items/properties/source_excerpt/enum"),
             Some(&json!([""]))
         );
+    }
+
+    #[test]
+    fn legacy_english_recaps_deserialize_with_explicit_target_language_metadata() {
+        let legacy = json!({
+            "meeting_title_english": "Planning meeting",
+            "dominant_language": "fr",
+            "executive_summary": { "original": "Planification", "english": "Planning" },
+            "full_summary": [{
+                "heading": { "original": "Plan", "english": "Plan" },
+                "body": { "original": "Accord", "english": "Agreement" },
+                "evidence_segment_ids": ["segment-1"]
+            }],
+            "commitments": [],
+            "actions_already_taken": [],
+            "agenda_present": false,
+            "agenda_coverage": [],
+            "translations": [{
+                "segment_id": "segment-1",
+                "source_excerpt": "Bonjour",
+                "language": "fr",
+                "english_translation": "Hello"
+            }]
+        });
+        let payload: RecapPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(payload.target_language, "en");
+        assert_eq!(payload.meeting_title, "Planning meeting");
+        assert_eq!(payload.executive_summary.translated, "Planning");
+        assert_eq!(payload.translations[0].translated_text, "Hello");
+        let current = serde_json::to_value(payload).unwrap();
+        assert_eq!(current["target_language"], "en");
+        assert!(current.get("meeting_title_english").is_none());
+        assert!(current["executive_summary"].get("english").is_none());
     }
 }

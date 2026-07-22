@@ -92,7 +92,17 @@
                 <span class="live-pill">LIVE</span>
               </div>
               <div class="live-transcript-frame">
-                <pre id="liveTranscript" class="live-transcript">Listening…</pre>
+                <div class="live-caption-streams">
+                  <section class="live-caption-stream">
+                    <span class="live-caption-label">Original</span>
+                    <pre id="liveTranscript" class="live-transcript">Listening…</pre>
+                  </section>
+                  <section id="liveTranslationSection" class="live-caption-stream translated" hidden>
+                    <span id="liveTranslationLabel" class="live-caption-label">Preferred-language translation</span>
+                    <pre id="liveTranslatedTranscript" class="live-transcript translated"></pre>
+                  </section>
+                  <p id="liveTranslationWarning" class="live-translation-warning" hidden></p>
+                </div>
                 <button id="jumpToLiveButton" class="jump-to-live" type="button" hidden>
                   Jump to latest ↓
                 </button>
@@ -141,7 +151,7 @@
               <div id="recapStaleBanner" class="recap-stale-banner" hidden>
                 <div>
                   <strong>This recap is out of date.</strong>
-                  <span>The transcript, participants, agenda, or translation policy changed after it was generated.</span>
+                  <span>The transcript, participants, or agenda changed after it was generated.</span>
                 </div>
                 <button id="staleRegenerateButton" class="secondary-button compact-action" type="button">Regenerate</button>
               </div>
@@ -179,7 +189,7 @@
                   <div class="panel-actions generated-actions">
                     <div id="generatedLanguageToggle" class="language-toggle" role="group" aria-label="Summary language">
                       <button id="showOriginalButton" class="selected" type="button">Original</button>
-                      <button id="showEnglishButton" type="button">English</button>
+                      <button id="showEnglishButton" type="button">Preferred language</button>
                     </div>
                     <button id="copyGeneratedText" class="text-button" type="button">Copy text</button>
                     <button id="copyGeneratedMarkdown" class="text-button" type="button">Copy Markdown</button>
@@ -387,6 +397,11 @@
           </section>
 
           <section class="settings-section settings-grid recap-settings-grid">
+            <div class="preferred-language-setting">
+              <label class="field-label" for="preferredLanguage">Preferred language</label>
+              <select id="preferredLanguage"></select>
+              <p class="field-help">Live translation and on-demand recap translations use this language.</p>
+            </div>
             <div>
               <label class="field-label" for="languageHints">Likely languages</label>
               <input id="languageHints" type="text" placeholder="en, fr, de, es, ru" />
@@ -395,7 +410,7 @@
             <div>
               <label class="field-label" for="noTranslationLanguages">No translation for languages</label>
               <input id="noTranslationLanguages" type="text" placeholder="e.g. de, fr" />
-              <p class="field-help">Base language codes. English is always left untranslated and does not need to be listed.</p>
+              <p class="field-help">Base language codes. Your preferred language is always left untranslated and is removed from this list.</p>
             </div>
             <label class="toggle-row">
               <span>

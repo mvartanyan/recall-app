@@ -56,7 +56,7 @@ struct StatusResponse {
     error_message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct Token {
     #[serde(default)]
     text: String,
@@ -68,6 +68,10 @@ struct Token {
     speaker: Option<Value>,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    source_language: Option<String>,
+    #[serde(default)]
+    translation_status: Option<String>,
     #[serde(default)]
     is_final: bool,
 }
@@ -96,6 +100,10 @@ struct RealtimeResponse {
 pub struct LiveTranscriptEvent {
     pub text: String,
     pub final_text: String,
+    pub translated_text: String,
+    pub translated_final_text: String,
+    pub target_language: Option<String>,
+    pub translation_warning: Option<String>,
     pub finished: bool,
     pub status: String,
     pub error: Option<String>,
@@ -106,6 +114,10 @@ impl LiveTranscriptEvent {
         Self {
             text: String::new(),
             final_text: String::new(),
+            translated_text: String::new(),
+            translated_final_text: String::new(),
+            target_language: None,
+            translation_warning: None,
             finished: false,
             status: "Live captions idle".into(),
             error: None,
@@ -127,6 +139,91 @@ impl LiveTranscriptEvent {
 pub enum LiveAudioMessage {
     Audio(Vec<u8>),
     Finish,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranslationLanguage {
+    pub code: &'static str,
+    pub name: &'static str,
+}
+
+const TRANSLATION_LANGUAGES: &[(&str, &str)] = &[
+    ("af", "Afrikaans"),
+    ("sq", "Albanian"),
+    ("ar", "Arabic"),
+    ("az", "Azerbaijani"),
+    ("eu", "Basque"),
+    ("be", "Belarusian"),
+    ("bn", "Bengali"),
+    ("bs", "Bosnian"),
+    ("bg", "Bulgarian"),
+    ("ca", "Catalan"),
+    ("zh", "Chinese"),
+    ("hr", "Croatian"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("nl", "Dutch"),
+    ("en", "English"),
+    ("et", "Estonian"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("gl", "Galician"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("gu", "Gujarati"),
+    ("he", "Hebrew"),
+    ("hi", "Hindi"),
+    ("hu", "Hungarian"),
+    ("id", "Indonesian"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("kn", "Kannada"),
+    ("kk", "Kazakh"),
+    ("ko", "Korean"),
+    ("lv", "Latvian"),
+    ("lt", "Lithuanian"),
+    ("mk", "Macedonian"),
+    ("ms", "Malay"),
+    ("ml", "Malayalam"),
+    ("mr", "Marathi"),
+    ("no", "Norwegian"),
+    ("fa", "Persian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("pa", "Punjabi"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("sr", "Serbian"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("es", "Spanish"),
+    ("sw", "Swahili"),
+    ("sv", "Swedish"),
+    ("tl", "Tagalog"),
+    ("ta", "Tamil"),
+    ("te", "Telugu"),
+    ("th", "Thai"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+    ("ur", "Urdu"),
+    ("vi", "Vietnamese"),
+    ("cy", "Welsh"),
+];
+
+pub fn supported_translation_languages() -> Vec<TranslationLanguage> {
+    TRANSLATION_LANGUAGES
+        .iter()
+        .map(|(code, name)| TranslationLanguage { code, name })
+        .collect()
+}
+
+pub fn normalize_translation_language(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+    let base = normalized.split('-').next()?;
+    TRANSLATION_LANGUAGES
+        .iter()
+        .any(|(code, _)| *code == base)
+        .then(|| base.to_string())
 }
 
 pub fn transcribe_file<F>(
@@ -288,25 +385,59 @@ where
 pub async fn run_realtime(
     api_key: String,
     language_hints: Vec<String>,
+    preferred_language: String,
+    no_translation_languages: Vec<String>,
     sample_rate: u32,
     mut audio_rx: mpsc::UnboundedReceiver<LiveAudioMessage>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     ensure_tls_provider();
-    emit_live(&app_handle, "Connecting live captions", "", "", false, None);
+    let (translation_target, translation_warning) = live_translation_policy(&preferred_language);
+    emit_live(
+        &app_handle,
+        LiveTranscriptEvent {
+            text: String::new(),
+            final_text: String::new(),
+            translated_text: String::new(),
+            translated_final_text: String::new(),
+            target_language: translation_target.clone(),
+            translation_warning: translation_warning.clone(),
+            finished: false,
+            status: "Connecting live captions".into(),
+            error: None,
+        },
+    );
     eprintln!("[live] connecting to the realtime STT provider");
     let (mut socket, _) =
         tokio::time::timeout(Duration::from_secs(10), connect_async(REALTIME_URL))
             .await
             .map_err(|_| "Timed out connecting to live STT after 10 seconds".to_string())?
             .map_err(|error| format!("Could not connect to live STT: {error}"))?;
-    let config = realtime_config(&api_key, &language_hints, sample_rate);
+    let config = realtime_config(
+        &api_key,
+        &language_hints,
+        translation_target.as_deref(),
+        sample_rate,
+    );
     socket
         .send(Message::Text(config.to_string()))
         .await
         .map_err(|error| format!("Could not configure live STT: {error}"))?;
     eprintln!("[live] connected and configured");
-    emit_live(&app_handle, "Live captions connected", "", "", false, None);
+    emit_live(
+        &app_handle,
+        LiveTranscriptEvent {
+            text: String::new(),
+            final_text: String::new(),
+            translated_text: String::new(),
+            translated_final_text: String::new(),
+            target_language: translation_target.clone(),
+            translation_warning: translation_warning.clone(),
+            finished: false,
+            status: "Live captions connected".into(),
+            error: None,
+        },
+    );
 
     let (mut writer, mut reader) = socket.split();
     let send_audio = async move {
@@ -343,6 +474,11 @@ pub async fn run_realtime(
     let receive_captions = async move {
         let mut final_tokens: Vec<Token> = Vec::new();
         let mut received_response = false;
+        let excluded_languages = no_translation_languages
+            .iter()
+            .filter_map(|language| normalize_translation_language(language))
+            .chain(translation_target.clone())
+            .collect::<HashSet<_>>();
         while let Some(incoming) = reader.next().await {
             let incoming =
                 incoming.map_err(|error| format!("Live STT connection error: {error}"))?;
@@ -384,15 +520,25 @@ pub async fn run_realtime(
             display.extend(non_final);
             emit_live(
                 &app_handle,
-                if response.finished {
-                    "Live captions finished"
-                } else {
-                    "Live"
+                LiveTranscriptEvent {
+                    text: render_original_tokens(&display),
+                    final_text: render_original_tokens(&final_tokens),
+                    translated_text: render_translation_tokens(&display, &excluded_languages),
+                    translated_final_text: render_translation_tokens(
+                        &final_tokens,
+                        &excluded_languages,
+                    ),
+                    target_language: translation_target.clone(),
+                    translation_warning: translation_warning.clone(),
+                    finished: response.finished,
+                    status: if response.finished {
+                        "Live captions finished"
+                    } else {
+                        "Live"
+                    }
+                    .into(),
+                    error: None,
                 },
-                &render_tokens(&display),
-                &render_tokens(&final_tokens),
-                response.finished,
-                None,
             );
             if response.finished {
                 eprintln!("[live] caption stream finished");
@@ -407,7 +553,12 @@ pub async fn run_realtime(
         .map(|_| ())
 }
 
-fn realtime_config(api_key: &str, language_hints: &[String], sample_rate: u32) -> Value {
+fn realtime_config(
+    api_key: &str,
+    language_hints: &[String],
+    translation_target: Option<&str>,
+    sample_rate: u32,
+) -> Value {
     let hints = normalize_language_hints(language_hints);
     let mut config = json!({
         "api_key": api_key,
@@ -419,38 +570,49 @@ fn realtime_config(api_key: &str, language_hints: &[String], sample_rate: u32) -
         "enable_language_identification": true,
         "enable_endpoint_detection": false,
     });
+    if let Some(target_language) = translation_target {
+        config["translation"] = json!({
+            "type": "one_way",
+            "target_language": target_language,
+        });
+    }
     if !hints.is_empty() {
         config["language_hints"] = json!(hints);
     }
     config
 }
 
+fn live_translation_policy(preferred_language: &str) -> (Option<String>, Option<String>) {
+    match normalize_translation_language(preferred_language) {
+        Some(language) => (Some(language), None),
+        None => (
+            None,
+            Some(format!(
+                "Preferred language {} is unavailable for live STT translation. Original live captions will continue.",
+                preferred_language.trim()
+            )),
+        ),
+    }
+}
+
 pub fn emit_realtime_error(app_handle: &tauri::AppHandle, error: String) {
     emit_live(
         app_handle,
-        "Live captions unavailable",
-        "",
-        "",
-        true,
-        Some(error),
+        LiveTranscriptEvent {
+            text: String::new(),
+            final_text: String::new(),
+            translated_text: String::new(),
+            translated_final_text: String::new(),
+            target_language: None,
+            translation_warning: None,
+            finished: true,
+            status: "Live captions unavailable".into(),
+            error: Some(error),
+        },
     );
 }
 
-fn emit_live(
-    app_handle: &tauri::AppHandle,
-    status: &str,
-    text: &str,
-    final_text: &str,
-    finished: bool,
-    error: Option<String>,
-) {
-    let payload = LiveTranscriptEvent {
-        text: text.to_string(),
-        final_text: final_text.to_string(),
-        finished,
-        status: status.to_string(),
-        error,
-    };
+fn emit_live(app_handle: &tauri::AppHandle, payload: LiveTranscriptEvent) {
     let state = app_handle.state::<crate::state::AppState>();
     if let Ok(mut snapshot) = state.live_transcript.lock() {
         *snapshot = payload.clone();
@@ -555,10 +717,13 @@ fn clean_text(value: &str) -> String {
         .replace(" ;", ";")
 }
 
-fn render_tokens(tokens: &[Token]) -> String {
+fn render_original_tokens(tokens: &[Token]) -> String {
     let mut rendered = String::new();
     let mut current_speaker = String::new();
-    for token in tokens {
+    for token in tokens
+        .iter()
+        .filter(|token| token.translation_status.as_deref() != Some("translation"))
+    {
         if token.text.is_empty() {
             continue;
         }
@@ -573,6 +738,24 @@ fn render_tokens(tokens: &[Token]) -> String {
         rendered.push_str(&token.text);
     }
     rendered.trim().to_string()
+}
+
+fn render_translation_tokens(tokens: &[Token], excluded_languages: &HashSet<String>) -> String {
+    tokens
+        .iter()
+        .filter(|token| token.translation_status.as_deref() == Some("translation"))
+        .filter(|token| {
+            token
+                .source_language
+                .as_deref()
+                .and_then(normalize_translation_language)
+                .map(|language| !excluded_languages.contains(&language))
+                .unwrap_or(false)
+        })
+        .map(|token| token.text.as_str())
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn display_speaker(speaker: &str) -> String {
@@ -633,6 +816,8 @@ mod tests {
                     end_ms: Some(100),
                     speaker: Some(json!("1")),
                     language: Some("en".into()),
+                    source_language: None,
+                    translation_status: None,
                     is_final: true,
                 },
                 Token {
@@ -641,6 +826,8 @@ mod tests {
                     end_ms: Some(300),
                     speaker: Some(json!("1")),
                     language: Some("en".into()),
+                    source_language: None,
+                    translation_status: None,
                     is_final: true,
                 },
                 Token {
@@ -649,6 +836,8 @@ mod tests {
                     end_ms: Some(500),
                     speaker: Some(json!(2)),
                     language: Some("en".into()),
+                    source_language: None,
+                    translation_status: None,
                     is_final: true,
                 },
             ],
@@ -685,7 +874,12 @@ mod tests {
 
     #[test]
     fn realtime_config_streams_raw_mono_pcm_with_diarization() {
-        let config = realtime_config("test-key", &["ru-RU".into(), "en-US".into()], 48_000);
+        let config = realtime_config(
+            "test-key",
+            &["ru-RU".into(), "en-US".into()],
+            Some("de"),
+            48_000,
+        );
         assert_eq!(config["model"], REALTIME_MODEL);
         assert_eq!(config["audio_format"], "pcm_s16le");
         assert_eq!(config["sample_rate"], 48_000);
@@ -693,5 +887,58 @@ mod tests {
         assert_eq!(config["enable_speaker_diarization"], true);
         assert_eq!(config["enable_language_identification"], true);
         assert_eq!(config["language_hints"], json!(["ru", "en"]));
+        assert_eq!(config["translation"]["type"], "one_way");
+        assert_eq!(config["translation"]["target_language"], "de");
+    }
+
+    #[test]
+    fn live_translation_tokens_respect_the_recording_policy_snapshot() {
+        let tokens = vec![
+            Token {
+                text: "Hallo".into(),
+                translation_status: Some("original".into()),
+                speaker: Some(json!(1)),
+                ..Token::default()
+            },
+            Token {
+                text: "Hello".into(),
+                source_language: Some("de".into()),
+                translation_status: Some("translation".into()),
+                ..Token::default()
+            },
+            Token {
+                text: "Bonjour".into(),
+                source_language: Some("fr".into()),
+                translation_status: Some("translation".into()),
+                ..Token::default()
+            },
+            Token {
+                text: "Hidden".into(),
+                source_language: None,
+                translation_status: Some("translation".into()),
+                ..Token::default()
+            },
+        ];
+        let excluded = HashSet::from(["de".to_string()]);
+        assert_eq!(render_original_tokens(&tokens), "Speaker 1: Hallo");
+        assert_eq!(render_translation_tokens(&tokens, &excluded), "Bonjour");
+    }
+
+    #[test]
+    fn preferred_language_is_normalized_against_the_supported_catalogue() {
+        assert_eq!(normalize_translation_language("DE-de"), Some("de".into()));
+        assert_eq!(normalize_translation_language("xx"), None);
+    }
+
+    #[test]
+    fn unsupported_live_translation_target_keeps_original_stt_enabled() {
+        let (target, warning) = live_translation_policy("xx");
+        assert!(target.is_none());
+        assert!(warning
+            .unwrap()
+            .contains("Original live captions will continue"));
+        let config = realtime_config("test-key", &[], target.as_deref(), 48_000);
+        assert!(config.get("translation").is_none());
+        assert_eq!(config["enable_language_identification"], true);
     }
 }

@@ -199,7 +199,7 @@ impl RecordingManager {
     fn start(
         &self,
         requested_device: Option<&str>,
-        live: Option<(String, Vec<String>)>,
+        live: Option<(String, Vec<String>, String, Vec<String>)>,
         app_handle: tauri::AppHandle,
     ) -> Result<RecordingStarted, String> {
         let mut guard = self.current.lock().map_err(|_| "Recording lock poisoned")?;
@@ -226,19 +226,28 @@ impl RecordingManager {
         let output_for_result = output.clone();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-        let live_tx = live.map(|(api_key, language_hints)| {
-            let (tx, rx) = tokio_mpsc::unbounded_channel();
-            let handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) =
-                    soniox::run_realtime(api_key, language_hints, sample_rate, rx, handle.clone())
-                        .await
-                {
-                    soniox::emit_realtime_error(&handle, error);
-                }
-            });
-            tx
-        });
+        let live_tx = live.map(
+            |(api_key, language_hints, preferred_language, no_translation_languages)| {
+                let (tx, rx) = tokio_mpsc::unbounded_channel();
+                let handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = soniox::run_realtime(
+                        api_key,
+                        language_hints,
+                        preferred_language,
+                        no_translation_languages,
+                        sample_rate,
+                        rx,
+                        handle.clone(),
+                    )
+                    .await
+                    {
+                        soniox::emit_realtime_error(&handle, error);
+                    }
+                });
+                tx
+            },
+        );
         let live_started = live_tx.is_some();
 
         let output_for_thread = output.clone();
@@ -545,9 +554,12 @@ fn start_recording_impl(
         .clone();
     let requested = input_device.or(config.selected_input_device.clone());
     app_state.reset_live_transcript(config.live_transcription)?;
-    let live = config
-        .live_transcription
-        .then_some((api_key, config.language_hints.clone()));
+    let live = config.live_transcription.then_some((
+        api_key,
+        config.language_hints.clone(),
+        config.preferred_language.clone(),
+        config.no_translation_languages.clone(),
+    ));
     let started = manager.start(requested.as_deref(), live, app_handle.clone())?;
     let _ = app_handle.emit("recording:started", started.clone());
     Ok(started)
@@ -1944,11 +1956,17 @@ fn get_preferences(app_state: State<AppState>) -> Result<AppConfig, String> {
 }
 
 #[tauri::command]
+fn list_translation_languages() -> Vec<soniox::TranslationLanguage> {
+    soniox::supported_translation_languages()
+}
+
+#[tauri::command]
 fn save_preferences(
     selected_input_device: Option<String>,
     language_hints: Vec<String>,
     live_transcription: bool,
     openai_model: String,
+    preferred_language: String,
     no_translation_languages: Vec<String>,
     app_state: State<AppState>,
 ) -> Result<(), String> {
@@ -1961,21 +1979,39 @@ fn save_preferences(
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
-    let mut excluded_languages = no_translation_languages
-        .into_iter()
-        .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty() && value != "en")
-        .collect::<Vec<_>>();
-    excluded_languages.sort();
-    excluded_languages.dedup();
     let mut config = app_state
         .config
         .lock()
         .map_err(|_| "Configuration lock poisoned")?;
+    let requested_preferred = preferred_language
+        .trim()
+        .to_ascii_lowercase()
+        .replace('_', "-")
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let preferred_language = match soniox::normalize_translation_language(&requested_preferred) {
+        Some(language) => language,
+        None if !requested_preferred.is_empty()
+            && requested_preferred == config.preferred_language =>
+        {
+            requested_preferred
+        }
+        None => return Err("Choose a supported preferred language".into()),
+    };
+    let mut excluded_languages = no_translation_languages
+        .into_iter()
+        .filter_map(|value| soniox::normalize_translation_language(&value))
+        .filter(|value| value != &preferred_language)
+        .collect::<Vec<_>>();
+    excluded_languages.sort();
+    excluded_languages.dedup();
     config.selected_input_device = selected_input_device.filter(|value| !value.trim().is_empty());
     config.language_hints = normalized_hints;
     config.live_transcription = live_transcription;
     config.openai_model = openai_model.to_string();
+    config.preferred_language = preferred_language;
     config.no_translation_languages = excluded_languages;
     config.save(&app_state.config_path)
 }
@@ -2123,7 +2159,7 @@ fn delete_session(session_id: String, app_state: State<AppState>) -> Result<usiz
     db.delete_session(&session_id)
 }
 
-fn recap_snapshot(db: &Db, config: &AppConfig, session_id: &str) -> Result<RecapSnapshot, String> {
+fn recap_snapshot(db: &Db, session_id: &str) -> Result<RecapSnapshot, String> {
     let session = db
         .list_sessions()?
         .into_iter()
@@ -2176,11 +2212,7 @@ fn recap_snapshot(db: &Db, config: &AppConfig, session_id: &str) -> Result<Recap
         mime_type: &agenda.mime_type,
         content: &agenda.content,
     });
-    let source_fingerprint = recap::source_fingerprint(
-        &segments,
-        agenda_fingerprint,
-        &config.no_translation_languages,
-    )?;
+    let source_fingerprint = recap::source_fingerprint(&segments, agenda_fingerprint)?;
     Ok(RecapSnapshot {
         segments,
         agenda,
@@ -2191,13 +2223,34 @@ fn recap_snapshot(db: &Db, config: &AppConfig, session_id: &str) -> Result<Recap
 
 fn recap_state_view(app_state: &AppState, session_id: &str) -> Result<RecapStateView, String> {
     let db = app_state.db_handle()?;
-    let config = app_state
-        .config
-        .lock()
-        .map_err(|_| "Configuration lock poisoned".to_string())?
-        .clone();
-    let snapshot = recap_snapshot(&db, &config, session_id)?;
-    let recap = db.load_recap(session_id)?;
+    let snapshot = recap_snapshot(&db, session_id)?;
+    let mut recap = db.load_recap(session_id)?;
+    if let Some(saved) = recap.as_mut() {
+        if saved.source_fingerprint != snapshot.source_fingerprint
+            && saved.schema_version != recap::SCHEMA_VERSION
+        {
+            let config = app_state
+                .config
+                .lock()
+                .map_err(|_| "Configuration lock poisoned".to_string())?
+                .clone();
+            let agenda_fingerprint = snapshot.agenda.as_ref().map(|agenda| AgendaFingerprint {
+                source_kind: &agenda.source_kind,
+                filename: &agenda.filename,
+                mime_type: &agenda.mime_type,
+                content: &agenda.content,
+            });
+            let legacy_fingerprint = recap::legacy_source_fingerprint(
+                &snapshot.segments,
+                agenda_fingerprint,
+                &config.no_translation_languages,
+            )?;
+            if saved.source_fingerprint == legacy_fingerprint {
+                db.update_recap_source_fingerprint(session_id, &snapshot.source_fingerprint)?;
+                saved.source_fingerprint = snapshot.source_fingerprint.clone();
+            }
+        }
+    }
     let stale = recap
         .as_ref()
         .map(|recap| recap.source_fingerprint != snapshot.source_fingerprint)
@@ -2362,7 +2415,7 @@ async fn generate_recap_inner(
         return Err("Configure an LLM model in Settings before creating a recap".into());
     }
     let api_key = app_state.load_openai_key()?;
-    let snapshot = recap_snapshot(&db, &config, session_id)?;
+    let snapshot = recap_snapshot(&db, session_id)?;
     if !allow_unresolved && !snapshot.unresolved_profiles.is_empty() {
         return Err(format!(
             "Name or assign {} unresolved voice profile{} before recapping, or explicitly choose Recap anyway",
@@ -2386,6 +2439,7 @@ async fn generate_recap_inner(
             model: &model,
             segments: &snapshot.segments,
             agenda: snapshot.agenda.as_ref(),
+            preferred_language: &config.preferred_language,
             no_translation_languages: &config.no_translation_languages,
         },
         |stage, detail| emit_recap_progress(app_handle, session_id, stage, detail),
@@ -2406,22 +2460,17 @@ async fn generate_recap_inner(
         "validate",
         "Validating structured recap",
     );
-    let current_config = app_state
-        .config
-        .lock()
-        .map_err(|_| "Configuration lock poisoned".to_string())?
-        .clone();
-    let current_snapshot = recap_snapshot(&db, &current_config, session_id)?;
+    let current_snapshot = recap_snapshot(&db, session_id)?;
     if current_snapshot.source_fingerprint != snapshot.source_fingerprint {
         return Err(
-            "The transcript, speakers, agenda, or translation policy changed while the LLM provider was working. Nothing was replaced; run Recap again."
+            "The transcript, speakers, or agenda changed while the LLM provider was working. Nothing was replaced; run Recap again."
                 .into(),
         );
     }
     emit_recap_progress(app_handle, session_id, "save", "Saving recap locally");
     db.save_recap_and_title(RecapSave {
         session_id,
-        title: &response.payload.meeting_title_english,
+        title: &response.payload.meeting_title,
         model: &model,
         prompt_version: recap::PROMPT_VERSION,
         schema_version: recap::SCHEMA_VERSION,
@@ -2680,6 +2729,7 @@ fn main() {
             delete_openai_key,
             openai_key_status,
             get_preferences,
+            list_translation_languages,
             save_preferences,
             complete_onboarding,
             unlock_db,

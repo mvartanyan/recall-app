@@ -48,8 +48,13 @@ export function parseLanguageHints(value) {
     .filter((language) => language && !seen.has(language) && seen.add(language));
 }
 
-export function parseNoTranslationLanguages(value) {
-  return parseLanguageHints(value).filter((language) => language !== "en");
+export function normalizePreferredLanguage(value, fallback = "en") {
+  return parseLanguageHints(value)[0] || fallback;
+}
+
+export function parseNoTranslationLanguages(value, preferredLanguage = "en") {
+  const preferred = normalizePreferredLanguage(preferredLanguage);
+  return parseLanguageHints(value).filter((language) => language !== preferred);
 }
 
 export function recapTabAvailability(recapState) {
@@ -91,7 +96,11 @@ export function buildTranslationPlan(text, annotations) {
     if (index > cursor) chunks.push({ source: source.slice(cursor, index), translation: null });
     chunks.push({
       source: excerpt,
-      translation: String(candidate.annotation.english_translation || ""),
+      translation: String(
+        candidate.annotation.translated_text ||
+          candidate.annotation.english_translation ||
+          "",
+      ),
       language: String(candidate.annotation.language || ""),
     });
     cursor = index + excerpt.length;
@@ -114,7 +123,7 @@ export function translatedSegmentText(text, annotations) {
     rendered +=
       (rendered ? "\n" : "") +
       "(TRANSLATION: " +
-      String(fallback.english_translation || "") +
+      String(fallback.translated_text || fallback.english_translation || "") +
       ")";
   }
   return rendered;
@@ -142,6 +151,12 @@ export function groupVoiceFilters(speakers) {
   for (const speaker of speakers || []) {
     if (!(Number(speaker.conversation_count) > 0)) continue;
     const label = String(speaker.label || "Unnamed voice").trim() || "Unnamed voice";
+    if (
+      isProvisionalLabel(label) ||
+      /^(?:unnamed voice|unknown speaker)$/i.test(label)
+    ) {
+      continue;
+    }
     const key = label.toLocaleLowerCase();
     const existing = groups.get(key);
     if (existing) {
@@ -176,13 +191,14 @@ export function processingRunIds(sessions) {
 
 export function contentMode({
   recording = false,
+  recordingViewSelected = recording,
   queueing = false,
   processingCount = 0,
   selectedSessionId = null,
 } = {}) {
-  if (recording) return "recording";
-  if (queueing) return "processing";
+  if (recording && recordingViewSelected) return "recording";
   if (selectedSessionId) return "conversation";
+  if (queueing) return "processing";
   if (Number(processingCount) > 0) return "processing";
   return "empty";
 }

@@ -18,12 +18,15 @@
     "audit:secrets": "node scripts/audit_secrets.mjs",
     "check:ui": "node --check src/main.js",
     "test": "node --test src/ui-helpers.test.mjs tests/ui-contract.test.mjs",
+    "test:e2e": "playwright test",
+    "test:all": "npm test && npm run test:e2e",
     "lint": "npm run check:ui"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.61.1",
     "@tauri-apps/cli": "^2.0.0"
   }
 }

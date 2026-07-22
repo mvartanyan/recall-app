@@ -39,7 +39,14 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Use the same transparent frontal-brain-with-headset identity mark in the
   macOS Dock and the in-app sidebar; the sidebar mark spans the combined height
   of the product name and subtitle.
-- Stream provisional live captions through Soniox stt-rt-v5.
+- Stream provisional original-language captions through Soniox stt-rt-v5 and,
+  when useful, show a separate live translation in the user's preferred
+  language. Speech already in the preferred language or an explicitly excluded
+  language is not translated on screen.
+- Keep original live captions working when a previously saved target is no
+  longer supported by the active STT adapter. Settings preserves the unavailable
+  value for correction and Activity reports the omitted translation; Recall
+  does not silently choose another target.
 - Run higher-quality final transcription through Soniox stt-async-v5.
 - Enable speaker diarization, language identification, and code-switching-friendly language hints.
 - Merge adjacent interventions from the same diarized speaker.
@@ -60,9 +67,10 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Keep both voice patterns or replace an old pattern when assigning a changed voice.
 - Show only voices attributed in the selected conversation in the right pane,
   while keeping every profile manageable in a separate **Voice Library**.
-- Filter historical conversations by a selected named or provisional voice.
-  Duplicate profiles with the same display name appear once, alphabetically,
-  and the filter includes conversations attached to any of those profile IDs.
+- Filter historical conversations by a named person. Duplicate profiles with
+  the same display name appear once, alphabetically, and the filter includes
+  conversations attached to any of those profile IDs. Provisional `VOICE<n>`
+  and Unknown labels stay out of this people-oriented filter.
 - Delete profiles and conversations. Conversation deletion transactionally
   removes orphan unnamed `VOICE<n>` profiles, samples, and voiceprints, while
   preserving named people and provisional voices referenced by another
@@ -78,10 +86,13 @@ Recall stores its archive locally. During transcription, it sends audio directly
   Status stays with the affected conversation; only conflicting changes to
   that conversation are disabled, and different conversations may be recapped
   concurrently.
-- Replace the previous transcript with a dedicated live-recording surface while
-  capturing, then create a durable draft conversation from the live captions
-  before final STT starts. Active and failed jobs remain in the conversation
-  list with persistent status, exact errors, and retry controls.
+- Add a synthetic **Current recording** row while capture is active. It opens
+  the live-caption surface, but the user can navigate to any historical
+  conversation and work there without stopping the recording. Stopping or
+  finishing background processing does not pull focus away from the view the
+  user selected. A durable draft conversation is created from the live captions
+  before final STT starts; active and failed jobs remain in the list with
+  persistent status, exact errors, and retry controls.
 - Keep every stopped WAV in a private app-owned recovery directory until the
   final transcript transaction commits. Interrupted jobs become retryable after
   restart, and an orphan WAV from a crash between file persistence and database
@@ -103,25 +114,30 @@ Recall stores its archive locally. During transcription, it sends audio directly
   below 50 MB are retained in their original form.
 - Review unresolved participants before recapping, with an explicit
   **Recap anyway** override for meetings that cannot be fully attributed.
-- Generate an English meeting title, executive summary, sectioned full summary,
+- Generate a meeting title, executive summary, sectioned full summary,
   participant commitments, actions already reported as taken, and
   point-by-point agenda coverage through an explicit native OpenAI Responses
-  API recap run. The holistic meeting analysis is separate from bounded
-  per-intervention translation batches, so long meetings do not require one
-  ever-growing structured response.
-- View generated material in the meeting's original/dominant language or in
-  English. Every intervention receives one validated translation decision;
-  applicable non-English interventions show a complete English rendering while
-  English and configured exclusions are removed only after coverage validation.
+  API recap run in the user's preferred language. The holistic meeting analysis
+  is separate from bounded per-intervention translation batches, so long
+  meetings do not require one ever-growing structured response.
+- View generated material in the meeting's original/dominant language or in the
+  preferred language recorded with that recap. Every intervention receives one
+  validated translation decision; applicable interventions show a complete
+  preferred-language rendering while preferred-language and configured
+  exclusions are removed only after coverage validation.
 - Let the editable meeting title use all header space before the action buttons,
   wrap without a hard line limit, and grow the header naturally. OpenAI receives
   a soft instruction to keep generated titles within two normal desktop lines.
 - Keep summary/action evidence IDs as internal factuality metadata. Generated
   views and clipboard exports omit them.
 - Copy the transcript or generated material as plain text or Markdown.
-- Mark a recap stale after transcript, speaker, agenda, or translation-policy
-  changes; hide stale inline translations and preserve the last good recap
-  until a replacement validates and saves successfully.
+- Mark a recap stale after transcript, speaker, or agenda changes; hide stale
+  inline translations and preserve the last good recap until a replacement
+  validates and saves successfully. A later settings change does not relabel or
+  invalidate a recap already saved with its target language.
+- Read existing English-specific recap payloads as English-target recaps. After
+  validating the old content fingerprint, Recall upgrades only their fingerprint
+  metadata; it does not rewrite their stored generated payload.
 
 Recall never generates a recap automatically.
 
@@ -179,8 +195,11 @@ After launching from source:
 4. Adjust likely languages if needed. The defaults are en, fr, de, es, ru; these are hints, not a restriction on code-switching.
 5. Choose whether to enable live captions. They may increase STT charges because
    final transcription still runs after recording.
-6. To use recaps, save an OpenAI key, choose the model, and optionally list
-   source-language codes that should not receive inline English translations.
+6. Choose your preferred language. Recall uses it for live translation and for
+   translations in future on-demand recaps. It is automatically excluded from
+   the no-translation list.
+7. To use recaps, save an OpenAI key, choose the model, and optionally list
+   other source-language codes that should not receive translations.
 
 Configured Soniox/OpenAI status badges stay hidden. A missing key is shown as
 an actionable warning instead of consuming permanent topbar space.
@@ -200,11 +219,17 @@ From app/:
 ~~~sh
 npm ci
 npm test
+npm run test:e2e
 npm run lint
 npm run audit:licenses
 npm run audit:secrets
 npm run dev
 ~~~
+
+The end-to-end suite serves the bundled desktop assets with a mocked Tauri
+bridge and uses the installed Google Chrome. It verifies navigation and UI
+state without launching Recall, opening the microphone, reading the local
+archive, or requiring provider keys.
 
 Rust checks:
 
@@ -377,10 +402,11 @@ migration and is never overwritten.
 ## Known limitations
 
 - The user confirmed visible microphone-to-native live captions after the
-  Rustls and event-plus-snapshot fixes. The new manual-scroll/follow control,
-  Voice Library modal, history filter, stacked intervention layout, and
-  conversation cleanup have automated coverage and still need one native visual
-  smoke test.
+  Rustls and event-plus-snapshot fixes. The manual-scroll/follow control, Voice
+  Library modal, named-person history filter, selectable **Current recording**
+  view, preferred-language settings, translated-caption stream, stacked
+  intervention layout, and conversation cleanup have automated coverage and
+  still need one native visual smoke test.
 - Live speaker labels are provisional and may shift; final async diarization is authoritative.
 - The v3 clean-window, named-only, and unique-claim voice policy has model,
   unit, and migration coverage but still needs a real one-person re-enrolment

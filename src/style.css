@@ -248,6 +248,18 @@ button:disabled {
   box-shadow: inset 3px 0 #65b89d;
 }
 
+.session-item.current-recording strong::before {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 0 4px rgba(207, 69, 68, 0.16);
+  content: "";
+  vertical-align: 1px;
+}
+
 .session-item.processing strong::after,
 .session-item.failed strong::after,
 .session-item.recapping strong::after,
@@ -583,6 +595,47 @@ button:disabled {
   margin: 28px 0 18px;
 }
 
+.live-caption-streams {
+  display: grid;
+  width: 100%;
+  min-height: 0;
+  gap: 18px;
+  grid-auto-rows: minmax(0, 1fr);
+}
+
+.live-caption-stream {
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.live-caption-stream[hidden] {
+  display: none;
+}
+
+.live-caption-stream.translated {
+  padding-top: 16px;
+  border-top: 1px solid #cfe3dc;
+}
+
+.live-caption-label {
+  margin-bottom: 8px;
+  color: var(--brand);
+  font-size: 12px;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.live-translation-warning {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 13px;
+}
+
 .live-transcript {
   min-height: 180px;
   max-height: 310px;
@@ -633,6 +686,10 @@ body.recording-active .live-transcript-frame {
   display: flex;
   flex: 1;
   min-height: 0;
+}
+
+body.recording-active .live-caption-streams {
+  flex: 1;
 }
 
 body.recording-active .live-transcript {
@@ -1978,6 +2035,10 @@ body.recording-active .live-transcript {
   width: 100%;
   padding-top: 16px;
   border-top: 1px solid var(--line);
+}
+
+.recap-settings-grid .preferred-language-setting {
+  grid-column: 1 / -1;
 }
 
 .recap-settings-grid {

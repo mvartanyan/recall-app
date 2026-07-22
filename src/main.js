@@ -9,6 +9,7 @@ import {
   isNearScrollBottom,
   isProvisionalLabel,
   isSessionProcessing,
+  normalizePreferredLanguage,
   parseLanguageHints,
   parseNoTranslationLanguages,
   processingRunIds,
@@ -31,6 +32,10 @@ const elements = {
   livePanel: document.getElementById("livePanel"),
   liveStatus: document.getElementById("liveStatus"),
   liveTranscript: document.getElementById("liveTranscript"),
+  liveTranslationSection: document.getElementById("liveTranslationSection"),
+  liveTranslationLabel: document.getElementById("liveTranslationLabel"),
+  liveTranslatedTranscript: document.getElementById("liveTranslatedTranscript"),
+  liveTranslationWarning: document.getElementById("liveTranslationWarning"),
   jumpToLiveButton: document.getElementById("jumpToLiveButton"),
   sessionsList: document.getElementById("sessionsList"),
   conversationSearch: document.getElementById("conversationSearch"),
@@ -106,6 +111,7 @@ const elements = {
   openaiModel: document.getElementById("openaiModel"),
   inputDevice: document.getElementById("inputDevice"),
   languageHints: document.getElementById("languageHints"),
+  preferredLanguage: document.getElementById("preferredLanguage"),
   noTranslationLanguages: document.getElementById("noTranslationLanguages"),
   liveTranscription: document.getElementById("liveTranscription"),
   settingsFeedback: document.getElementById("settingsFeedback"),
@@ -161,6 +167,10 @@ const state = {
   recordingStartedAt: null,
   recordingTimer: null,
   recordingSource: null,
+  liveWorkspaceSelected: false,
+  navigationRevision: 0,
+  openQueuedDraft: false,
+  openQueuedDraftRevision: null,
   activeRuns: new Set(),
   queueingProcessing: false,
   processingDetail: "Preparing final transcription…",
@@ -175,6 +185,7 @@ const state = {
   sessionLoadSequence: 0,
   lastLiveStatus: null,
   lastLiveSignature: null,
+  lastLiveTranslationWarning: null,
   liveHasText: false,
   liveEnabledForRecording: false,
   liveFollow: true,
@@ -190,6 +201,7 @@ const state = {
   recapJobs: new Map(),
   translationWarnings: new Set(),
   onboardingAcknowledgedThisLaunch: false,
+  translationLanguages: [],
 };
 
 function errorText(error) {
@@ -450,6 +462,7 @@ function renderProcessingRecovery(session) {
 function updateContentVisibility() {
   const mode = contentMode({
     recording: state.recording,
+    recordingViewSelected: state.liveWorkspaceSelected,
     queueing: state.queueingProcessing,
     processingCount: state.activeRuns.size,
     selectedSessionId: state.selectedSessionId,
@@ -534,9 +547,18 @@ function setProcessingDetail(detail) {
   updateContentVisibility();
 }
 
+function translationLanguageName(code) {
+  const normalized = normalizePreferredLanguage(code);
+  const language = state.translationLanguages.find(
+    (candidate) => candidate.code === normalized,
+  );
+  return language ? language.name : normalized.toUpperCase();
+}
+
 function scrollLiveToLatest() {
   window.requestAnimationFrame(() => {
     elements.liveTranscript.scrollTop = elements.liveTranscript.scrollHeight;
+    elements.liveTranslatedTranscript.scrollTop = elements.liveTranslatedTranscript.scrollHeight;
   });
 }
 
@@ -546,8 +568,8 @@ function setLiveFollow(following, scroll = true) {
   if (state.liveFollow && scroll) scrollLiveToLatest();
 }
 
-function handleLiveScroll() {
-  const following = isNearScrollBottom(elements.liveTranscript);
+function handleLiveScroll(event) {
+  const following = isNearScrollBottom(event?.currentTarget || elements.liveTranscript);
   if (following !== state.liveFollow) setLiveFollow(following, false);
 }
 
@@ -560,11 +582,21 @@ function setRecordingUi(recording, started) {
   elements.emptyRecordButton.disabled = recording;
   if (recording) {
     if (!wasRecording) {
+      state.navigationRevision += 1;
+      state.liveWorkspaceSelected = true;
+      state.openQueuedDraft = false;
+      state.openQueuedDraftRevision = null;
       state.lastLiveStatus = null;
       state.lastLiveSignature = null;
+      state.lastLiveTranslationWarning = null;
       state.liveHasText = false;
       state.livePollErrorLogged = false;
       setLiveFollow(true);
+      elements.liveTranslationSection.hidden = true;
+      elements.liveTranslatedTranscript.textContent = "";
+      elements.liveTranslationWarning.hidden = true;
+      elements.liveTranslationWarning.textContent = "";
+      stopVoicePreview();
     }
     if (!state.recordingStartedAt) state.recordingStartedAt = Date.now();
     if (!state.recordingTimer) {
@@ -582,6 +614,14 @@ function setRecordingUi(recording, started) {
     }
     if (liveEnabled) startLivePolling();
   } else {
+    if (wasRecording && state.liveWorkspaceSelected) {
+      state.openQueuedDraft = true;
+      state.openQueuedDraftRevision = state.navigationRevision;
+      state.liveWorkspaceSelected = false;
+      state.selectedSessionId = null;
+      state.selectedSegments = [];
+      state.recapState = null;
+    }
     if (state.recordingTimer) window.clearInterval(state.recordingTimer);
     state.recordingTimer = null;
     state.recordingStartedAt = null;
@@ -593,6 +633,7 @@ function setRecordingUi(recording, started) {
   }
   renderSpeakers();
   renderVoiceLibrary();
+  renderSessions();
   updateContentVisibility();
 }
 
@@ -604,14 +645,29 @@ function updateRecordingTimer() {
   const seconds = total % 60;
   elements.recordingTimer.textContent =
     String(minutes).padStart(2, "0") + ":" + String(seconds).padStart(2, "0");
+  const sidebarTimer = elements.sessionsList.querySelector("[data-current-recording-meta]");
+  if (sidebarTimer) sidebarTimer.textContent = "Recording · " + elements.recordingTimer.textContent;
 }
 
 function handleLiveTranscript(payload) {
   if (!payload) return;
   const status = String(payload.status || "Live");
   const text = String(payload.text || "").trim();
+  const translatedText = String(payload.translated_text || "").trim();
+  const targetLanguage = String(
+    payload.target_language || state.preferences?.preferred_language || "en",
+  );
+  const translationWarning = String(payload.translation_warning || "").trim();
   const error = payload.error ? String(payload.error) : "";
-  const signature = JSON.stringify([status, text, Boolean(payload.finished), error]);
+  const signature = JSON.stringify([
+    status,
+    text,
+    translatedText,
+    targetLanguage,
+    translationWarning,
+    Boolean(payload.finished),
+    error,
+  ]);
   if (signature === state.lastLiveSignature) return;
   state.lastLiveSignature = signature;
 
@@ -635,6 +691,27 @@ function handleLiveTranscript(payload) {
   } else if (status === "Live captions connected" || status === "Live") {
     elements.liveTranscript.textContent = "Listening for speech…";
     if (state.liveFollow) scrollLiveToLatest();
+  }
+  if (translatedText) {
+    const previousTranslationScrollTop = elements.liveTranslatedTranscript.scrollTop;
+    elements.liveTranslationLabel.textContent =
+      "Translation · " + translationLanguageName(targetLanguage);
+    elements.liveTranslatedTranscript.textContent = translatedText;
+    elements.liveTranslationSection.hidden = false;
+    if (state.liveFollow) {
+      scrollLiveToLatest();
+    } else {
+      elements.liveTranslatedTranscript.scrollTop = previousTranslationScrollTop;
+    }
+  }
+  elements.liveTranslationWarning.hidden = !translationWarning;
+  elements.liveTranslationWarning.textContent = translationWarning;
+  if (
+    translationWarning &&
+    translationWarning !== state.lastLiveTranslationWarning
+  ) {
+    state.lastLiveTranslationWarning = translationWarning;
+    addActivity("Live translation: " + translationWarning, "error");
   }
   if (error) {
     addActivity("Live transcription error: " + error, "error");
@@ -685,6 +762,7 @@ async function startRecording() {
   elements.recordButton.disabled = true;
   elements.emptyRecordButton.disabled = true;
   state.queueingProcessing = false;
+  stopVoicePreview();
   addActivity("Starting a new recording");
   try {
     const inputDevice =
@@ -727,15 +805,28 @@ async function stopRecording() {
     state.queueingProcessing = false;
     addActivity("[" + runId.slice(0, 8) + "] Final transcription queued");
     setProcessingDetail("Uploading the retained recording to the STT provider…");
-    const shouldOpenDraft = !state.recording;
-    await loadSessions(shouldOpenDraft ? sessionId : undefined);
+    const shouldOpenDraft =
+      state.openQueuedDraft &&
+      state.openQueuedDraftRevision === state.navigationRevision &&
+      !state.recording;
+    await loadSessions();
     const stored = state.sessions.find((session) => session.id === sessionId);
     if (stored && ["queued", "processing"].includes(stored.processing_status)) {
       trackRun(runId);
     } else {
       finishRun(runId);
     }
-    if (sessionId && shouldOpenDraft && !state.recording) await selectSession(sessionId);
+    if (
+      sessionId &&
+      shouldOpenDraft &&
+      state.openQueuedDraft &&
+      state.openQueuedDraftRevision === state.navigationRevision &&
+      !state.recording
+    ) {
+      state.openQueuedDraft = false;
+      state.openQueuedDraftRevision = null;
+      await selectSession(sessionId, { userInitiated: false });
+    }
   } catch (error) {
     state.queueingProcessing = false;
     const message = errorText(error);
@@ -852,8 +943,9 @@ async function handleProgressEvent(event) {
     if (
       sessionId &&
       !state.recording &&
+      !state.liveWorkspaceSelected &&
       state.selectedSessionId === selectedBeforeRefresh &&
-      (selectedBeforeRefresh === sessionId || !selectedBeforeRefresh)
+      selectedBeforeRefresh === sessionId
     ) {
       await selectSession(sessionId);
     }
@@ -869,8 +961,9 @@ async function handleProgressEvent(event) {
     if (
       failedSession &&
       !state.recording &&
+      !state.liveWorkspaceSelected &&
       state.selectedSessionId === selectedBeforeRefresh &&
-      (!selectedBeforeRefresh || selectedBeforeRefresh === failedSession.id)
+      selectedBeforeRefresh === failedSession.id
     ) {
       await selectSession(failedSession.id);
     }
@@ -917,15 +1010,12 @@ function sessionDate(session) {
   });
 }
 
-async function loadSessions(preferredId) {
+async function loadSessions() {
   try {
     state.sessions = await invoke("list_sessions");
     reconcileTrackedRuns(state.sessions);
     renderSessions();
-    if (preferredId && state.sessions.some((session) => session.id === preferredId)) {
-      state.selectedSessionId = preferredId;
-      renderSessions();
-    } else if (
+    if (
       state.selectedSessionId &&
       !state.sessions.some((session) => session.id === state.selectedSessionId)
     ) {
@@ -943,7 +1033,23 @@ function renderSessions() {
   const query = elements.conversationSearch.value.trim().toLowerCase();
   const filtered = filterSessions(state.sessions, query, state.voiceFilteredSessionIds);
   elements.sessionsList.replaceChildren();
+  if (state.recording) {
+    const current = document.createElement("button");
+    current.type = "button";
+    current.className =
+      "session-item current-recording" + (state.liveWorkspaceSelected ? " selected" : "");
+    current.dataset.currentRecording = "true";
+    const title = document.createElement("strong");
+    title.textContent = "Current recording";
+    const meta = document.createElement("span");
+    meta.dataset.currentRecordingMeta = "true";
+    meta.textContent = "Recording · " + elements.recordingTimer.textContent;
+    current.append(title, meta);
+    current.addEventListener("click", selectCurrentRecording);
+    elements.sessionsList.append(current);
+  }
   if (!filtered.length) {
+    if (state.recording) return;
     const empty = document.createElement("div");
     empty.className = "sidebar-empty";
     empty.textContent =
@@ -957,7 +1063,8 @@ function renderSessions() {
     const button = document.createElement("button");
     button.type = "button";
     button.className =
-      "session-item" + (session.id === state.selectedSessionId ? " selected" : "");
+      "session-item" +
+      (!state.liveWorkspaceSelected && session.id === state.selectedSessionId ? " selected" : "");
     if (isSessionProcessing(session)) {
       button.classList.add("processing");
     } else if (session.processing_status === "failed") {
@@ -982,9 +1089,25 @@ function renderSessions() {
   }
 }
 
-async function selectSession(sessionId) {
+function selectCurrentRecording() {
+  if (!state.recording) return;
+  state.navigationRevision += 1;
+  state.liveWorkspaceSelected = true;
+  state.openQueuedDraft = false;
+  state.openQueuedDraftRevision = null;
+  state.sessionLoadSequence += 1;
+  renderSessions();
+  renderSpeakers();
+  updateContentVisibility();
+}
+
+async function selectSession(sessionId, { userInitiated = true } = {}) {
   const session = state.sessions.find((candidate) => candidate.id === sessionId);
   if (!session) return;
+  if (userInitiated) state.navigationRevision += 1;
+  state.liveWorkspaceSelected = false;
+  state.openQueuedDraft = false;
+  state.openQueuedDraftRevision = null;
   const sequence = ++state.sessionLoadSequence;
   state.selectedSessionId = sessionId;
   state.selectedSegments = [];
@@ -1082,7 +1205,8 @@ function selectRecapTab(tab) {
 
 function localized(value) {
   if (!value) return "";
-  return String(value[state.generatedLanguage] || value.english || value.original || "");
+  if (state.generatedLanguage === "original") return String(value.original || "");
+  return String(value.translated || value.english || value.original || "");
 }
 
 function evidenceLabel(ids) {
@@ -1129,7 +1253,10 @@ function renderGeneratedTab() {
   );
   elements.showEnglishButton.classList.toggle(
     "selected",
-    state.generatedLanguage === "english",
+    state.generatedLanguage === "translated",
+  );
+  elements.showEnglishButton.textContent = translationLanguageName(
+    payload.target_language || "en",
   );
 
   if (tab === "executive") {
@@ -1291,7 +1418,10 @@ function renderTranscript(session) {
         for (const fallback of plan.fallbacks) {
           const translation = document.createElement("p");
           translation.className = "translation-fallback";
-          translation.textContent = "(TRANSLATION: " + fallback.english_translation + ")";
+          translation.textContent =
+            "(TRANSLATION: " +
+            (fallback.translated_text || fallback.english_translation || "") +
+            ")";
           fallbacks.append(translation);
           const warningKey =
             state.recapState.recap.generated_at + ":" + segment.id + ":" + fallback.source_excerpt;
@@ -1472,7 +1602,7 @@ async function retrySelectedProcessing() {
   addActivity("Retrying final transcription from the retained recording");
   try {
     const queued = await invoke("retry_processing", { sessionId });
-    await loadSessions(sessionId);
+    await loadSessions();
     const stored = state.sessions.find((session) => session.id === sessionId);
     if (stored && ["queued", "processing"].includes(stored.processing_status)) {
       trackRun(queued.run_id);
@@ -1488,7 +1618,7 @@ async function retrySelectedProcessing() {
     const message = errorText(error);
     addActivity("Could not retry final transcription: " + message, "error");
     showToast(message, "error");
-    await loadSessions(sessionId);
+    await loadSessions();
   } finally {
     elements.retryProcessingButton.disabled = false;
   }
@@ -1511,7 +1641,7 @@ async function discardSelectedRetainedAudio() {
   try {
     await invoke("discard_retained_audio", { sessionId });
     addActivity("Retained recording removed", "success");
-    await loadSessions(sessionId);
+    await loadSessions();
     await selectSession(sessionId);
   } catch (error) {
     const message = errorText(error);
@@ -1654,7 +1784,7 @@ function profileDate(value) {
 
 function renderSpeakers() {
   elements.speakersList.replaceChildren();
-  if (state.recording) {
+  if (state.recording && state.liveWorkspaceSelected) {
     const empty = document.createElement("div");
     empty.className = "people-empty";
     empty.textContent = "Voice profiles will appear after the recording is processed.";
@@ -1712,7 +1842,9 @@ function renderVoiceLibrary() {
     (session) => session.id === state.selectedSessionId,
   );
   const selectedSpeakerIds = new Set(
-    state.recording || state.queueingProcessing || isSessionProcessing(selectedSession)
+    (state.recording && state.liveWorkspaceSelected) ||
+      state.queueingProcessing ||
+      isSessionProcessing(selectedSession)
       ? []
       : state.selectedSegments.map((segment) => segment.speaker_id).filter(Boolean),
   );
@@ -1889,9 +2021,11 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
   const actions = document.createElement("div");
   actions.className = "speaker-actions";
   const preview = actionButton("Preview", () => previewSpeaker(speaker));
-  preview.disabled = speaker.sample_count === 0;
+  preview.disabled = speaker.sample_count === 0 || state.recording;
   preview.title =
-    speaker.sample_count === 0
+    state.recording
+      ? "Voice preview is unavailable during recording"
+      : speaker.sample_count === 0
       ? "No sample is retained after a person is named"
       : "Play the excerpt used for this voiceprint";
   actions.append(preview);
@@ -1943,9 +2077,14 @@ function actionButton(label, handler, className) {
 }
 
 async function previewSpeaker(speaker) {
+  if (state.recording) {
+    showToast("Voice preview is unavailable during recording.", "error");
+    return;
+  }
   addActivity("Loading preview for " + speaker.label);
   try {
     const samples = await invoke("get_speaker_samples", { speakerId: speaker.id });
+    if (state.recording) return;
     if (!samples.length) {
       showToast("No sample is retained for this profile.", "error");
       addActivity("No preview is retained for " + speaker.label, "error");
@@ -1954,12 +2093,27 @@ async function previewSpeaker(speaker) {
     }
     if (state.previewAudio) state.previewAudio.pause();
     state.previewAudio = new Audio("data:audio/wav;base64," + samples[0].sample_b64);
+    if (state.recording) {
+      state.previewAudio = null;
+      return;
+    }
     await state.previewAudio.play();
+    if (state.recording) {
+      stopVoicePreview();
+      return;
+    }
     addActivity("Playing voice preview for " + speaker.label, "success");
   } catch (error) {
     addActivity("Could not play voice preview: " + errorText(error), "error");
     showToast(errorText(error), "error");
   }
+}
+
+function stopVoicePreview() {
+  if (!state.previewAudio) return;
+  state.previewAudio.pause();
+  state.previewAudio.currentTime = 0;
+  state.previewAudio = null;
 }
 
 function openNameDialog(speaker) {
@@ -2415,13 +2569,15 @@ async function runRecap(allowUnresolved) {
 }
 
 async function loadSettingsData() {
-  const [status, preferences, devices] = await Promise.all([
+  const [status, preferences, devices, translationLanguages] = await Promise.all([
     invoke("app_status"),
     invoke("get_preferences"),
     invoke("list_input_devices"),
+    invoke("list_translation_languages"),
   ]);
   state.status = status;
   state.preferences = preferences;
+  state.translationLanguages = translationLanguages || [];
   setServiceStatus(status.soniox_key_configured);
   setOpenAIStatus(status.openai_key_configured);
   if (status.recording && !state.recording) {
@@ -2432,8 +2588,28 @@ async function loadSettingsData() {
     });
   }
   elements.languageHints.value = (preferences.language_hints || []).join(", ");
-  elements.noTranslationLanguages.value = (
-    preferences.no_translation_languages || []
+  elements.preferredLanguage.replaceChildren();
+  const preferredLanguage = normalizePreferredLanguage(preferences.preferred_language);
+  let preferredAvailable = false;
+  for (const language of state.translationLanguages) {
+    const option = document.createElement("option");
+    option.value = language.code;
+    option.textContent = language.name + " (" + language.code + ")";
+    option.selected = language.code === preferredLanguage;
+    if (option.selected) preferredAvailable = true;
+    elements.preferredLanguage.append(option);
+  }
+  if (!preferredAvailable) {
+    const unavailable = document.createElement("option");
+    unavailable.value = preferredLanguage;
+    unavailable.textContent = preferredLanguage.toUpperCase() + " (unavailable for live translation)";
+    unavailable.selected = true;
+    elements.preferredLanguage.prepend(unavailable);
+  }
+  elements.showEnglishButton.textContent = translationLanguageName(preferredLanguage);
+  elements.noTranslationLanguages.value = parseNoTranslationLanguages(
+    (preferences.no_translation_languages || []).join(", "),
+    preferredLanguage,
   ).join(", ");
   elements.openaiModel.value = preferences.openai_model || "gpt-5.6-terra";
   elements.liveTranscription.checked = preferences.live_transcription;
@@ -2568,8 +2744,10 @@ async function saveSettings(event) {
   event.preventDefault();
   const selectedInputDevice = elements.inputDevice.value || null;
   const languageHints = parseLanguageHints(elements.languageHints.value);
+  const preferredLanguage = normalizePreferredLanguage(elements.preferredLanguage.value);
   const noTranslationLanguages = parseNoTranslationLanguages(
     elements.noTranslationLanguages.value,
+    preferredLanguage,
   );
   const liveTranscription = elements.liveTranscription.checked;
   const openaiModel = elements.openaiModel.value.trim();
@@ -2584,6 +2762,7 @@ async function saveSettings(event) {
       languageHints,
       liveTranscription,
       openaiModel,
+      preferredLanguage,
       noTranslationLanguages,
     });
     state.preferences = {
@@ -2592,10 +2771,13 @@ async function saveSettings(event) {
       language_hints: languageHints,
       live_transcription: liveTranscription,
       openai_model: openaiModel,
+      preferred_language: preferredLanguage,
       no_translation_languages: noTranslationLanguages,
       onboarding_version: state.preferences?.onboarding_version || null,
     };
     elements.settingsFeedback.textContent = "Saved.";
+    elements.noTranslationLanguages.value = noTranslationLanguages.join(", ");
+    elements.showEnglishButton.textContent = translationLanguageName(preferredLanguage);
     elements.settingsDialog.close();
     addActivity("Recording preferences saved", "success");
     if (state.selectedSessionId) {
@@ -2681,19 +2863,31 @@ async function registerListeners() {
     const runId = queued.run_id;
     const sessionId = queued.session_id;
     if (!runId) return;
-    const shouldOpenDraft = state.queueingProcessing || !state.selectedSessionId;
+    const shouldOpenDraft =
+      state.openQueuedDraft &&
+      state.openQueuedDraftRevision === state.navigationRevision &&
+      !state.recording;
     trackRun(runId);
     state.queueingProcessing = false;
     addActivity("[" + runId.slice(0, 8) + "] Queued from the menu bar");
     setProcessingDetail("Uploading the retained recording to the STT provider…");
-    void loadSessions(sessionId).then(() => {
+    void loadSessions().then(() => {
       const stored = state.sessions.find((session) => session.id === sessionId);
       if (!stored || !["queued", "processing"].includes(stored.processing_status)) {
         finishRun(runId);
       }
-      return sessionId && shouldOpenDraft && !state.recording
-        ? selectSession(sessionId)
-        : undefined;
+      if (
+        sessionId &&
+        shouldOpenDraft &&
+        state.openQueuedDraft &&
+        state.openQueuedDraftRevision === state.navigationRevision &&
+        !state.recording
+      ) {
+        state.openQueuedDraft = false;
+        state.openQueuedDraftRevision = null;
+        return selectSession(sessionId, { userInitiated: false });
+      }
+      return undefined;
     });
   });
   await listen("recording:started", (event) => {
@@ -2727,6 +2921,9 @@ function bindInterface() {
   elements.conversationSearch.addEventListener("input", renderSessions);
   elements.conversationSpeakerFilter.addEventListener("change", applyConversationVoiceFilter);
   elements.liveTranscript.addEventListener("scroll", handleLiveScroll, { passive: true });
+  elements.liveTranslatedTranscript.addEventListener("scroll", handleLiveScroll, {
+    passive: true,
+  });
   elements.jumpToLiveButton.addEventListener("click", () => setLiveFollow(true));
   elements.voiceLibraryButton.addEventListener("click", openVoiceLibrary);
   elements.agendaButton.addEventListener("click", openAgendaDialog);
@@ -2745,7 +2942,7 @@ function bindInterface() {
     renderGeneratedTab();
   });
   elements.showEnglishButton.addEventListener("click", () => {
-    state.generatedLanguage = "english";
+    state.generatedLanguage = "translated";
     renderGeneratedTab();
   });
   elements.copyTranscriptText.addEventListener("click", () =>
@@ -2788,6 +2985,12 @@ function bindInterface() {
   elements.saveOpenAIKeyButton.addEventListener("click", saveOpenAIKey);
   elements.deleteOpenAIKeyButton.addEventListener("click", deleteOpenAIKey);
   elements.settingsForm.addEventListener("submit", saveSettings);
+  elements.preferredLanguage.addEventListener("change", () => {
+    elements.noTranslationLanguages.value = parseNoTranslationLanguages(
+      elements.noTranslationLanguages.value,
+      elements.preferredLanguage.value,
+    ).join(", ");
+  });
   elements.agendaForm.addEventListener("submit", saveAgendaText);
   elements.attachAgendaButton.addEventListener("click", chooseAgendaFile);
   elements.removeAgendaButton.addEventListener("click", removeAgenda);
@@ -2851,7 +3054,7 @@ async function initialize() {
       return;
     }
     await Promise.all([loadSpeakers(), loadSessions()]);
-    if (state.sessions.length) await selectSession(state.sessions[0].id);
+    if (state.sessions.length && !state.recording) await selectSession(state.sessions[0].id);
     updateContentVisibility();
     addActivity("Recall is ready", "success");
     scheduleInitialSetupPrompt();

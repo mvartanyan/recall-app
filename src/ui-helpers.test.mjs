@@ -12,6 +12,7 @@ import {
   isNearScrollBottom,
   isProvisionalLabel,
   isSessionProcessing,
+  normalizePreferredLanguage,
   parseLanguageHints,
   parseNoTranslationLanguages,
   processingRunIds,
@@ -28,7 +29,7 @@ test("onboarding is shown until the current copy version is acknowledged", () =>
   assert.equal(shouldShowOnboarding(ONBOARDING_VERSION), false);
 });
 
-test("workspace modes are mutually exclusive and recording takes priority", () => {
+test("the selected workspace remains usable while recording and processing continue", () => {
   assert.equal(contentMode(), "empty");
   assert.equal(contentMode({ selectedSessionId: "old" }), "conversation");
   assert.equal(
@@ -39,7 +40,16 @@ test("workspace modes are mutually exclusive and recording takes priority", () =
     contentMode({ selectedSessionId: "old", processingCount: 2, recording: true }),
     "recording",
   );
-  assert.equal(contentMode({ selectedSessionId: "old", queueing: true }), "processing");
+  assert.equal(
+    contentMode({
+      selectedSessionId: "old",
+      processingCount: 2,
+      recording: true,
+      recordingViewSelected: false,
+    }),
+    "conversation",
+  );
+  assert.equal(contentMode({ selectedSessionId: "old", queueing: true }), "conversation");
   assert.equal(contentMode({ processingCount: 1 }), "processing");
 });
 
@@ -57,8 +67,10 @@ test("language hints are normalized and deduplicated", () => {
   assert.deepEqual(parseLanguageHints("en-US, de-DE, en, ru"), ["en", "de", "ru"]);
 });
 
-test("translation exclusions normalize language codes and omit implicit English", () => {
+test("translation exclusions normalize codes and omit the preferred language", () => {
   assert.deepEqual(parseNoTranslationLanguages("EN-us, de-DE, fr, de"), ["de", "fr"]);
+  assert.deepEqual(parseNoTranslationLanguages("de-DE, fr, en", "de"), ["fr", "en"]);
+  assert.equal(normalizePreferredLanguage("DE-de"), "de");
 });
 
 test("a persisted recap always exposes its generated tabs", () => {
@@ -152,7 +164,7 @@ test("conversation filtering combines text and selected voice", () => {
   assert.deepEqual(filterSessions(sessions, "planning", new Set(["two"])), []);
 });
 
-test("voice filters collapse duplicate labels, include every profile id, and sort names", () => {
+test("voice filters collapse named people and omit provisional or unknown profiles", () => {
   assert.deepEqual(
     groupVoiceFilters([
       { id: "z", label: "Zoë", conversation_count: 1 },
@@ -161,11 +173,13 @@ test("voice filters collapse duplicate labels, include every profile id, and sor
       { id: "a2", label: "alice", conversation_count: 1 },
       { id: "v2", label: "VOICE10", conversation_count: 1 },
       { id: "v1", label: "VOICE2", conversation_count: 1 },
+      { id: "v3", label: " voice3 ", conversation_count: 1 },
+      { id: "unknown", label: "Unknown speaker", conversation_count: 1 },
+      { id: "blank", label: "   ", conversation_count: 1 },
+      { id: "unused", label: "Bob", conversation_count: 0 },
     ]),
     [
       { key: "alice", label: "Alice", speakerIds: ["a1", "a2"] },
-      { key: "voice2", label: "VOICE2", speakerIds: ["v1"] },
-      { key: "voice10", label: "VOICE10", speakerIds: ["v2"] },
       { key: "zoë", label: "Zoë", speakerIds: ["z"] },
     ],
   );

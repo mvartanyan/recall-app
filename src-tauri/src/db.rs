@@ -1410,6 +1410,26 @@ impl Db {
         }))
     }
 
+    pub fn update_recap_source_fingerprint(
+        &self,
+        session_id: &str,
+        source_fingerprint: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE session_recaps SET source_fingerprint=?1 WHERE session_id=?2",
+                params![source_fingerprint, session_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("Saved recap not found".into());
+        }
+        Ok(())
+    }
+
     pub fn save_recap_and_title(&self, recap: RecapSave<'_>) -> Result<RecapRecord, String> {
         let generated_at: DateTime<Utc> = SystemTime::now().into();
         let payload_bytes = serde_json::to_vec(recap.payload)
@@ -2038,10 +2058,11 @@ mod tests {
     fn test_recap_payload() -> RecapPayload {
         let localized = crate::recap::LocalizedText {
             original: "Summary".into(),
-            english: "Summary".into(),
+            translated: "Summary".into(),
         };
         RecapPayload {
-            meeting_title_english: "Weekly planning".into(),
+            target_language: "en".into(),
+            meeting_title: "Weekly planning".into(),
             dominant_language: "en".into(),
             executive_summary: localized.clone(),
             full_summary: vec![crate::recap::SummarySection {
@@ -2465,7 +2486,7 @@ mod tests {
                 output_tokens: 45,
             })
             .unwrap();
-        assert_eq!(recap.payload.meeting_title_english, "Weekly planning");
+        assert_eq!(recap.payload.meeting_title, "Weekly planning");
         assert_eq!(db.list_sessions().unwrap()[0].title, "Weekly planning");
         assert_eq!(
             db.load_agenda(&session).unwrap().unwrap().content,
@@ -2474,6 +2495,12 @@ mod tests {
         assert_eq!(
             db.load_recap(&session).unwrap().unwrap().source_fingerprint,
             "fingerprint"
+        );
+        db.update_recap_source_fingerprint(&session, "content-only-fingerprint")
+            .unwrap();
+        assert_eq!(
+            db.load_recap(&session).unwrap().unwrap().source_fingerprint,
+            "content-only-fingerprint"
         );
 
         db.delete_session(&session).unwrap();

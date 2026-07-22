@@ -223,9 +223,20 @@ test("live captions have event delivery plus a native polling fallback", () => {
   assert.match(javascript, /Live captions finished without receiving speech/);
 });
 
+test("live captions carry separate original and preferred-language streams", () => {
+  assert.match(html, /id="liveTranslatedTranscript"/);
+  assert.match(html, /id="liveTranslationWarning"/);
+  assert.match(rustSoniox, /"type": "one_way"/);
+  assert.match(rustSoniox, /"target_language": target_language/);
+  assert.match(rustSoniox, /translation_status\.as_deref\(\) == Some\("translation"\)/);
+  assert.match(javascript, /payload\.translated_text/);
+  assert.match(rustSoniox, /Original live captions will continue/);
+  assert.match(javascript, /Live translation: /);
+});
+
 test("live captions can pause auto-follow and jump back to the latest text", () => {
   assert.match(html, /id="jumpToLiveButton"/);
-  assert.match(javascript, /isNearScrollBottom\(elements\.liveTranscript\)/);
+  assert.match(javascript, /isNearScrollBottom\(event\?\.currentTarget \|\| elements\.liveTranscript\)/);
   assert.match(javascript, /if \(state\.liveFollow\) scrollLiveToLatest\(\)/);
   assert.match(javascript, /jumpToLiveButton\.addEventListener\("click"/);
 });
@@ -302,6 +313,20 @@ test("conversation history can be filtered by a voice profile", () => {
   assert.match(javascript, /groupVoiceFilters\(state\.speakers\)/);
   assert.match(javascript, /invoke\("list_session_ids_for_speakers"/);
   assert.match(rustMain, /fn list_session_ids_for_speakers/);
+});
+
+test("the conversation voice filter excludes provisional and unknown profiles", () => {
+  assert.match(javascript, /groupVoiceFilters\(state\.speakers\)/);
+  assert.match(javascript, /selectedStillExists/);
+  assert.match(javascript, /state\.voiceFilteredSessionIds = null/);
+});
+
+test("an active recording is a selectable sidebar workspace", () => {
+  assert.match(javascript, /dataset\.currentRecording = "true"/);
+  assert.match(javascript, /function selectCurrentRecording\(\)/);
+  assert.match(javascript, /recordingViewSelected: state\.liveWorkspaceSelected/);
+  assert.match(javascript, /state\.openQueuedDraftRevision === state\.navigationRevision/);
+  assert.match(javascript, /Voice preview is unavailable during recording/);
 });
 
 test("interventions put time and a wide speaker selector above the text", () => {
@@ -416,8 +441,10 @@ test("recaps and original agenda files use encrypted-capable local persistence",
   assert.match(rustOpenAI, /"file_data"/);
 });
 
-test("recap source changes are fingerprinted and stale translations are hidden", () => {
-  assert.match(rustRecap, /no_translation_languages/);
+test("recap content changes are fingerprinted while language preferences are regeneration-only", () => {
+  assert.match(rustRecap, /struct FingerprintInput<'a>[\s\S]*?agenda: Option<.*?>,[\s\S]*?\n}/);
+  assert.match(rustRecap, /legacy_source_fingerprint/);
+  assert.match(rustMain, /update_recap_source_fingerprint/);
   assert.match(rustRecap, /content_sha256/);
   assert.match(javascript, /state\.recapState\.stale/);
   assert.match(javascript, /if \(!state\.recapState\?\.recap \|\| state\.recapState\.stale\) return \[\]/);
@@ -451,7 +478,8 @@ test("recap and final transcription status are scoped without taking over unrela
   assert.match(javascript, /sessionRecapJob\?\.status === "running"/);
   assert.match(javascript, /recapIsRunning\(session\.id\)/);
   assert.match(javascript, /await Promise\.all\(\[loadSpeakers\(\), loadSessions\(\)\]\)/);
-  assert.match(javascript, /selectedBeforeRefresh === sessionId \|\| !selectedBeforeRefresh/);
+  assert.match(javascript, /selectedBeforeRefresh === sessionId/);
+  assert.doesNotMatch(javascript, /selectedBeforeRefresh === sessionId \|\| !selectedBeforeRefresh/);
   assert.match(rustState, /recap_in_flight: Arc<Mutex<HashSet<String>>>/);
   assert.match(rustMain, /ensure_sessions_not_recapping/);
   const runRecapBlock = javascript.slice(
@@ -506,10 +534,16 @@ test("configured services stay quiet while missing keys remain visible", () => {
 
 test("recap preferences separate Soniox hints from translation exclusions", () => {
   assert.match(rustConfig, /openai_model/);
+  assert.match(rustConfig, /preferred_language/);
   assert.match(rustConfig, /no_translation_languages/);
+  assert.match(html, /id="preferredLanguage"/);
   assert.match(html, /id="languageHints"/);
   assert.match(html, /id="noTranslationLanguages"/);
   assert.match(javascript, /parseNoTranslationLanguages/);
+  assert.match(javascript, /invoke\("list_translation_languages"\)/);
+  assert.match(rustRecap, /target_language/);
+  assert.match(rustRecap, /translated_text/);
+  assert.match(rustOpenAI, /preferred_language/);
 });
 
 test("active desktop code has no localhost API or Azure dependency", () => {
