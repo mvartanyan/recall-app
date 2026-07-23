@@ -15,9 +15,15 @@ const oldSession = {
 async function installTauriMock(page) {
   await page.addInitScript(({ session }) => {
     const listeners = new Map();
+    let jamieChoiceGate = null;
+    let releaseJamieChoice = null;
+    let jamieInspectionGate = null;
+    let releaseJamieInspection = null;
     const native = {
       recording: false,
       sessions: [session],
+      importBatches: [],
+      importedArtifacts: {},
       segments: {
         [session.id]: [
           {
@@ -28,6 +34,15 @@ async function installTauriMock(page) {
             speaker_id: "speaker-alice",
             speaker_label: "Alice",
             text: "Earlier discussion",
+          },
+          {
+            id: "segment-likely",
+            session_id: session.id,
+            start_ms: 5_000,
+            end_ms: 9_000,
+            speaker_id: "speaker-voice",
+            speaker_label: "VOICE12",
+            text: "A later contribution",
           },
         ],
       },
@@ -50,6 +65,16 @@ async function installTauriMock(page) {
         sample_count: 1,
         embedding_count: 1,
         conversation_count: 1,
+        likely_match: {
+          decision_id: "decision-likely",
+          speaker_id: "speaker-alice",
+          label: "Alice",
+          score: 0.9555,
+          runner_up_label: "Dmitrii",
+          runner_up_score: 0.9403,
+          support_count: 1,
+          reason: "Strong but ambiguous",
+        },
       },
       {
         id: "speaker-alice-duplicate",
@@ -88,6 +113,133 @@ async function installTauriMock(page) {
       unresolved_profiles: [],
       in_flight: false,
     };
+    const jamiePreview = {
+      draft: {
+        id: "aaaaaaaaaaaaaaaa",
+        source_path: "/tmp/jamie-export.txt",
+        source_sha256: "a".repeat(64),
+        importer_version: "jamie-text-v1",
+        identity_decisions: [
+          {
+            alias: "Mv",
+            action: "proposed_map",
+            target_speaker_id: "speaker-michael",
+            display_name: "Michael Vartanyan",
+          },
+          {
+            alias: "Bob Example",
+            action: "review",
+            target_speaker_id: null,
+            display_name: null,
+          },
+          {
+            alias: "Speaker 0",
+            action: "unresolved",
+            target_speaker_id: null,
+            display_name: null,
+          },
+        ],
+        excluded_meetings: [],
+        updated_at: "2026-07-23T09:01:59Z",
+      },
+      metadata: {
+        user: "Test User",
+        export_date: "2026-07-23T09:01:59Z",
+        declared_total_meetings: 2,
+        includes: ["summaries", "transcripts", "tasks"],
+        source_sha256: "a".repeat(64),
+        source_size_bytes: 25_024_004,
+      },
+      known_people: [
+        { id: "speaker-alice", label: "Alice" },
+        { id: "speaker-michael", label: "Michael Vartanyan" },
+      ],
+      meetings: [
+        {
+          source_fingerprint: "meeting-valid",
+          title: "Imported planning call",
+          started_at: "2026-07-22T12:00:00Z",
+          duration_ms: 60_000,
+          intervention_count: 2,
+          speaker_count: 2,
+          has_executive_summary: true,
+          has_full_summary: true,
+          has_tasks: true,
+          included: true,
+          already_imported: false,
+          warnings: [],
+        },
+        {
+          source_fingerprint: "meeting-empty",
+          title: "Empty source meeting",
+          started_at: "2026-07-21T12:00:00Z",
+          duration_ms: 0,
+          intervention_count: 0,
+          speaker_count: 0,
+          has_executive_summary: false,
+          has_full_summary: true,
+          has_tasks: false,
+          included: true,
+          already_imported: false,
+          warnings: [
+            {
+              code: "empty_transcript",
+              message: "The meeting has no transcript interventions.",
+              blocking: true,
+            },
+          ],
+        },
+      ],
+      identities: [
+        {
+          alias: "Bob Example",
+          generic: false,
+          intervention_count: 1,
+          meeting_count: 1,
+          excerpts: ["I will send the draft tomorrow."],
+          decision: {
+            alias: "Bob Example",
+            action: "review",
+            target_speaker_id: null,
+            display_name: null,
+          },
+        },
+        {
+          alias: "Mv",
+          generic: false,
+          intervention_count: 1,
+          meeting_count: 1,
+          excerpts: ["Let us review the plan."],
+          decision: {
+            alias: "Mv",
+            action: "proposed_map",
+            target_speaker_id: "speaker-michael",
+            display_name: "Michael Vartanyan",
+          },
+        },
+        {
+          alias: "Speaker 0",
+          generic: true,
+          intervention_count: 1,
+          meeting_count: 1,
+          excerpts: ["Generic source label."],
+          decision: {
+            alias: "Speaker 0",
+            action: "unresolved",
+            target_speaker_id: null,
+            display_name: null,
+          },
+        },
+      ],
+      archive_warnings: [],
+      validation_errors: [
+        "Bob Example: choose how this source identity should import.",
+      ],
+      ready_to_import: false,
+      included_meeting_count: 2,
+      existing_meeting_count: 0,
+      total_intervention_count: 3,
+    };
     const invoke = async (command, args = {}) => {
       switch (command) {
         case "app_status":
@@ -115,12 +267,170 @@ async function installTauriMock(page) {
           ];
         case "list_sessions":
           return structuredClone(native.sessions);
+        case "list_import_batches":
+          return structuredClone(native.importBatches);
         case "list_segments":
           return structuredClone(native.segments[args.sessionId] || []);
         case "get_recap_state":
           return structuredClone(recapState);
+        case "get_imported_session_artifact":
+          return structuredClone(native.importedArtifacts[args.sessionId] || null);
         case "list_speakers_with_stats":
           return structuredClone(speakers);
+        case "list_identity_profiles": {
+          let items = speakers.map((speaker) => ({
+            id: speaker.id,
+            label: speaker.label || "Unnamed voice",
+            created_at: speaker.created_at,
+            last_seen_at: speaker.last_seen_at,
+            sample_count: speaker.sample_count || 0,
+            active_voiceprint_count: speaker.embedding_count || 0,
+            inactive_voiceprint_count: 0,
+            conversation_count: speaker.conversation_count || 0,
+            intervention_count: Object.values(native.segments)
+              .flat()
+              .filter((segment) => segment.speaker_id === speaker.id).length,
+            provisional: /^VOICE\d+$/i.test(speaker.label || ""),
+            imported: speaker.id === "speaker-alice-duplicate",
+            duplicate_name_conflict:
+              speaker.id === "speaker-alice" ||
+              speaker.id === "speaker-alice-duplicate",
+            duplicate_name_count:
+              speaker.id === "speaker-alice" ||
+              speaker.id === "speaker-alice-duplicate"
+                ? 2
+                : 0,
+          }));
+          const search = String(args.search || "").toLowerCase();
+          if (search) {
+            items = items.filter((item) =>
+              item.label.toLowerCase().includes(search),
+            );
+          }
+          if (args.status === "named") {
+            items = items.filter((item) => !item.provisional);
+          } else if (args.status === "provisional") {
+            items = items.filter((item) => item.provisional);
+          } else if (args.status === "no_voiceprint") {
+            items = items.filter((item) => item.active_voiceprint_count === 0);
+          } else if (args.status === "conflict") {
+            items = items.filter((item) => item.duplicate_name_conflict);
+          } else if (args.status === "imported") {
+            items = items.filter((item) => item.imported);
+          }
+          items.sort((left, right) =>
+            left.label.localeCompare(right.label, undefined, {
+              sensitivity: "base",
+              numeric: true,
+            }),
+          );
+          return {
+            items: structuredClone(items),
+            total: items.length,
+            page: 1,
+            page_size: 100,
+            page_count: 1,
+          };
+        }
+        case "list_unassigned_identities":
+          return {
+            items: [
+              {
+                key: {
+                  session_id: session.id,
+                  speaker_label: "Speaker 1",
+                },
+                display_label: "Speaker 1",
+                session_title: session.title,
+                session_created_at: session.created_at,
+                intervention_count: 2,
+                first_start_ms: 10_000,
+                last_end_ms: 16_000,
+                generic: true,
+              },
+            ],
+            total: 1,
+            page: 1,
+            page_size: 100,
+            page_count: 1,
+          };
+        case "preview_identity_consolidation": {
+          const targetId = args.request.target_speaker_id;
+          const target = speakers.find((speaker) => speaker.id === targetId);
+          return {
+            target_speaker_id: targetId,
+            target_label: args.request.final_label,
+            source_profiles: [],
+            unassigned_groups: [],
+            affected_session_ids: [session.id],
+            affected_conversation_count: 1,
+            affected_intervention_count:
+              args.request.profile_ids.length + args.request.unassigned_groups.length,
+            stale_recap_count: 1,
+            active_voiceprint_count: args.request.profile_ids.length,
+            inactive_voiceprint_count: 0,
+            samples_to_delete: args.request.profile_ids.length,
+            imported_source_profile_count: 0,
+            creates_new_person: !target,
+            warnings: [
+              "1 saved recap will be marked out of date.",
+              "Temporary voice samples will be deleted for privacy.",
+            ],
+          };
+        }
+        case "consolidate_identities": {
+          const request = args.request;
+          let target = speakers.find(
+            (speaker) => speaker.id === request.target_speaker_id,
+          );
+          if (!target) {
+            target = {
+              id: "speaker-created",
+              label: request.final_label,
+              created_at: "2026-07-23T12:00:00Z",
+              last_seen_at: session.created_at,
+              sample_count: 0,
+              embedding_count: 0,
+              conversation_count: 1,
+            };
+            speakers.push(target);
+          }
+          const sourceIds = new Set(
+            request.profile_ids.filter((id) => id !== target.id),
+          );
+          for (const segments of Object.values(native.segments)) {
+            for (const segment of segments) {
+              const groupSelected = request.unassigned_groups.some(
+                (group) =>
+                  group.session_id === segment.session_id &&
+                  group.speaker_label === segment.speaker_label &&
+                  !segment.speaker_id,
+              );
+              if (sourceIds.has(segment.speaker_id) || groupSelected) {
+                segment.speaker_id = target.id;
+                segment.speaker_label = request.final_label;
+              } else if (segment.speaker_id === target.id) {
+                segment.speaker_label = request.final_label;
+              }
+            }
+          }
+          target.label = request.final_label;
+          for (let index = speakers.length - 1; index >= 0; index -= 1) {
+            if (sourceIds.has(speakers[index].id)) speakers.splice(index, 1);
+          }
+          return {
+            target_speaker_id: target.id,
+            target_label: request.final_label,
+            merged_profile_count: sourceIds.size,
+            assigned_group_count: request.unassigned_groups.length,
+            affected_conversation_count: 1,
+            affected_intervention_count: 2,
+            activated_voiceprints: sourceIds.size,
+            quarantined_voiceprints: 0,
+            deleted_samples: request.profile_ids.length,
+            backup_path: "/tmp/recall.pre-identity-merge.db",
+          };
+        }
         case "start_recording":
           native.recording = true;
           return {
@@ -152,8 +462,131 @@ async function installTauriMock(page) {
           return [];
         case "get_live_transcription":
           return null;
+        case "choose_jamie_export":
+          if (jamieChoiceGate) await jamieChoiceGate;
+          return "/tmp/jamie-export.txt";
+        case "inspect_jamie_export":
+          if (jamieInspectionGate) await jamieInspectionGate;
+          return structuredClone(jamiePreview);
+        case "resume_jamie_import":
+          return structuredClone(jamiePreview);
+        case "save_jamie_import_draft":
+          jamiePreview.draft = structuredClone(args.draft);
+          return null;
+        case "run_jamie_import": {
+          const imported = {
+            id: "session-jamie",
+            created_at: "2026-07-22T12:00:00Z",
+            title: "Imported planning call",
+            duration_ms: 60_000,
+            transcript:
+              "Michael Vartanyan: Let us review the plan.\nBob Example: I will send the draft tomorrow.",
+            processing_status: null,
+            processing_error: null,
+            processing_run_id: null,
+            recoverable_audio: false,
+          };
+          native.sessions = [native.sessions[0], imported];
+          native.segments[imported.id] = [
+            {
+              id: "segment-jamie-1",
+              session_id: imported.id,
+              start_ms: 0,
+              end_ms: 4_000,
+              speaker_id: "speaker-michael",
+              speaker_label: "Michael Vartanyan",
+              text: "Let us review the plan.",
+            },
+            {
+              id: "segment-jamie-2",
+              session_id: imported.id,
+              start_ms: 5_000,
+              end_ms: 9_000,
+              speaker_id: "speaker-bob",
+              speaker_label: "Bob Example",
+              text: "I will send the draft tomorrow.",
+            },
+          ];
+          speakers.push({
+            id: "speaker-bob",
+            label: "Bob Example",
+            created_at: "2026-07-23T10:00:00Z",
+            last_seen_at: "2026-07-22T12:00:00Z",
+            sample_count: 0,
+            embedding_count: 0,
+            conversation_count: 1,
+          });
+          native.importedArtifacts[imported.id] = {
+            session_id: imported.id,
+            source_provider: "Jamie",
+            source_meeting_sha256: "meeting-valid",
+            imported_at: "2026-07-23T10:00:00Z",
+            executive_summary: "The team reviewed the plan.",
+            full_summary: "## Planning\nThe plan was reviewed.",
+            tasks: "[ ] Bob will send the draft.",
+          };
+          native.importBatches = [
+            {
+              id: "import-jamie",
+              source_provider: "Jamie",
+              source_file_sha256: "a".repeat(64),
+              imported_at: "2026-07-23T10:00:00Z",
+              status: "imported",
+              meeting_count: 1,
+              rolled_back_at: null,
+            },
+          ];
+          return {
+            import_id: "import-jamie",
+            backup_path: "/tmp/recall.pre-jamie-import.db",
+            imported_meetings: 1,
+            already_imported_meetings: 0,
+            imported_interventions: 2,
+            created_people: 1,
+          };
+        }
+        case "rollback_jamie_import":
+          native.sessions = native.sessions.filter(
+            (candidate) => candidate.id !== "session-jamie",
+          );
+          delete native.segments["session-jamie"];
+          delete native.importedArtifacts["session-jamie"];
+          const bobIndex = speakers.findIndex(
+            (speaker) => speaker.id === "speaker-bob",
+          );
+          if (bobIndex >= 0) speakers.splice(bobIndex, 1);
+          native.importBatches[0].status = "rolled_back";
+          native.importBatches[0].rolled_back_at = "2026-07-23T11:00:00Z";
+          return {
+            import_id: args.importId,
+            backup_path: "/tmp/recall.pre-jamie-rollback.db",
+            removed_meetings: 1,
+            removed_people: 1,
+            preserved_people: 0,
+          };
         case "list_session_ids_for_speakers":
           return [session.id];
+        case "accept_voice_match_suggestion": {
+          const sourceIndex = speakers.findIndex((speaker) => speaker.id === args.sourceId);
+          const target = speakers.find((speaker) => speaker.id === args.targetId);
+          if (sourceIndex < 0 || !target) throw new Error("Suggestion is no longer current");
+          for (const segments of Object.values(native.segments)) {
+            for (const segment of segments) {
+              if (segment.speaker_id !== args.sourceId) continue;
+              segment.speaker_id = target.id;
+              segment.speaker_label = target.label;
+            }
+          }
+          speakers.splice(sourceIndex, 1);
+          native.sessions[0].transcript =
+            "Alice: Earlier discussion\nAlice: A later contribution";
+          return {
+            target_speaker_id: target.id,
+            target_label: target.label,
+            activated_voiceprints: 1,
+            quarantined_voiceprints: 0,
+          };
+        }
         case "save_preferences":
           preferences.selected_input_device = args.selectedInputDevice;
           preferences.language_hints = args.languageHints;
@@ -204,6 +637,26 @@ async function installTauriMock(page) {
     };
     window.__setMockPreferredLanguage = (language) => {
       preferences.preferred_language = language;
+    };
+    window.__deferJamieChoice = () => {
+      jamieChoiceGate = new Promise((resolve) => {
+        releaseJamieChoice = resolve;
+      });
+    };
+    window.__releaseJamieChoice = () => {
+      releaseJamieChoice?.();
+      jamieChoiceGate = null;
+      releaseJamieChoice = null;
+    };
+    window.__deferJamieInspection = () => {
+      jamieInspectionGate = new Promise((resolve) => {
+        releaseJamieInspection = resolve;
+      });
+    };
+    window.__releaseJamieInspection = () => {
+      releaseJamieInspection?.();
+      jamieInspectionGate = null;
+      releaseJamieInspection = null;
     };
   }, { session: oldSession });
 }
@@ -304,6 +757,78 @@ test("the conversation filter contains named people only", async ({ page }) => {
   await expect(filter.locator("option")).toHaveText(["All voices", "Alice"]);
 });
 
+test("People & Voices keeps cross-view selections and confirms an impact-reviewed merge", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "People & Voices" }).click();
+  const manager = page.getByRole("dialog", { name: "People & Voices" });
+  await expect(manager).toBeVisible();
+  await expect(manager.getByText(/Showing 1–4 of 4 profiles/)).toBeVisible();
+
+  await manager.getByRole("tab", { name: "Unassigned" }).click();
+  await expect(manager.getByText("Speaker 1", { exact: true })).toBeVisible();
+  await expect(manager.getByText("This conversation only", { exact: true })).toBeVisible();
+  await manager
+    .getByRole("checkbox", {
+      name: "Select Speaker 1 in Earlier planning meeting",
+    })
+    .check();
+
+  await manager.getByRole("tab", { name: "Profiles" }).click();
+  await manager
+    .locator('[data-identity-profile-id="speaker-alice"] input[type="checkbox"]')
+    .check();
+  await manager
+    .locator('[data-identity-profile-id="speaker-voice"] input[type="checkbox"]')
+    .check();
+  await expect(manager.getByText(/2 profiles and 1 unassigned group selected/)).toBeVisible();
+  await manager.getByRole("button", { name: "Merge or assign selected" }).click();
+
+  const review = page.getByRole("dialog", { name: "Merge or assign selected" });
+  await expect(review).toBeVisible();
+  await expect(review.getByLabel("Canonical person")).toHaveValue("speaker-alice");
+  await review.getByLabel("Final display name").fill("Alice Consolidated");
+  await review.getByRole("button", { name: "Review impact" }).click();
+  await expect(review.getByText(/1 saved recap will be marked out of date/)).toBeVisible();
+  await expect(review.getByText(/make and verify a local database backup/)).toBeVisible();
+  await review.getByRole("button", { name: "Confirm changes" }).click();
+
+  await expect(review).toBeHidden();
+  await expect(page.locator("#activityLog")).toContainText(
+    "People & Voices: Alice Consolidated saved across 1 conversations",
+  );
+  await expect(page.locator("#speakersList").getByText("VOICE12", { exact: true })).toHaveCount(
+    0,
+  );
+});
+
+test("an ambiguous voice suggestion survives review and can be accepted once", async ({
+  page,
+}) => {
+  const currentVoices = page.locator("#speakersList");
+  await expect(currentVoices.getByText("Likely Alice", { exact: true })).toBeVisible();
+  await expect(currentVoices.getByText(/Best match: Alice at 0\.956/)).toBeVisible();
+
+  await page.getByRole("button", { name: "Voice Library" }).click();
+  const manager = page.getByRole("dialog", { name: "People & Voices" });
+  await expect(manager.getByText("VOICE12", { exact: true })).toBeVisible();
+  await expect(manager.getByText("Provisional VOICE", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Close People and Voices" }).click();
+  await expect(currentVoices.getByText("Likely Alice", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Assign to Alice", exact: true }).click();
+
+  await expect(page.getByText("Likely Alice", { exact: true })).toHaveCount(0);
+  await expect(page.locator("#activityLog")).toContainText(
+    "Assigned voice history to Alice; 1 compatible voiceprint activated",
+  );
+  const speakerSelectors = page.locator("#segmentsList select");
+  await expect(speakerSelectors).toHaveCount(2);
+  await expect
+    .poll(() => speakerSelectors.evaluateAll((items) => items.map((item) => item.value)))
+    .toEqual(["speaker-alice", "speaker-alice"]);
+});
+
 test("preferred language is selected from provider capabilities and removed from exclusions", async ({ page }) => {
   await page.getByRole("button", { name: "Settings" }).click();
   const preferred = page.getByLabel("Preferred language");
@@ -351,4 +876,115 @@ test("an unavailable live target keeps original captions and reports the warning
   await expect(page.getByText("Speaker 1: Original speech continues", { exact: true })).toBeVisible();
   await expect(page.locator("#liveTranslationSection")).toBeHidden();
   await expect(page.locator("#activityLog")).toContainText("Original live captions will continue");
+});
+
+async function enableJamieImportUi(page) {
+  await page.addInitScript(() => {
+    window.__RECALL_ENABLE_JAMIE_IMPORT__ = true;
+  });
+  await page.reload();
+}
+
+test("Jamie import stays hidden in the release interface", async ({ page }) => {
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByRole("button", { name: "Choose export…" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Resume review" })).toHaveCount(0);
+  await expect(page.getByRole("dialog", { name: "Review Jamie import" })).toBeHidden();
+});
+
+test("Jamie archives are reviewed, imported with provenance, and rollback safely", async ({
+  page,
+}) => {
+  await enableJamieImportUi(page);
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Choose export…" }).click();
+
+  const review = page.getByRole("dialog", { name: "Review Jamie import" });
+  await expect(review).toBeVisible();
+  await expect(review.getByText("2", { exact: true }).first()).toBeVisible();
+  await expect(review.getByText(/3 review items remaining/)).toBeVisible();
+  await expect(review.getByText("Mv", { exact: true })).toBeVisible();
+  await expect(review.getByText("Bob Example", { exact: true })).toBeVisible();
+
+  await review.getByRole("button", { name: "Use source names" }).click();
+  await expect(review.getByText("No source names currently need attention.")).toBeVisible();
+  await review
+    .getByRole("button", { name: "Exclude unreadable meetings" })
+    .click();
+  await expect(review.getByText("Ready to import", { exact: true })).toBeVisible();
+
+  await review.getByRole("button", { name: "Import reviewed meetings" }).click();
+  await page.getByRole("button", { name: "Import archive" }).click();
+  await expect(page.getByRole("button", { name: /Imported planning call/ })).toBeVisible();
+
+  await page.getByRole("button", { name: /Imported planning call/ }).click();
+  await page.getByRole("tab", { name: "Imported executive summary" }).click();
+  await expect(page.getByText("The team reviewed the plan.", { exact: true })).toBeVisible();
+  await expect(page.getByText(/It was not generated by Recall/)).toBeVisible();
+  await page.getByRole("tab", { name: "Imported tasks" }).click();
+  await expect(page.getByText("[ ] Bob will send the draft.", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByText("Jamie · 1 meetings", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Roll back" }).click();
+  await page.getByRole("button", { name: "Roll back import" }).click();
+  await expect(page.getByRole("button", { name: /Imported planning call/ })).toHaveCount(0);
+  await expect(page.getByText("Jamie · 1 meetings", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Rolled back/)).toBeVisible();
+});
+
+test("the native Jamie chooser precedes a full-height parsing dialog", async ({ page }) => {
+  await enableJamieImportUi(page);
+  await page.evaluate(() => {
+    window.__deferJamieChoice();
+    window.__deferJamieInspection();
+  });
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Choose export…" }).click();
+
+  const review = page.getByRole("dialog", { name: "Review Jamie import" });
+  await expect(review).toBeHidden();
+
+  await page.evaluate(() => window.__releaseJamieChoice());
+  await expect(review).toBeVisible();
+  await expect(review.getByText("Reading the archive", { exact: true })).toBeVisible();
+  const box = await review.boundingBox();
+  expect(box?.height).toBeGreaterThan(500);
+
+  await page.evaluate(() => window.__releaseJamieInspection());
+  await expect(review.getByText("Mv", { exact: true })).toBeVisible();
+});
+
+test("Jamie aliases that collide with existing people remain visible as blockers", async ({
+  page,
+}) => {
+  await enableJamieImportUi(page);
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Choose export…" }).click();
+  const review = page.getByRole("dialog", { name: "Review Jamie import" });
+  const bob = review.locator(".jamie-identity-row").filter({ hasText: "Bob Example" });
+
+  await bob.locator(".jamie-identity-action").selectOption("create_named");
+  await bob.getByLabel("New Recall name for Bob Example").fill("Alice");
+  await expect(
+    bob.getByText(
+      "That person already exists in Recall. Map the source name to the existing person instead.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(review.getByRole("button", { name: "Import reviewed meetings" })).toBeDisabled();
+
+  const attentionOnly = review.getByRole("checkbox", {
+    name: "Needs attention only",
+  });
+  await attentionOnly.uncheck();
+  await attentionOnly.check();
+  await expect(bob).toBeVisible();
+
+  await bob.locator(".jamie-identity-action").selectOption("map_existing");
+  await bob.getByLabel("Existing person for Bob Example").selectOption("speaker-alice");
+  await expect(bob.locator(".jamie-identity-issue")).toHaveCount(0);
+  await attentionOnly.uncheck();
+  await attentionOnly.check();
+  await expect(bob).toHaveCount(0);
 });

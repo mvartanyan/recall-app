@@ -33,6 +33,7 @@ mod config;
 mod credentials;
 mod db;
 mod embedding;
+mod jamie_import;
 mod openai;
 mod recap;
 mod soniox;
@@ -41,9 +42,10 @@ mod state;
 use config::AppConfig;
 use db::{
     AgendaMetadata, AgendaRecord, Crypto, Db, RecapRecord, RecapSave, SegmentRecord, Session,
-    Speaker, StoredEmbedding,
+    Speaker, StoredEmbedding, VoiceMatchDecisionSave,
 };
 use embedding::EMBEDDING_VERSION;
+use jamie_import::{JamieImportDraft, JamieImportPreview};
 use recap::{AgendaFingerprint, RecapSourceSegment};
 use soniox::{LiveAudioMessage, LiveTranscriptEvent, TranscriptSegment};
 use state::AppState;
@@ -58,7 +60,8 @@ const MIN_SAMPLE_RMS: f32 = 0.002;
 const SAMPLE_CONSISTENCY_THRESHOLD: f32 = 0.90;
 const SAME_VOICE_SPLIT_THRESHOLD: f32 = 0.97;
 const MATCH_THRESHOLD: f32 = 0.94;
-const MATCH_MARGIN: f32 = 0.08;
+const STRONG_MATCH_THRESHOLD: f32 = 0.97;
+const STRONG_MATCH_MARGIN: f32 = 0.03;
 const PROFILE_CLAIM_MARGIN: f32 = 0.06;
 const MAX_AGENDA_BYTES: usize = 50 * 1024 * 1024;
 const ONBOARDING_VERSION: &str = "1";
@@ -70,10 +73,38 @@ const ALLOWED_EXTERNAL_URLS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq)]
-struct SpeakerMatch {
+struct IdentityMatch {
     speaker_id: String,
     label: String,
     score: f32,
+    support_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VoiceMatchKind {
+    Automatic,
+    Suggested,
+    New,
+    Skipped,
+}
+
+impl VoiceMatchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Suggested => "suggested",
+            Self::New => "new",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct VoiceMatchCandidate {
+    kind: VoiceMatchKind,
+    best: Option<IdentityMatch>,
+    runner_up: Option<IdentityMatch>,
+    reason: String,
 }
 
 #[derive(Debug)]
@@ -82,11 +113,15 @@ struct VoiceObservation {
     pcm: Vec<f32>,
     embedding: Vec<f32>,
     clean_window_count: usize,
+    selected_duration_ms: u64,
+    consistency_score: f32,
 }
 
 #[derive(Debug, Clone)]
 struct SampleWindow {
+    #[cfg(test)]
     start_ms: u64,
+    #[cfg(test)]
     end_ms: u64,
     pcm: Vec<f32>,
 }
@@ -1279,6 +1314,45 @@ fn ensure_session_not_recapping(app_state: &AppState, session_id: &str) -> Resul
     ensure_sessions_not_recapping(app_state, &[session_id.to_string()])
 }
 
+fn claim_identity_sessions(app_state: &AppState, session_ids: &[String]) -> Result<(), String> {
+    let recap_in_flight = app_state
+        .recap_in_flight
+        .lock()
+        .map_err(|_| "Recap lock poisoned".to_string())?;
+    if session_ids
+        .iter()
+        .any(|session_id| recap_in_flight.contains(session_id))
+    {
+        return Err(
+            "That change is paused because an affected conversation is being recapped. Try again after the recap finishes."
+                .into(),
+        );
+    }
+    let mut identity_in_flight = app_state
+        .identity_in_flight
+        .lock()
+        .map_err(|_| "Identity lock poisoned".to_string())?;
+    if session_ids
+        .iter()
+        .any(|session_id| identity_in_flight.contains(session_id))
+    {
+        return Err(
+            "Those people or voices are already being changed. Wait for that operation to finish."
+                .into(),
+        );
+    }
+    identity_in_flight.extend(session_ids.iter().cloned());
+    Ok(())
+}
+
+fn release_identity_sessions(app_state: &AppState, session_ids: &[String]) {
+    if let Ok(mut identity_in_flight) = app_state.identity_in_flight.lock() {
+        for session_id in session_ids {
+            identity_in_flight.remove(session_id);
+        }
+    }
+}
+
 fn make_conversation_title(transcript: &str) -> String {
     let words = transcript.split_whitespace().take(9).collect::<Vec<_>>();
     if words.is_empty() {
@@ -1394,7 +1468,9 @@ fn clean_sample_windows(
                 continue;
             }
             result.windows.push(SampleWindow {
+                #[cfg(test)]
                 start_ms,
+                #[cfg(test)]
                 end_ms,
                 pcm,
             });
@@ -1471,6 +1547,25 @@ fn average_embeddings(vectors: impl Iterator<Item = Vec<f32>>) -> Vec<f32> {
         }
     }
     average
+}
+
+fn mean_pairwise_similarity(vectors: &[Vec<f32>]) -> f32 {
+    if vectors.len() < 2 {
+        return 1.0;
+    }
+    let mut total = 0.0;
+    let mut pairs = 0usize;
+    for left in 0..vectors.len() {
+        for right in (left + 1)..vectors.len() {
+            total += embedding::cosine_similarity(&vectors[left], &vectors[right]);
+            pairs += 1;
+        }
+    }
+    if pairs == 0 {
+        1.0
+    } else {
+        total / pairs as f32
+    }
 }
 
 fn group_voice_observations(observations: &[VoiceObservation]) -> Vec<VoiceObservationGroup> {
@@ -1598,15 +1693,22 @@ fn process_segments(
         let mut pcm = Vec::with_capacity(target_samples);
         let mut selected_windows = 0usize;
         let mut selected_ms = 0u64;
+        let mut selected_vectors = Vec::new();
         for index in consistent_indices.iter().copied() {
             let window = &embedded_windows[index].0;
             let remaining = target_samples.saturating_sub(pcm.len());
             if remaining == 0 {
                 break;
             }
-            pcm.extend_from_slice(&window.pcm[..remaining.min(window.pcm.len())]);
+            let selected_samples = remaining.min(window.pcm.len());
+            pcm.extend_from_slice(&window.pcm[..selected_samples]);
+            selected_vectors.push(embedded_windows[index].1.clone());
             selected_windows += 1;
-            selected_ms += window.end_ms.saturating_sub(window.start_ms);
+            selected_ms += if audio.sample_rate == 0 {
+                0
+            } else {
+                (selected_samples as u64 * 1_000) / audio.sample_rate as u64
+            };
         }
         let sample_duration_ms = if audio.sample_rate == 0 {
             0
@@ -1625,22 +1727,19 @@ fn process_segments(
             );
             continue;
         }
-        let embedding = if selected_windows == 1 {
-            embedded_windows[consistent_indices[0]].1.clone()
-        } else {
-            match embedder.embed(&pcm, audio.sample_rate) {
-                Ok(value) => value,
-                Err(error) => {
-                    emit_progress(
-                        app_handle,
-                        "voiceprint:warning",
-                        Some(format!("{diarized_speaker}: {error}")),
-                        Some(run_id),
-                    );
-                    continue;
-                }
-            }
-        };
+        let embedding = average_embeddings(selected_vectors.iter().cloned());
+        if embedding.is_empty() {
+            emit_progress(
+                app_handle,
+                "voiceprint:warning",
+                Some(format!(
+                    "{diarized_speaker}: clean excerpts did not produce a usable centroid"
+                )),
+                Some(run_id),
+            );
+            continue;
+        }
+        let consistency_score = mean_pairwise_similarity(&selected_vectors);
         let consistency_rejections = embedded_windows.len() - consistent_indices.len();
         emit_progress(
             app_handle,
@@ -1672,21 +1771,20 @@ fn process_segments(
             pcm,
             embedding,
             clean_window_count: selected_windows,
+            selected_duration_ms: sample_duration_ms.min(selected_ms),
+            consistency_score,
         });
     }
 
     let groups = group_voice_observations(&observations);
-    let candidates = groups
+    let mut candidates = groups
         .iter()
-        .map(|group| best_speaker_match(&group.embedding, &known))
+        .map(|group| classify_speaker_match(&group.embedding, &known))
         .collect::<Vec<_>>();
-    let resolved_matches = resolve_unique_profile_matches(&candidates);
+    resolve_unique_profile_matches(&mut candidates);
     let mut mapping: HashMap<String, (String, String)> = HashMap::new();
 
-    for (group, (candidate, matched)) in groups
-        .into_iter()
-        .zip(candidates.into_iter().zip(resolved_matches))
-    {
+    for (group, candidate) in groups.into_iter().zip(candidates) {
         let representative_index = group
             .observation_indices
             .iter()
@@ -1705,37 +1803,50 @@ fn process_segments(
             .map(|index| observations[*index].diarized_speaker.clone())
             .collect::<Vec<_>>();
         let diarized_label = diarized_speakers.join(" + ");
-        let (speaker_id, label, is_new) = if let Some(matched) = matched {
-            emit_progress(
-                app_handle,
-                "voiceprint:matched",
-                Some(format!(
-                    "{diarized_label} → {} ({:.2}; reference left unchanged)",
-                    matched.label, matched.score
-                )),
-                Some(run_id),
-            );
-            (matched.speaker_id, matched.label, false)
-        } else {
-            let label = db.next_voice_label()?;
-            let speaker_id = db.insert_speaker(Some(&label))?;
-            let reason = candidate
-                .map(|candidate| {
-                    format!(
-                        "the {:.2} claim for {} was not unique within this recording",
-                        candidate.score, candidate.label
+        let (speaker_id, label, is_new) = match candidate.kind {
+            VoiceMatchKind::Automatic => {
+                let matched = candidate
+                    .best
+                    .as_ref()
+                    .ok_or_else(|| "Automatic voice match had no identity".to_string())?;
+                emit_progress(
+                    app_handle,
+                    "voiceprint:matched",
+                    Some(format!(
+                        "{diarized_label} → {} automatically ({:.3}; {}; reference left unchanged)",
+                        matched.label, matched.score, candidate.reason
+                    )),
+                    Some(run_id),
+                );
+                (matched.speaker_id.clone(), matched.label.clone(), false)
+            }
+            VoiceMatchKind::Suggested | VoiceMatchKind::New => {
+                let label = db.next_voice_label()?;
+                let speaker_id = db.insert_speaker(Some(&label))?;
+                let (stage, detail) = if candidate.kind == VoiceMatchKind::Suggested {
+                    let likely = candidate
+                        .best
+                        .as_ref()
+                        .ok_or_else(|| "Voice suggestion had no identity".to_string())?;
+                    (
+                        "voiceprint:suggested",
+                        format!(
+                            "{diarized_label} → {label}; likely {} at {:.3}, kept for one-click review ({})",
+                            likely.label, likely.score, candidate.reason
+                        ),
                     )
-                })
-                .unwrap_or_else(|| {
-                    format!("no named profile reached {MATCH_THRESHOLD:.2} unambiguously")
-                });
-            emit_progress(
-                app_handle,
-                "voiceprint:new",
-                Some(format!("{diarized_label} → {label} ({reason})")),
-                Some(run_id),
-            );
-            (speaker_id, label, true)
+                } else {
+                    (
+                        "voiceprint:new",
+                        format!("{diarized_label} → {label} ({})", candidate.reason),
+                    )
+                };
+                emit_progress(app_handle, stage, Some(detail), Some(run_id));
+                (speaker_id, label, true)
+            }
+            VoiceMatchKind::Skipped => {
+                return Err("A skipped voice observation reached the matching stage".into());
+            }
         };
 
         // New provisional voices establish a reference. Automatic matches are
@@ -1754,6 +1865,54 @@ fn process_segments(
                 Some(run_id),
             );
         }
+        let selected_window_count = group
+            .observation_indices
+            .iter()
+            .map(|index| observations[*index].clean_window_count)
+            .sum::<usize>();
+        let selected_duration_ms = group
+            .observation_indices
+            .iter()
+            .map(|index| observations[*index].selected_duration_ms)
+            .sum::<u64>();
+        let observation_consistency = group
+            .observation_indices
+            .iter()
+            .map(|index| observations[*index].consistency_score)
+            .fold(1.0_f32, f32::min);
+        let group_vectors = group
+            .observation_indices
+            .iter()
+            .map(|index| observations[*index].embedding.clone())
+            .collect::<Vec<_>>();
+        let consistency_score =
+            observation_consistency.min(mean_pairwise_similarity(&group_vectors));
+        db.insert_voice_match_decision(&VoiceMatchDecisionSave {
+            session_id,
+            provider_speakers: &diarized_speakers,
+            resulting_speaker_id: Some(&speaker_id),
+            best_speaker_id: candidate
+                .best
+                .as_ref()
+                .map(|match_| match_.speaker_id.as_str()),
+            runner_up_speaker_id: candidate
+                .runner_up
+                .as_ref()
+                .map(|match_| match_.speaker_id.as_str()),
+            best_score: candidate.best.as_ref().map(|match_| match_.score),
+            runner_up_score: candidate.runner_up.as_ref().map(|match_| match_.score),
+            support_count: candidate
+                .best
+                .as_ref()
+                .map(|match_| match_.support_count)
+                .unwrap_or(0),
+            selected_duration_ms,
+            selected_window_count,
+            consistency_score: Some(consistency_score),
+            model_version: EMBEDDING_VERSION,
+            decision: candidate.kind.as_str(),
+            reason: &candidate.reason,
+        })?;
         if diarized_speakers.len() > 1 {
             emit_progress(
                 app_handle,
@@ -1797,6 +1956,25 @@ fn process_segments(
             )),
             Some(run_id),
         );
+        let provider_speakers = vec![diarized_speaker.clone()];
+        let reason =
+            "no safe ECAPA observation could be built from the available clean speech windows";
+        db.insert_voice_match_decision(&VoiceMatchDecisionSave {
+            session_id,
+            provider_speakers: &provider_speakers,
+            resulting_speaker_id: Some(&speaker_id),
+            best_speaker_id: None,
+            runner_up_speaker_id: None,
+            best_score: None,
+            runner_up_score: None,
+            support_count: 0,
+            selected_duration_ms: 0,
+            selected_window_count: 0,
+            consistency_score: None,
+            model_version: EMBEDDING_VERSION,
+            decision: VoiceMatchKind::Skipped.as_str(),
+            reason,
+        })?;
         mapping.insert(diarized_speaker, (speaker_id, label));
     }
 
@@ -1823,8 +2001,19 @@ fn is_provisional_label(label: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn best_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> Option<SpeakerMatch> {
-    let mut by_speaker: HashMap<&str, (&StoredEmbedding, f32)> = HashMap::new();
+fn is_matchable_person_label(label: &str) -> bool {
+    let trimmed = label.trim();
+    !trimmed.is_empty()
+        && !is_provisional_label(trimmed)
+        && !trimmed.eq_ignore_ascii_case("unknown speaker")
+        && !trimmed.eq_ignore_ascii_case("unnamed voice")
+}
+
+fn ranked_identity_matches(
+    query: &[f32],
+    known: &[StoredEmbedding],
+) -> (Vec<IdentityMatch>, usize) {
+    let mut normalized_profiles: HashMap<String, HashSet<String>> = HashMap::new();
     for candidate in known {
         let Some(label) = candidate.speaker_label.as_deref() else {
             continue;
@@ -1832,68 +2021,172 @@ fn best_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> Option<Speake
         if is_provisional_label(label) {
             continue;
         }
+        if !is_matchable_person_label(label) {
+            continue;
+        }
+        normalized_profiles
+            .entry(db::normalized_person_name(label))
+            .or_default()
+            .insert(candidate.speaker_id.clone());
+    }
+    let conflicted_profiles = normalized_profiles
+        .values()
+        .filter(|profiles| profiles.len() > 1)
+        .flat_map(|profiles| profiles.iter().cloned())
+        .collect::<HashSet<_>>();
+
+    let mut by_speaker: HashMap<&str, IdentityMatch> = HashMap::new();
+    for candidate in known {
+        let Some(label) = candidate.speaker_label.as_deref() else {
+            continue;
+        };
+        if !is_matchable_person_label(label)
+            || conflicted_profiles.contains(candidate.speaker_id.as_str())
+        {
+            continue;
+        }
         let score = embedding::cosine_similarity(query, &candidate.vector);
         let entry = by_speaker
             .entry(candidate.speaker_id.as_str())
-            .or_insert((candidate, score));
-        if score > entry.1 {
-            *entry = (candidate, score);
+            .or_insert_with(|| IdentityMatch {
+                speaker_id: candidate.speaker_id.clone(),
+                label: label.to_string(),
+                score,
+                support_count: 0,
+            });
+        if score > entry.score {
+            entry.score = score;
+        }
+        if score >= MATCH_THRESHOLD {
+            entry.support_count += 1;
         }
     }
     let mut ranked = by_speaker.into_values().collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
-    let (best, score) = ranked.first().copied()?;
-    let second = ranked.get(1).map(|value| value.1).unwrap_or(-1.0);
-    if score < MATCH_THRESHOLD || score - second < MATCH_MARGIN {
-        return None;
-    }
-    Some(SpeakerMatch {
-        speaker_id: best.speaker_id.clone(),
-        label: best
-            .speaker_label
-            .clone()
-            .unwrap_or_else(|| "Unnamed speaker".into()),
-        score,
-    })
+    ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
+    (ranked, conflicted_profiles.len())
 }
 
-fn resolve_unique_profile_matches(
-    candidates: &[Option<SpeakerMatch>],
-) -> Vec<Option<SpeakerMatch>> {
-    let mut claims: HashMap<&str, Vec<(usize, f32)>> = HashMap::new();
+fn classify_speaker_match(query: &[f32], known: &[StoredEmbedding]) -> VoiceMatchCandidate {
+    let (ranked, conflicted_profile_count) = ranked_identity_matches(query, known);
+    let duplicate_note = if conflicted_profile_count == 0 {
+        String::new()
+    } else {
+        format!(
+            "; excluded {conflicted_profile_count} profile{} in unresolved duplicate-name groups",
+            if conflicted_profile_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    };
+    let Some(best) = ranked.first().cloned() else {
+        return VoiceMatchCandidate {
+            kind: VoiceMatchKind::New,
+            best: None,
+            runner_up: None,
+            reason: format!("no eligible named voiceprint was available{duplicate_note}"),
+        };
+    };
+    let runner_up = ranked.get(1).cloned();
+    let runner_up_score = runner_up.as_ref().map(|match_| match_.score);
+    if best.score < MATCH_THRESHOLD {
+        return VoiceMatchCandidate {
+            kind: VoiceMatchKind::New,
+            reason: format!(
+                "best named identity {} scored {:.3}, below {:.2}{duplicate_note}",
+                best.label, best.score, MATCH_THRESHOLD
+            ),
+            best: Some(best),
+            runner_up,
+        };
+    }
+
+    let different_person_lead = best.score - runner_up_score.unwrap_or(-1.0);
+    let strong_single_match =
+        best.score >= STRONG_MATCH_THRESHOLD && different_person_lead >= STRONG_MATCH_MARGIN;
+    let multi_reference_consensus =
+        best.support_count >= 2 && runner_up_score.unwrap_or(-1.0) < MATCH_THRESHOLD;
+    if strong_single_match || multi_reference_consensus {
+        let reason = if strong_single_match {
+            format!(
+                "{} scored {:.3} with a {:.3} lead over the next different identity{}",
+                best.label, best.score, different_person_lead, duplicate_note
+            )
+        } else {
+            format!(
+                "{} had {} agreeing references at or above {:.2}; every different identity stayed below {:.2}{}",
+                best.label,
+                best.support_count,
+                MATCH_THRESHOLD,
+                MATCH_THRESHOLD,
+                duplicate_note
+            )
+        };
+        VoiceMatchCandidate {
+            kind: VoiceMatchKind::Automatic,
+            best: Some(best),
+            runner_up,
+            reason,
+        }
+    } else {
+        let runner_up_description = runner_up
+            .as_ref()
+            .map(|match_| format!("{} at {:.3}", match_.label, match_.score))
+            .unwrap_or_else(|| "no different named identity".into());
+        VoiceMatchCandidate {
+            kind: VoiceMatchKind::Suggested,
+            reason: format!(
+                "{} scored {:.3} ({} agreeing reference{}); runner-up was {runner_up_description}. The evidence is strong enough to suggest but not assign automatically{duplicate_note}",
+                best.label,
+                best.score,
+                best.support_count,
+                if best.support_count == 1 { "" } else { "s" },
+            ),
+            best: Some(best),
+            runner_up,
+        }
+    }
+}
+
+fn resolve_unique_profile_matches(candidates: &mut [VoiceMatchCandidate]) {
+    let mut claims: HashMap<String, Vec<(usize, f32)>> = HashMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
-        if let Some(candidate) = candidate {
+        if candidate.kind == VoiceMatchKind::Automatic {
+            let candidate = candidate
+                .best
+                .as_ref()
+                .expect("automatic match must have a best identity");
             claims
-                .entry(candidate.speaker_id.as_str())
+                .entry(candidate.speaker_id.clone())
                 .or_default()
                 .push((index, candidate.score));
         }
     }
 
-    let mut accepted = HashSet::new();
     for mut profile_claims in claims.into_values() {
+        if profile_claims.len() < 2 {
+            continue;
+        }
         profile_claims.sort_by(|left, right| right.1.total_cmp(&left.1));
-        let (best_index, best_score) = profile_claims[0];
-        let runner_up = profile_claims.get(1).map(|value| value.1);
-        if runner_up
-            .map(|score| best_score - score >= PROFILE_CLAIM_MARGIN)
-            .unwrap_or(true)
-        {
-            accepted.insert(best_index);
+        let (_, best_score) = profile_claims[0];
+        let runner_up_score = profile_claims[1].1;
+        if best_score - runner_up_score >= PROFILE_CLAIM_MARGIN {
+            for (index, _) in profile_claims.into_iter().skip(1) {
+                candidates[index].kind = VoiceMatchKind::Suggested;
+                candidates[index].reason.push_str(
+                    "; another provider voice made a clearly stronger claim to this person in the same recording",
+                );
+            }
+        } else {
+            for (index, _) in profile_claims {
+                candidates[index].kind = VoiceMatchKind::Suggested;
+                candidates[index].reason.push_str(
+                    "; multiple provider voices made close claims to this person in the same recording",
+                );
+            }
         }
     }
-
-    candidates
-        .iter()
-        .enumerate()
-        .map(|(index, candidate)| {
-            if accepted.contains(&index) {
-                candidate.clone()
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 fn encode_wav_base64(pcm: &[f32], sample_rate: u32) -> Result<String, String> {
@@ -2380,6 +2673,190 @@ fn agenda_mime_type(path: &Path) -> Option<&'static str> {
     }
 }
 
+fn jamie_preview_for_path(
+    path: &Path,
+    supplied_draft: Option<JamieImportDraft>,
+    app_state: &AppState,
+) -> Result<JamieImportPreview, String> {
+    let archive = jamie_import::parse_jamie_export(path)?;
+    let db = app_state.db_handle()?;
+    let known_people = db.jamie_known_people()?;
+    let initial = jamie_import::initial_import_draft(path, &archive, &known_people);
+    let draft_path =
+        jamie_import::import_draft_path(&app_state.data_dir, &archive.metadata.source_sha256);
+    let saved = match supplied_draft {
+        Some(draft) => Some(draft),
+        None => jamie_import::load_import_draft(&draft_path)?,
+    };
+    let mut draft = saved
+        .map(|saved| jamie_import::merge_saved_draft(initial.clone(), saved))
+        .unwrap_or(initial);
+    draft.updated_at = chrono::Utc::now();
+    jamie_import::save_import_draft(&draft_path, &draft)?;
+    let existing = db.imported_meeting_fingerprints("Jamie")?;
+    Ok(jamie_import::build_import_preview(
+        &archive,
+        &draft,
+        &known_people,
+        &existing,
+    ))
+}
+
+#[tauri::command]
+fn choose_jamie_export() -> Result<Option<String>, String> {
+    let path = rfd::FileDialog::new()
+        .set_title("Choose a Jamie meeting export")
+        .add_filter("Jamie text export", &["txt"])
+        .pick_file();
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    path.into_os_string()
+        .into_string()
+        .map(Some)
+        .map_err(|_| "The selected Jamie export path is not valid Unicode.".to_string())
+}
+
+#[tauri::command]
+async fn inspect_jamie_export(
+    source_path: String,
+    app_state: State<'_, AppState>,
+) -> Result<JamieImportPreview, String> {
+    let path = PathBuf::from(source_path);
+    if !path.is_file() {
+        return Err("The selected Jamie export is no longer available.".into());
+    }
+    let state = app_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || jamie_preview_for_path(&path, None, &state))
+        .await
+        .map_err(|error| format!("Jamie import inspection stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+async fn resume_jamie_import(
+    app_state: State<'_, AppState>,
+) -> Result<Option<JamieImportPreview>, String> {
+    let state = app_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = state.data_dir.join("imports");
+        if !directory.is_dir() {
+            return Ok(None);
+        }
+        let mut candidates = std::fs::read_dir(&directory)
+            .map_err(|error| format!("Could not inspect saved import drafts: {error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|value| value.starts_with("jamie-") && value.ends_with(".json"))
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        });
+        let Some(draft_path) = candidates.pop() else {
+            return Ok(None);
+        };
+        let Some(draft) = jamie_import::load_import_draft(&draft_path)? else {
+            return Ok(None);
+        };
+        let source = PathBuf::from(&draft.source_path);
+        if !source.is_file() {
+            return Err(format!(
+                "The source file for this saved Jamie import is no longer available at {}",
+                source.display()
+            ));
+        }
+        jamie_preview_for_path(&source, Some(draft), &state).map(Some)
+    })
+    .await
+    .map_err(|error| format!("Jamie import resume stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+fn save_jamie_import_draft(
+    draft: JamieImportDraft,
+    app_state: State<AppState>,
+) -> Result<(), String> {
+    let source = PathBuf::from(&draft.source_path);
+    if !source.is_file() {
+        return Err("The selected Jamie export is no longer available.".into());
+    }
+    if draft.source_sha256.len() != 64
+        || !draft
+            .source_sha256
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+    {
+        return Err("The Jamie import draft has an invalid source fingerprint.".into());
+    }
+    let draft_path = jamie_import::import_draft_path(&app_state.data_dir, &draft.source_sha256);
+    jamie_import::save_import_draft(&draft_path, &draft)
+}
+
+#[tauri::command]
+async fn run_jamie_import(
+    draft: JamieImportDraft,
+    app_state: State<'_, AppState>,
+) -> Result<db::JamieImportResult, String> {
+    let state = app_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let source = PathBuf::from(&draft.source_path);
+        let archive = jamie_import::parse_jamie_export(&source)?;
+        if archive.metadata.source_sha256 != draft.source_sha256 {
+            return Err(
+                "The Jamie export changed after review. Reopen it and review the new content."
+                    .into(),
+            );
+        }
+        let db = state.db_handle()?;
+        let result = db.import_jamie_archive(&archive, &draft)?;
+        let draft_path = jamie_import::import_draft_path(&state.data_dir, &draft.source_sha256);
+        if draft_path.is_file() {
+            std::fs::remove_file(&draft_path)
+                .map_err(|error| format!("Import succeeded but draft cleanup failed: {error}"))?;
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|error| format!("Jamie import stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+async fn rollback_jamie_import(
+    import_id: String,
+    app_state: State<'_, AppState>,
+) -> Result<db::JamieRollbackResult, String> {
+    let state = app_state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let db = state.db_handle()?;
+        let session_ids = db.import_batch_session_ids(&import_id)?;
+        ensure_sessions_not_recapping(&state, &session_ids)?;
+        db.rollback_import(&import_id)
+    })
+    .await
+    .map_err(|error| format!("Jamie rollback stopped unexpectedly: {error}"))?
+}
+
+#[tauri::command]
+fn list_import_batches(app_state: State<AppState>) -> Result<Vec<db::ImportBatchSummary>, String> {
+    app_state.db_handle()?.list_import_batches()
+}
+
+#[tauri::command]
+fn get_imported_session_artifact(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<Option<db::ImportedSessionArtifact>, String> {
+    app_state
+        .db_handle()?
+        .load_imported_session_artifact(&session_id)
+}
+
 fn emit_recap_progress(app_handle: &tauri::AppHandle, session_id: &str, stage: &str, detail: &str) {
     eprintln!("[recap {session_id}] {stage}: {detail}");
     let _ = app_handle.emit(
@@ -2502,6 +2979,16 @@ async fn generate_recap(
             .recap_in_flight
             .lock()
             .map_err(|_| "Recap lock poisoned".to_string())?;
+        let identity_in_flight = app_state
+            .identity_in_flight
+            .lock()
+            .map_err(|_| "Identity lock poisoned".to_string())?;
+        if identity_in_flight.contains(&session_id) {
+            return Err(
+                "This conversation's people or voices are being changed. Run the recap after that operation finishes."
+                    .into(),
+            );
+        }
         if !in_flight.insert(session_id.clone()) {
             return Err("A recap is already being generated for this conversation".into());
         }
@@ -2527,6 +3014,73 @@ fn list_speakers(app_state: State<AppState>) -> Result<Vec<Speaker>, String> {
 #[tauri::command]
 fn list_speakers_with_stats(app_state: State<AppState>) -> Result<Vec<db::SpeakerStats>, String> {
     app_state.db_handle()?.list_speakers_with_stats()
+}
+
+#[tauri::command]
+fn list_identity_profiles(
+    search: String,
+    status: String,
+    page: usize,
+    page_size: usize,
+    app_state: State<AppState>,
+) -> Result<db::IdentityProfilePage, String> {
+    app_state
+        .db_handle()?
+        .list_identity_profiles(&search, &status, page, page_size)
+}
+
+#[tauri::command]
+fn list_unassigned_identities(
+    search: String,
+    status: String,
+    page: usize,
+    page_size: usize,
+    app_state: State<AppState>,
+) -> Result<db::UnassignedIdentityPage, String> {
+    app_state
+        .db_handle()?
+        .list_unassigned_identities(&search, &status, page, page_size)
+}
+
+#[tauri::command]
+fn preview_identity_consolidation(
+    request: db::IdentityConsolidationRequest,
+    app_state: State<AppState>,
+) -> Result<db::IdentityConsolidationPreview, String> {
+    app_state
+        .db_handle()?
+        .preview_identity_consolidation(&request)
+}
+
+#[tauri::command]
+async fn consolidate_identities(
+    request: db::IdentityConsolidationRequest,
+    app_state: State<'_, AppState>,
+) -> Result<db::IdentityConsolidationResult, String> {
+    let app_state = app_state.inner().clone();
+    let db = app_state.db_handle()?;
+    let preview = db.preview_identity_consolidation(&request)?;
+    let affected_session_ids = preview.affected_session_ids.clone();
+    claim_identity_sessions(&app_state, &affected_session_ids)?;
+    let expected_session_ids = affected_session_ids.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        db.consolidate_identities(&request, &expected_session_ids)
+    })
+    .await
+    .map_err(|error| format!("People and voices operation stopped unexpectedly: {error}"))
+    .and_then(|result| result);
+    release_identity_sessions(&app_state, &affected_session_ids);
+    result
+}
+
+#[tauri::command]
+fn list_voice_match_decisions(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<Vec<db::VoiceMatchDecision>, String> {
+    app_state
+        .db_handle()?
+        .list_voice_match_decisions(&session_id)
 }
 
 #[tauri::command]
@@ -2567,15 +3121,11 @@ fn rename_speaker(
     speaker_id: String,
     new_label: String,
     app_state: State<AppState>,
-) -> Result<(), String> {
+) -> Result<db::RenameSpeakerResult, String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
     ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.rename_speaker(&speaker_id, &new_label)?;
-    for session_id in sessions {
-        refresh_session_transcript(&db, &session_id)?;
-    }
-    Ok(())
+    db.rename_speaker(&speaker_id, &new_label)
 }
 
 #[tauri::command]
@@ -2583,11 +3133,7 @@ fn delete_speaker(speaker_id: String, app_state: State<AppState>) -> Result<(), 
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
     ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.delete_speaker(&speaker_id)?;
-    for session_id in sessions {
-        refresh_session_transcript(&db, &session_id)?;
-    }
-    Ok(())
+    db.delete_speaker(&speaker_id)
 }
 
 #[tauri::command]
@@ -2604,15 +3150,23 @@ fn merge_speakers(
     source_id: String,
     replace_embeddings: bool,
     app_state: State<AppState>,
-) -> Result<(), String> {
+) -> Result<db::SpeakerMergeResult, String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[source_id.as_str(), target_id.as_str()])?;
     ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.merge_speakers(&source_id, &target_id, replace_embeddings)?;
-    for session_id in sessions {
-        refresh_session_transcript(&db, &session_id)?;
-    }
-    Ok(())
+    db.merge_speakers(&source_id, &target_id, replace_embeddings)
+}
+
+#[tauri::command]
+fn accept_voice_match_suggestion(
+    source_id: String,
+    target_id: String,
+    app_state: State<AppState>,
+) -> Result<db::SuggestionAcceptance, String> {
+    let db = app_state.db_handle()?;
+    let sessions = db.session_ids_for_speakers(&[source_id.as_str(), target_id.as_str()])?;
+    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
+    db.accept_voice_match_suggestion(&source_id, &target_id)
 }
 
 fn is_allowed_external_url(url: &str) -> bool {
@@ -2746,9 +3300,22 @@ fn main() {
             save_agenda_text,
             choose_agenda_file,
             remove_agenda,
+            choose_jamie_export,
+            inspect_jamie_export,
+            resume_jamie_import,
+            save_jamie_import_draft,
+            run_jamie_import,
+            rollback_jamie_import,
+            list_import_batches,
+            get_imported_session_artifact,
             generate_recap,
             list_speakers,
             list_speakers_with_stats,
+            list_identity_profiles,
+            list_unassigned_identities,
+            preview_identity_consolidation,
+            consolidate_identities,
+            list_voice_match_decisions,
             list_session_ids_for_speaker,
             list_session_ids_for_speakers,
             create_profile_for_unknown_segments,
@@ -2756,6 +3323,7 @@ fn main() {
             delete_speaker,
             get_speaker_samples,
             merge_speakers,
+            accept_voice_match_suggestion,
             open_external_url,
         ])
         .manage(RecordingManager::default())
@@ -2911,6 +3479,29 @@ mod tests {
     }
 
     #[test]
+    fn identity_lock_blocks_overlapping_recaps_and_not_unrelated_conversations() {
+        let root = std::env::temp_dir().join(format!("recall-identity-lock-{}", Uuid::new_v4()));
+        let state = AppState::new(root.clone(), root.join("missing-model.onnx"));
+        state
+            .recap_in_flight
+            .lock()
+            .unwrap()
+            .insert("recapping".into());
+
+        assert!(claim_identity_sessions(&state, &["recapping".into()]).is_err());
+        assert!(claim_identity_sessions(&state, &["identity-change".into()]).is_ok());
+        assert!(state
+            .identity_in_flight
+            .lock()
+            .unwrap()
+            .contains("identity-change"));
+        assert!(claim_identity_sessions(&state, &["identity-change".into()]).is_err());
+        assert!(claim_identity_sessions(&state, &["unrelated".into()]).is_ok());
+        release_identity_sessions(&state, &["identity-change".into(), "unrelated".into()]);
+        assert!(state.identity_in_flight.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn adjacent_interventions_from_same_speaker_are_merged() {
         let segments = vec![
             TranscriptSegment {
@@ -2938,21 +3529,64 @@ mod tests {
     }
 
     #[test]
-    fn match_requires_threshold_and_margin() {
+    fn strong_identity_match_is_automatic() {
         let known = vec![
             stored_embedding("e1", "s1", "Alice", vec![1.0, 0.0]),
             stored_embedding("e2", "s2", "Bob", vec![0.0, 1.0]),
         ];
-        let matched = best_speaker_match(&[1.0, 0.0], &known).unwrap();
-        assert_eq!(matched.speaker_id, "s1");
-        assert!(best_speaker_match(&[0.71, 0.70], &known).is_none());
+        let decision = classify_speaker_match(&[1.0, 0.0], &known);
+        assert_eq!(decision.kind, VoiceMatchKind::Automatic);
+        assert_eq!(decision.best.unwrap().speaker_id, "s1");
     }
 
     #[test]
-    fn strict_ecapa_threshold_accepts_high_confidence_repeat_voice() {
-        let known = vec![stored_embedding("e1", "s1", "Alice", vec![1.0, 0.0])];
-        assert!(best_speaker_match(&[0.95, 0.312_249_9], &known).is_some());
-        assert!(best_speaker_match(&[0.93, 0.367_559_5], &known).is_none());
+    fn consistent_window_centroid_is_l2_normalized() {
+        let centroid =
+            average_embeddings(vec![vec![1.0, 0.0], vec![0.8, 0.6], vec![0.8, -0.6]].into_iter());
+        let norm = centroid
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!(centroid[0] > 0.99);
+        assert!(centroid[1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn ambiguous_known_voice_becomes_a_reviewable_suggestion() {
+        let known = vec![
+            stored_embedding("e1", "s1", "Michael", vec![0.9555, 0.294_990_7]),
+            stored_embedding("e2", "s2", "Dmitrii", vec![0.9403, 0.340_346_5]),
+        ];
+        let decision = classify_speaker_match(&[1.0, 0.0], &known);
+        assert_eq!(decision.kind, VoiceMatchKind::Suggested);
+        assert_eq!(decision.best.as_ref().unwrap().speaker_id, "s1");
+        assert_eq!(decision.runner_up.as_ref().unwrap().speaker_id, "s2");
+    }
+
+    #[test]
+    fn below_threshold_voice_stays_new() {
+        let known = vec![
+            stored_embedding("e1", "s1", "Vasily", vec![0.9318, 0.363_003_3]),
+            stored_embedding("e2", "s2", "Michael", vec![0.8863, 0.463_111_5]),
+        ];
+        assert_eq!(
+            classify_speaker_match(&[1.0, 0.0], &known).kind,
+            VoiceMatchKind::New
+        );
+    }
+
+    #[test]
+    fn two_agreeing_references_can_make_a_consensus_match() {
+        let known = vec![
+            stored_embedding("e1", "s1", "Alice", vec![0.96, 0.28]),
+            stored_embedding("e2", "s1", "Alice", vec![0.95, -0.312_249_9]),
+            stored_embedding("e3", "s2", "Bob", vec![0.93, 0.367_559_5]),
+        ];
+        let decision = classify_speaker_match(&[1.0, 0.0], &known);
+        assert_eq!(decision.kind, VoiceMatchKind::Automatic);
+        assert_eq!(decision.best.unwrap().support_count, 2);
     }
 
     #[test]
@@ -3018,18 +3652,24 @@ mod tests {
                 pcm: vec![0.1; 10],
                 embedding: vec![1.0, 0.0],
                 clean_window_count: 1,
+                selected_duration_ms: 4_000,
+                consistency_score: 1.0,
             },
             VoiceObservation {
                 diarized_speaker: "speaker_3".into(),
                 pcm: vec![0.1; 10],
                 embedding: vec![0.98, 0.198_997_5],
                 clean_window_count: 1,
+                selected_duration_ms: 4_000,
+                consistency_score: 1.0,
             },
             VoiceObservation {
                 diarized_speaker: "speaker_2".into(),
                 pcm: vec![0.1; 10],
                 embedding: vec![0.0, 1.0],
                 clean_window_count: 1,
+                selected_duration_ms: 4_000,
+                consistency_score: 1.0,
             },
         ];
 
@@ -3043,44 +3683,83 @@ mod tests {
     #[test]
     fn provisional_profiles_never_match_automatically() {
         let known = vec![stored_embedding("e1", "s1", "VOICE9", vec![1.0, 0.0])];
-        assert!(best_speaker_match(&[1.0, 0.0], &known).is_none());
+        assert_eq!(
+            classify_speaker_match(&[1.0, 0.0], &known).kind,
+            VoiceMatchKind::New
+        );
+    }
+
+    #[test]
+    fn duplicate_normalized_names_are_quarantined_from_matching() {
+        let known = vec![
+            stored_embedding("e1", "s1", "Michael Vartanyan", vec![1.0, 0.0]),
+            stored_embedding("e2", "s2", " michael  vartanyan ", vec![0.99, 0.1]),
+        ];
+        let decision = classify_speaker_match(&[1.0, 0.0], &known);
+        assert_eq!(decision.kind, VoiceMatchKind::New);
+        assert!(decision.reason.contains("duplicate-name"));
     }
 
     #[test]
     fn one_named_profile_cannot_claim_multiple_diarized_voices() {
-        let candidates = vec![
-            Some(SpeakerMatch {
-                speaker_id: "s1".into(),
-                label: "Alice".into(),
-                score: 0.96,
-            }),
-            Some(SpeakerMatch {
-                speaker_id: "s1".into(),
-                label: "Alice".into(),
-                score: 0.88,
-            }),
+        let mut candidates = vec![
+            VoiceMatchCandidate {
+                kind: VoiceMatchKind::Automatic,
+                best: Some(IdentityMatch {
+                    speaker_id: "s1".into(),
+                    label: "Alice".into(),
+                    score: 0.99,
+                    support_count: 1,
+                }),
+                runner_up: None,
+                reason: "strong".into(),
+            },
+            VoiceMatchCandidate {
+                kind: VoiceMatchKind::Automatic,
+                best: Some(IdentityMatch {
+                    speaker_id: "s1".into(),
+                    label: "Alice".into(),
+                    score: 0.90,
+                    support_count: 1,
+                }),
+                runner_up: None,
+                reason: "strong".into(),
+            },
         ];
-        let resolved = resolve_unique_profile_matches(&candidates);
-        assert!(resolved[0].is_some());
-        assert!(resolved[1].is_none());
+        resolve_unique_profile_matches(&mut candidates);
+        assert_eq!(candidates[0].kind, VoiceMatchKind::Automatic);
+        assert_eq!(candidates[1].kind, VoiceMatchKind::Suggested);
     }
 
     #[test]
     fn close_competing_claims_are_all_rejected() {
-        let candidates = vec![
-            Some(SpeakerMatch {
-                speaker_id: "s1".into(),
-                label: "Alice".into(),
-                score: 0.95,
-            }),
-            Some(SpeakerMatch {
-                speaker_id: "s1".into(),
-                label: "Alice".into(),
-                score: 0.92,
-            }),
+        let mut candidates = vec![
+            VoiceMatchCandidate {
+                kind: VoiceMatchKind::Automatic,
+                best: Some(IdentityMatch {
+                    speaker_id: "s1".into(),
+                    label: "Alice".into(),
+                    score: 0.99,
+                    support_count: 1,
+                }),
+                runner_up: None,
+                reason: "strong".into(),
+            },
+            VoiceMatchCandidate {
+                kind: VoiceMatchKind::Automatic,
+                best: Some(IdentityMatch {
+                    speaker_id: "s1".into(),
+                    label: "Alice".into(),
+                    score: 0.95,
+                    support_count: 1,
+                }),
+                runner_up: None,
+                reason: "strong".into(),
+            },
         ];
-        assert!(resolve_unique_profile_matches(&candidates)
+        resolve_unique_profile_matches(&mut candidates);
+        assert!(candidates
             .iter()
-            .all(Option::is_none));
+            .all(|candidate| candidate.kind == VoiceMatchKind::Suggested));
     }
 }

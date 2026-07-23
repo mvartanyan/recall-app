@@ -41,6 +41,11 @@
         </div>
 
         <div class="sidebar-footer">
+          <button id="peopleVoicesButton" class="sidebar-action" type="button">
+            <span aria-hidden="true">◉</span>
+            People &amp; Voices
+            <span id="identityOperationBadge" class="activity-badge" hidden>Working</span>
+          </button>
           <button id="settingsButton" class="sidebar-action" type="button">
             <span aria-hidden="true">⚙</span>
             Settings
@@ -162,6 +167,9 @@
                 <button id="fullSummaryTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="full" hidden>Full summary</button>
                 <button id="actionsTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="actions" hidden>Actions</button>
                 <button id="agendaCoverageTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="agenda" hidden>Agenda coverage</button>
+                <button id="importedExecutiveTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="imported-executive" hidden>Imported executive summary</button>
+                <button id="importedFullSummaryTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="imported-full" hidden>Imported full summary</button>
+                <button id="importedTasksTab" class="recap-tab" type="button" role="tab" aria-selected="false" data-recap-tab="imported-tasks" hidden>Imported tasks</button>
               </nav>
 
               <section id="transcriptTabPanel" class="recap-tab-panel" role="tabpanel">
@@ -310,17 +318,79 @@
       </div>
     </dialog>
 
-    <dialog id="voiceLibraryDialog" class="modal voice-library-modal">
+    <dialog id="voiceLibraryDialog" class="modal voice-library-modal" aria-labelledby="identityManagerTitle">
       <div class="modal-header">
         <div>
-          <span class="eyebrow">Voice database</span>
-          <h2>Voice Library</h2>
+          <span class="eyebrow">Local identity database</span>
+          <h2 id="identityManagerTitle">People &amp; Voices</h2>
         </div>
-        <button class="icon-button" type="button" data-close-dialog="voiceLibraryDialog" aria-label="Close Voice Library">×</button>
+        <button class="icon-button" type="button" data-close-dialog="voiceLibraryDialog" aria-label="Close People and Voices">×</button>
       </div>
       <div class="voice-library-body">
-        <p class="supporting-copy voice-library-help"><strong>Manage everyone Recall has heard.</strong> Name new VOICE profiles, assign them to an existing person, preview retained excerpts, or remove profiles you no longer need. Only named people are eligible for automatic recognition, and named people used by conversation history are protected from deletion.</p>
-        <div id="voiceLibraryList" class="speakers-list voice-library-list"></div>
+        <p class="supporting-copy voice-library-help">Review named people, provisional voice profiles, and transcript speakers that have not yet been assigned. Only named people are eligible for automatic recognition, and named people used by conversation history are protected from deletion. Selecting items never combines identical labels from different conversations unless you select both.</p>
+        <nav class="identity-tabs" role="tablist" aria-label="People and voices views">
+          <button id="identityProfilesTab" class="identity-tab selected" type="button" role="tab" aria-selected="true">Profiles</button>
+          <button id="identityUnassignedTab" class="identity-tab" type="button" role="tab" aria-selected="false">Unassigned</button>
+        </nav>
+        <div class="identity-toolbar">
+          <label class="search-field identity-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="identitySearch" type="search" placeholder="Search people and voices" autocomplete="off" />
+          </label>
+          <label class="identity-filter">
+            <span>Status</span>
+            <select id="identityStatusFilter" aria-label="Filter people and voices by status"></select>
+          </label>
+          <button id="identityRefreshButton" class="icon-button" type="button" title="Refresh people and voices" aria-label="Refresh people and voices">↻</button>
+        </div>
+        <div id="identityManagerStatus" class="identity-manager-status" role="status" aria-live="polite"></div>
+        <div id="voiceLibraryList" class="identity-manager-list" aria-live="polite"></div>
+        <div class="identity-pagination">
+          <button id="identityPreviousPage" class="text-button" type="button">← Previous</button>
+          <span id="identityPageStatus">Page 1 of 1</span>
+          <button id="identityNextPage" class="text-button" type="button">Next →</button>
+        </div>
+      </div>
+      <div class="modal-footer identity-manager-footer">
+        <span id="identitySelectionSummary">Nothing selected</span>
+        <div class="identity-footer-actions">
+          <button id="identityClearSelection" class="text-button" type="button" disabled>Clear selection</button>
+          <button id="identityMergeButton" class="primary-button" type="button" disabled>Merge or assign selected</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="identityMergeDialog" class="modal identity-merge-modal" aria-labelledby="identityMergeTitle">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow">People &amp; Voices</span>
+          <h2 id="identityMergeTitle">Merge or assign selected</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog="identityMergeDialog" aria-label="Close merge review">×</button>
+      </div>
+      <div class="identity-merge-body">
+        <p id="identityMergeSelection" class="supporting-copy"></p>
+        <div class="identity-merge-fields">
+          <label>
+            <span class="field-label">Canonical person</span>
+            <select id="identityTarget"></select>
+          </label>
+          <label>
+            <span class="field-label">Final display name</span>
+            <input id="identityFinalLabel" type="text" placeholder="Full name" autocomplete="off" />
+          </label>
+        </div>
+        <button id="identityPreviewButton" class="secondary-button" type="button">Review impact</button>
+        <section id="identityImpact" class="identity-impact" hidden aria-live="polite">
+          <div id="identityImpactStats" class="identity-impact-stats"></div>
+          <ul id="identityImpactWarnings" class="identity-impact-warnings"></ul>
+          <p class="identity-backup-note">Recall will make and verify a local database backup before changing anything. The selected changes then run in one database transaction.</p>
+        </section>
+        <p id="identityMergeFeedback" class="modal-feedback" role="status" aria-live="polite"></p>
+      </div>
+      <div class="modal-footer">
+        <button class="text-button" type="button" data-close-dialog="identityMergeDialog">Cancel</button>
+        <button id="identityConfirmButton" class="primary-button" type="button" disabled>Confirm changes</button>
       </div>
     </dialog>
 
@@ -420,6 +490,20 @@
               <input id="liveTranscription" type="checkbox" />
             </label>
           </section>
+
+          <section id="jamieImportSettingsSection" class="settings-section" hidden aria-hidden="true">
+            <div class="setting-title-row">
+              <div>
+                <h3>Import a Jamie archive</h3>
+                <p>Review speaker names and meeting warnings before adding a Jamie data-mobility export to Recall. The source file stays unchanged.</p>
+              </div>
+              <div class="settings-inline-actions">
+                <button id="chooseJamieExportButton" class="secondary-button" type="button">Choose export…</button>
+                <button id="resumeJamieImportButton" class="text-button" type="button">Resume review</button>
+              </div>
+            </div>
+            <div id="jamieImportHistory" class="import-history" aria-live="polite"></div>
+          </section>
         </div>
 
         <div class="modal-footer">
@@ -428,6 +512,93 @@
           <button id="saveSettingsButton" class="primary-button" type="submit">Save settings</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="jamieImportDialog" class="modal jamie-import-modal" aria-labelledby="jamieImportTitle" hidden aria-hidden="true">
+      <div class="jamie-import-shell">
+        <div class="modal-header">
+          <div>
+            <span class="eyebrow">Archive migration</span>
+            <h2 id="jamieImportTitle">Review Jamie import</h2>
+          </div>
+          <button class="icon-button" type="button" data-close-dialog="jamieImportDialog" aria-label="Close Jamie import review">×</button>
+        </div>
+
+        <div class="jamie-import-scroll">
+          <section id="jamieImportLoading" class="import-loading" hidden>
+            <div class="spinner" aria-hidden="true"></div>
+            <div>
+              <strong>Reading the archive</strong>
+              <p>The export is checked locally. Large archives can take a few seconds.</p>
+            </div>
+          </section>
+
+          <section id="jamieImportError" class="import-loading import-error-state" hidden>
+            <div>
+              <strong>Could not read the archive</strong>
+              <p id="jamieImportErrorMessage"></p>
+            </div>
+          </section>
+
+          <div id="jamieImportReview" hidden>
+            <section class="import-overview">
+              <div>
+                <span class="eyebrow">Source</span>
+                <h3 id="jamieImportSource">Jamie meeting export</h3>
+                <p id="jamieImportSummary"></p>
+              </div>
+              <div id="jamieImportStats" class="import-stat-grid"></div>
+            </section>
+
+            <section id="jamieValidationPanel" class="import-validation" aria-live="polite"></section>
+
+            <section class="import-review-section">
+              <div class="import-section-heading">
+                <div>
+                  <span class="eyebrow">Step 1</span>
+                  <h3>Review people</h3>
+                  <p>Jamie names are source labels, not voiceprints. Map them to someone already in Recall, create a name-only person, or leave them unresolved.</p>
+                </div>
+                <button id="jamieUseSourceNamesButton" class="secondary-button" type="button">Use source names</button>
+              </div>
+              <div class="import-toolbar">
+                <input id="jamieIdentitySearch" type="search" placeholder="Search source names" autocomplete="off" />
+                <label class="inline-toggle">
+                  <input id="jamieIdentityNeedsReview" type="checkbox" checked />
+                  Needs attention only
+                </label>
+              </div>
+              <p id="jamieGenericIdentityNote" class="field-help"></p>
+              <div id="jamieIdentityList" class="jamie-identity-list"></div>
+            </section>
+
+            <section class="import-review-section">
+              <div class="import-section-heading">
+                <div>
+                  <span class="eyebrow">Step 2</span>
+                  <h3>Review meetings</h3>
+                  <p>Meetings with blocking transcript problems must be excluded. Existing imported meetings are skipped automatically.</p>
+                </div>
+                <button id="jamieExcludeInvalidButton" class="secondary-button" type="button">Exclude unreadable meetings</button>
+              </div>
+              <div class="import-toolbar">
+                <input id="jamieMeetingSearch" type="search" placeholder="Search meeting titles" autocomplete="off" />
+                <label class="inline-toggle">
+                  <input id="jamieMeetingIssuesOnly" type="checkbox" />
+                  Issues only
+                </label>
+              </div>
+              <div id="jamieMeetingList" class="jamie-meeting-list"></div>
+            </section>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <span id="jamieImportFeedback" class="modal-feedback"></span>
+          <button class="text-button" type="button" data-close-dialog="jamieImportDialog">Close</button>
+          <button id="jamieImportButton" class="primary-button" type="button" disabled>Import reviewed meetings</button>
+        </div>
+      </div>
     </dialog>
 
     <dialog id="agendaDialog" class="modal agenda-modal">
@@ -509,10 +680,10 @@
         <select id="assignTarget" required></select>
         <fieldset class="choice-group">
           <legend>How should Recall update the voice profile?</legend>
-          <label><input type="radio" name="voiceprintMode" value="keep" checked /> Keep the old pattern and add this voice</label>
+          <label><input type="radio" name="voiceprintMode" value="keep" checked /> Keep the old pattern and add this voice if it agrees</label>
           <label><input type="radio" name="voiceprintMode" value="replace" /> Replace the old pattern with this voice</label>
         </fieldset>
-        <p class="field-help">Keep both is best for illness, aging, or different microphones. Replace only when the old pattern is wrong.</p>
+        <p class="field-help">Keep preserves trusted patterns and quarantines a conflicting new one. Replace only when the old pattern is wrong and this excerpt is a better reference.</p>
         <div class="modal-footer">
           <button class="text-button" type="button" data-close-dialog="assignDialog">Cancel</button>
           <button class="primary-button" type="submit">Assign person</button>

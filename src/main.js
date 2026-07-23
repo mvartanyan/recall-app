@@ -21,6 +21,7 @@ import {
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+const JAMIE_IMPORT_UI_ENABLED = window.__RECALL_ENABLE_JAMIE_IMPORT__ === true;
 
 const elements = {
   recordButton: document.getElementById("recordButton"),
@@ -71,6 +72,9 @@ const elements = {
   fullSummaryTab: document.getElementById("fullSummaryTab"),
   actionsTab: document.getElementById("actionsTab"),
   agendaCoverageTab: document.getElementById("agendaCoverageTab"),
+  importedExecutiveTab: document.getElementById("importedExecutiveTab"),
+  importedFullSummaryTab: document.getElementById("importedFullSummaryTab"),
+  importedTasksTab: document.getElementById("importedTasksTab"),
   transcriptTabPanel: document.getElementById("transcriptTabPanel"),
   generatedTabPanel: document.getElementById("generatedTabPanel"),
   generatedEyebrow: document.getElementById("generatedEyebrow"),
@@ -89,8 +93,32 @@ const elements = {
   speakersList: document.getElementById("speakersList"),
   refreshSpeakers: document.getElementById("refreshSpeakers"),
   voiceLibraryButton: document.getElementById("voiceLibraryButton"),
+  peopleVoicesButton: document.getElementById("peopleVoicesButton"),
+  identityOperationBadge: document.getElementById("identityOperationBadge"),
   voiceLibraryDialog: document.getElementById("voiceLibraryDialog"),
   voiceLibraryList: document.getElementById("voiceLibraryList"),
+  identityProfilesTab: document.getElementById("identityProfilesTab"),
+  identityUnassignedTab: document.getElementById("identityUnassignedTab"),
+  identitySearch: document.getElementById("identitySearch"),
+  identityStatusFilter: document.getElementById("identityStatusFilter"),
+  identityRefreshButton: document.getElementById("identityRefreshButton"),
+  identityManagerStatus: document.getElementById("identityManagerStatus"),
+  identityPreviousPage: document.getElementById("identityPreviousPage"),
+  identityPageStatus: document.getElementById("identityPageStatus"),
+  identityNextPage: document.getElementById("identityNextPage"),
+  identitySelectionSummary: document.getElementById("identitySelectionSummary"),
+  identityClearSelection: document.getElementById("identityClearSelection"),
+  identityMergeButton: document.getElementById("identityMergeButton"),
+  identityMergeDialog: document.getElementById("identityMergeDialog"),
+  identityMergeSelection: document.getElementById("identityMergeSelection"),
+  identityTarget: document.getElementById("identityTarget"),
+  identityFinalLabel: document.getElementById("identityFinalLabel"),
+  identityPreviewButton: document.getElementById("identityPreviewButton"),
+  identityImpact: document.getElementById("identityImpact"),
+  identityImpactStats: document.getElementById("identityImpactStats"),
+  identityImpactWarnings: document.getElementById("identityImpactWarnings"),
+  identityMergeFeedback: document.getElementById("identityMergeFeedback"),
+  identityConfirmButton: document.getElementById("identityConfirmButton"),
   confirmationDialog: document.getElementById("confirmationDialog"),
   confirmationForm: document.getElementById("confirmationForm"),
   confirmationTitle: document.getElementById("confirmationTitle"),
@@ -115,6 +143,30 @@ const elements = {
   noTranslationLanguages: document.getElementById("noTranslationLanguages"),
   liveTranscription: document.getElementById("liveTranscription"),
   settingsFeedback: document.getElementById("settingsFeedback"),
+  chooseJamieExportButton: document.getElementById("chooseJamieExportButton"),
+  resumeJamieImportButton: document.getElementById("resumeJamieImportButton"),
+  jamieImportSettingsSection: document.getElementById("jamieImportSettingsSection"),
+  jamieImportHistory: document.getElementById("jamieImportHistory"),
+  jamieImportDialog: document.getElementById("jamieImportDialog"),
+  jamieImportLoading: document.getElementById("jamieImportLoading"),
+  jamieImportError: document.getElementById("jamieImportError"),
+  jamieImportErrorMessage: document.getElementById("jamieImportErrorMessage"),
+  jamieImportReview: document.getElementById("jamieImportReview"),
+  jamieImportSource: document.getElementById("jamieImportSource"),
+  jamieImportSummary: document.getElementById("jamieImportSummary"),
+  jamieImportStats: document.getElementById("jamieImportStats"),
+  jamieValidationPanel: document.getElementById("jamieValidationPanel"),
+  jamieUseSourceNamesButton: document.getElementById("jamieUseSourceNamesButton"),
+  jamieIdentitySearch: document.getElementById("jamieIdentitySearch"),
+  jamieIdentityNeedsReview: document.getElementById("jamieIdentityNeedsReview"),
+  jamieGenericIdentityNote: document.getElementById("jamieGenericIdentityNote"),
+  jamieIdentityList: document.getElementById("jamieIdentityList"),
+  jamieExcludeInvalidButton: document.getElementById("jamieExcludeInvalidButton"),
+  jamieMeetingSearch: document.getElementById("jamieMeetingSearch"),
+  jamieMeetingIssuesOnly: document.getElementById("jamieMeetingIssuesOnly"),
+  jamieMeetingList: document.getElementById("jamieMeetingList"),
+  jamieImportFeedback: document.getElementById("jamieImportFeedback"),
+  jamieImportButton: document.getElementById("jamieImportButton"),
   agendaDialog: document.getElementById("agendaDialog"),
   agendaForm: document.getElementById("agendaForm"),
   agendaCurrent: document.getElementById("agendaCurrent"),
@@ -196,12 +248,31 @@ const state = {
   titleResizeFrame: null,
   transcriptResizeFrame: null,
   recapState: null,
+  importedArtifact: null,
   activeRecapTab: "transcript",
   generatedLanguage: "original",
   recapJobs: new Map(),
   translationWarnings: new Set(),
   onboardingAcknowledgedThisLaunch: false,
   translationLanguages: [],
+  jamieImportPreview: null,
+  jamieImportSaveTimer: null,
+  jamieImportRevision: 0,
+  jamieImportRunning: false,
+  importBatches: [],
+  identityManagerView: "profiles",
+  identitySearch: "",
+  identityStatus: "all",
+  identityPage: 1,
+  identityPageSize: 100,
+  identityPageData: null,
+  identityLoadSequence: 0,
+  identitySearchTimer: null,
+  selectedIdentityProfiles: new Map(),
+  selectedUnassignedGroups: new Map(),
+  identityPreview: null,
+  identityPreviewSignature: null,
+  identityOperationRunning: false,
 };
 
 function errorText(error) {
@@ -212,6 +283,10 @@ function errorText(error) {
   } catch {
     return String(error);
   }
+}
+
+function serializableCopy(value) {
+  return JSON.parse(JSON.stringify(value));
 }
 
 function addActivity(message, kind) {
@@ -1021,6 +1096,8 @@ async function loadSessions() {
     ) {
       state.selectedSessionId = null;
       state.selectedSegments = [];
+      state.recapState = null;
+      state.importedArtifact = null;
     }
     renderSpeakers();
     updateContentVisibility();
@@ -1112,6 +1189,7 @@ async function selectSession(sessionId, { userInitiated = true } = {}) {
   state.selectedSessionId = sessionId;
   state.selectedSegments = [];
   state.recapState = null;
+  state.importedArtifact = null;
   state.activeRecapTab = "transcript";
   renderSpeakers();
   elements.segmentsList.replaceChildren();
@@ -1121,9 +1199,10 @@ async function selectSession(sessionId, { userInitiated = true } = {}) {
   elements.saveState.textContent = "Loading…";
   updateContentVisibility();
   try {
-    const [segmentsResult, recapResult] = await Promise.allSettled([
+    const [segmentsResult, recapResult, importedArtifactResult] = await Promise.allSettled([
       invoke("list_segments", { sessionId }),
       invoke("get_recap_state", { sessionId }),
+      invoke("get_imported_session_artifact", { sessionId }),
     ]);
     if (sequence !== state.sessionLoadSequence) return;
     if (segmentsResult.status === "rejected") throw segmentsResult.reason;
@@ -1133,6 +1212,15 @@ async function selectSession(sessionId, { userInitiated = true } = {}) {
       rememberNativeRecapState(sessionId, state.recapState);
     } else {
       addActivity("Could not load recap data: " + errorText(recapResult.reason), "error");
+    }
+    if (importedArtifactResult.status === "fulfilled") {
+      state.importedArtifact = importedArtifactResult.value;
+    } else {
+      addActivity(
+        "Could not load imported meeting notes: " +
+          errorText(importedArtifactResult.reason),
+        "error",
+      );
     }
     renderRecapShell();
     renderTranscript(session);
@@ -1167,17 +1255,38 @@ function renderRecapShell() {
   const availableTabs = new Set(recapTabAvailability(state.recapState));
   const hasRecap = availableTabs.has("executive");
   const hasAgendaCoverage = availableTabs.has("agenda");
+  const importedExecutive = Boolean(
+    state.importedArtifact?.executive_summary?.trim(),
+  );
+  const importedFull = Boolean(state.importedArtifact?.full_summary?.trim());
+  const importedTasks = Boolean(state.importedArtifact?.tasks?.trim());
   elements.executiveTab.hidden = !availableTabs.has("executive");
   elements.fullSummaryTab.hidden = !availableTabs.has("full");
   elements.actionsTab.hidden = !availableTabs.has("actions");
   elements.agendaCoverageTab.hidden = !availableTabs.has("agenda");
+  elements.importedExecutiveTab.hidden = !importedExecutive;
+  elements.importedFullSummaryTab.hidden = !importedFull;
+  elements.importedTasksTab.hidden = !importedTasks;
   elements.recapStaleBanner.hidden = !(
     hasRecap && state.recapState && state.recapState.stale
   );
-  if (!hasRecap && state.activeRecapTab !== "transcript") {
+  if (
+    !hasRecap &&
+    state.activeRecapTab !== "transcript" &&
+    !state.activeRecapTab.startsWith("imported-")
+  ) {
     state.activeRecapTab = "transcript";
   }
   if (state.activeRecapTab === "agenda" && !hasAgendaCoverage) {
+    state.activeRecapTab = "transcript";
+  }
+  if (state.activeRecapTab === "imported-executive" && !importedExecutive) {
+    state.activeRecapTab = "transcript";
+  }
+  if (state.activeRecapTab === "imported-full" && !importedFull) {
+    state.activeRecapTab = "transcript";
+  }
+  if (state.activeRecapTab === "imported-tasks" && !importedTasks) {
     state.activeRecapTab = "transcript";
   }
   selectRecapTab(state.activeRecapTab);
@@ -1186,7 +1295,15 @@ function renderRecapShell() {
 
 function selectRecapTab(tab) {
   const recapRecord = state.recapState && state.recapState.recap;
-  if (tab !== "transcript" && !recapRecord) tab = "transcript";
+  const importedTabs = new Set([
+    "imported-executive",
+    "imported-full",
+    "imported-tasks",
+  ]);
+  if (tab !== "transcript" && !importedTabs.has(tab) && !recapRecord) {
+    tab = "transcript";
+  }
+  if (importedTabs.has(tab) && !state.importedArtifact) tab = "transcript";
   if (tab === "agenda" && !recapRecord?.payload?.agenda_present) tab = "transcript";
   state.activeRecapTab = tab;
   for (const button of elements.recapTabs.querySelectorAll("[data-recap-tab]")) {
@@ -1234,9 +1351,14 @@ function appendEmptyGeneratedState(copy) {
 }
 
 function renderGeneratedTab() {
+  if (state.activeRecapTab.startsWith("imported-")) {
+    renderImportedArtifactTab();
+    return;
+  }
   const payload = state.recapState?.recap?.payload;
   elements.generatedContent.replaceChildren();
   if (!payload) return;
+  elements.generatedLanguageToggle.hidden = false;
   const tab = state.activeRecapTab;
   const labels = {
     executive: ["Recap", "Executive summary"],
@@ -1303,6 +1425,44 @@ function renderGeneratedTab() {
     }
     elements.generatedContent.append(list);
   }
+}
+
+function renderImportedArtifactTab() {
+  const artifact = state.importedArtifact;
+  elements.generatedContent.replaceChildren();
+  elements.generatedLanguageToggle.hidden = true;
+  if (!artifact) return;
+  const contentByTab = {
+    "imported-executive": [
+      "Imported from " + artifact.source_provider,
+      "Executive summary",
+      artifact.executive_summary,
+    ],
+    "imported-full": [
+      "Imported from " + artifact.source_provider,
+      "Full summary",
+      artifact.full_summary,
+    ],
+    "imported-tasks": [
+      "Imported from " + artifact.source_provider,
+      "Tasks",
+      artifact.tasks,
+    ],
+  };
+  const [eyebrow, title, content] =
+    contentByTab[state.activeRecapTab] || contentByTab["imported-full"];
+  elements.generatedEyebrow.textContent = eyebrow;
+  elements.generatedTitle.textContent = title;
+  const provenance = document.createElement("p");
+  provenance.className = "imported-artifact-provenance";
+  provenance.textContent =
+    "Saved from the source archive on " +
+    new Date(artifact.imported_at).toLocaleString() +
+    ". It was not generated by Recall.";
+  const body = document.createElement("pre");
+  body.className = "imported-artifact-content";
+  body.textContent = content || "";
+  elements.generatedContent.append(provenance, body);
 }
 
 function renderActionGroup(title, items) {
@@ -1829,29 +1989,362 @@ function renderSpeakers() {
 }
 
 function renderVoiceLibrary() {
+  if (!elements.voiceLibraryDialog.open || !state.identityPageData) return;
+  renderIdentityManager();
+}
+
+function identityGroupKey(key) {
+  return JSON.stringify([
+    String(key?.session_id || ""),
+    key?.speaker_label === null || key?.speaker_label === undefined
+      ? null
+      : String(key.speaker_label),
+  ]);
+}
+
+function identityProfileAsSpeaker(profile) {
+  return {
+    id: profile.id,
+    label: profile.label,
+    created_at: profile.created_at,
+    last_seen_at: profile.last_seen_at,
+    sample_count: Number(profile.sample_count || 0),
+    embedding_count: Number(profile.active_voiceprint_count || 0),
+    inactive_voiceprint_count: Number(profile.inactive_voiceprint_count || 0),
+    conversation_count: Number(profile.conversation_count || 0),
+    duplicate_name_conflict: Boolean(profile.duplicate_name_conflict),
+    duplicate_name_count: Number(profile.duplicate_name_count || 0),
+    likely_match: null,
+  };
+}
+
+function identitySelectionCounts() {
+  return {
+    profiles: state.selectedIdentityProfiles.size,
+    groups: state.selectedUnassignedGroups.size,
+  };
+}
+
+function canConsolidateIdentitySelection() {
+  const { profiles, groups } = identitySelectionCounts();
+  return groups > 0 || profiles > 1;
+}
+
+function identityStatusOptions() {
+  if (state.identityManagerView === "unassigned") {
+    return [
+      ["all", "All unassigned"],
+      ["generic", "Generic speaker labels"],
+      ["labelled", "Source-labelled speakers"],
+    ];
+  }
+  return [
+    ["all", "All profiles"],
+    ["named", "Named people"],
+    ["provisional", "Provisional VOICE profiles"],
+    ["no_voiceprint", "No current voiceprint"],
+    ["conflict", "Duplicate names"],
+    ["imported", "Imported profiles"],
+  ];
+}
+
+function renderIdentityStatusOptions() {
+  elements.identityStatusFilter.replaceChildren();
+  const options = identityStatusOptions();
+  if (!options.some(([value]) => value === state.identityStatus)) {
+    state.identityStatus = "all";
+  }
+  for (const [value, label] of options) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = label;
+    option.selected = value === state.identityStatus;
+    elements.identityStatusFilter.append(option);
+  }
+}
+
+function identityTag(label, className = "") {
+  const tag = document.createElement("span");
+  tag.className = "identity-tag" + (className ? " " + className : "");
+  tag.textContent = label;
+  return tag;
+}
+
+function buildIdentityProfileRow(profile) {
+  const row = document.createElement("article");
+  row.className = "identity-row identity-profile-row";
+  row.dataset.identityProfileId = profile.id;
+
+  const selection = document.createElement("label");
+  selection.className = "identity-selection";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = state.selectedIdentityProfiles.has(profile.id);
+  checkbox.setAttribute("aria-label", "Select " + profile.label);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) {
+      state.selectedIdentityProfiles.set(profile.id, profile);
+    } else {
+      state.selectedIdentityProfiles.delete(profile.id);
+    }
+    renderIdentitySelection();
+  });
+  selection.append(checkbox);
+
+  const main = document.createElement("div");
+  main.className = "identity-row-main";
+  const title = document.createElement("div");
+  title.className = "identity-row-title";
+  title.textContent = profile.label;
+  const meta = document.createElement("div");
+  meta.className = "identity-row-meta";
+  meta.textContent =
+    Number(profile.conversation_count || 0).toLocaleString() +
+    " conversation" +
+    (Number(profile.conversation_count) === 1 ? "" : "s") +
+    " · " +
+    Number(profile.intervention_count || 0).toLocaleString() +
+    " intervention" +
+    (Number(profile.intervention_count) === 1 ? "" : "s") +
+    " · last heard " +
+    profileDate(profile.last_seen_at || profile.created_at);
+  const counts = document.createElement("div");
+  counts.className = "identity-row-counts";
+  counts.textContent =
+    Number(profile.active_voiceprint_count || 0).toLocaleString() +
+    " current voiceprint" +
+    (Number(profile.active_voiceprint_count) === 1 ? "" : "s") +
+    (Number(profile.inactive_voiceprint_count || 0)
+      ? " · " +
+        Number(profile.inactive_voiceprint_count).toLocaleString() +
+        " inactive"
+      : "") +
+    (Number(profile.sample_count || 0)
+      ? " · " + Number(profile.sample_count).toLocaleString() + " retained sample"
+      : "");
+  const tags = document.createElement("div");
+  tags.className = "identity-row-tags";
+  if (profile.provisional) tags.append(identityTag("Provisional VOICE", "provisional"));
+  else tags.append(identityTag("Named person", "named"));
+  if (profile.active_voiceprint_count === 0) {
+    tags.append(identityTag("No current voiceprint", "muted"));
+  }
+  if (profile.duplicate_name_conflict) {
+    tags.append(
+      identityTag(
+        Number(profile.duplicate_name_count || 2) + " profiles share this name",
+        "warning",
+      ),
+    );
+  }
+  if (profile.imported) tags.append(identityTag("Imported", "imported"));
+  if (profile.sample_count > 0) tags.append(identityTag("Preview available", "sample"));
+  main.append(title, meta, counts, tags);
+
+  const actions = document.createElement("div");
+  actions.className = "identity-row-actions";
+  const speaker = identityProfileAsSpeaker(profile);
+  const preview = actionButton("Preview", () => previewSpeaker(speaker));
+  preview.disabled = Number(profile.sample_count || 0) === 0 || state.recording;
+  preview.title = preview.disabled
+    ? state.recording
+      ? "Voice preview is unavailable during recording"
+      : "No temporary sample is retained for this profile"
+    : "Play the retained excerpt";
+  const rename = actionButton(
+    profile.provisional ? "Name" : "Rename",
+    () => openNameDialog(speaker),
+  );
+  const remove = actionButton("Delete", () => deleteSpeaker(speaker), "danger-mini");
+  if (!profile.provisional && Number(profile.conversation_count || 0) > 0) {
+    remove.disabled = true;
+    remove.title = "Reassign or remove this person's conversation history first";
+  }
+  actions.append(preview, rename, remove);
+
+  row.append(selection, main, actions);
+  return row;
+}
+
+function buildUnassignedIdentityRow(group) {
+  const row = document.createElement("article");
+  row.className = "identity-row identity-unassigned-row";
+  const key = identityGroupKey(group.key);
+  row.dataset.identityGroupKey = key;
+
+  const selection = document.createElement("label");
+  selection.className = "identity-selection";
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = state.selectedUnassignedGroups.has(key);
+  checkbox.setAttribute(
+    "aria-label",
+    "Select " + group.display_label + " in " + group.session_title,
+  );
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) {
+      state.selectedUnassignedGroups.set(key, group);
+    } else {
+      state.selectedUnassignedGroups.delete(key);
+    }
+    renderIdentitySelection();
+  });
+  selection.append(checkbox);
+
+  const main = document.createElement("div");
+  main.className = "identity-row-main";
+  const title = document.createElement("div");
+  title.className = "identity-row-title";
+  title.textContent = group.display_label;
+  const conversation = document.createElement("div");
+  conversation.className = "identity-row-conversation";
+  conversation.textContent = group.session_title;
+  const meta = document.createElement("div");
+  meta.className = "identity-row-meta";
+  meta.textContent =
+    Number(group.intervention_count || 0).toLocaleString() +
+    " intervention" +
+    (Number(group.intervention_count) === 1 ? "" : "s") +
+    " · " +
+    formatTimestamp(Number(group.first_start_ms || 0)) +
+    "–" +
+    formatTimestamp(Number(group.last_end_ms || 0)) +
+    " · " +
+    profileDate(group.session_created_at);
+  const tags = document.createElement("div");
+  tags.className = "identity-row-tags";
+  tags.append(
+    identityTag(
+      group.generic ? "Generic provider label" : "Source-labelled speaker",
+      group.generic ? "muted" : "imported",
+    ),
+  );
+  const scope = identityTag("This conversation only", "scoped");
+  scope.title =
+    "An identical label in another conversation is a separate group and will not be changed unless selected.";
+  tags.append(scope);
+  main.append(title, conversation, meta, tags);
+  row.append(selection, main);
+  return row;
+}
+
+function renderIdentitySelection() {
+  const { profiles, groups } = identitySelectionCounts();
+  const parts = [];
+  if (profiles) {
+    parts.push(
+      profiles.toLocaleString() + " profile" + (profiles === 1 ? "" : "s"),
+    );
+  }
+  if (groups) {
+    parts.push(
+      groups.toLocaleString() +
+        " unassigned group" +
+        (groups === 1 ? "" : "s"),
+    );
+  }
+  elements.identitySelectionSummary.textContent = parts.length
+    ? parts.join(" and ") + " selected"
+    : "Nothing selected";
+  const hasSelection = profiles + groups > 0;
+  elements.identityClearSelection.disabled = !hasSelection;
+  elements.identityMergeButton.disabled =
+    !canConsolidateIdentitySelection() || state.identityOperationRunning;
+}
+
+function renderIdentityManager() {
+  const page = state.identityPageData;
   elements.voiceLibraryList.replaceChildren();
-  if (!state.speakers.length) {
-    const empty = document.createElement("div");
-    empty.className = "people-empty";
-    empty.textContent =
-      "No voice profiles yet. Recall creates them after the first diarized recording.";
-    elements.voiceLibraryList.append(empty);
+  elements.identityProfilesTab.classList.toggle(
+    "selected",
+    state.identityManagerView === "profiles",
+  );
+  elements.identityProfilesTab.setAttribute(
+    "aria-selected",
+    String(state.identityManagerView === "profiles"),
+  );
+  elements.identityUnassignedTab.classList.toggle(
+    "selected",
+    state.identityManagerView === "unassigned",
+  );
+  elements.identityUnassignedTab.setAttribute(
+    "aria-selected",
+    String(state.identityManagerView === "unassigned"),
+  );
+  renderIdentityStatusOptions();
+  if (!page) {
+    elements.identityManagerStatus.textContent = "Loading…";
+    renderIdentitySelection();
     return;
   }
-  const selectedSession = state.sessions.find(
-    (session) => session.id === state.selectedSessionId,
-  );
-  const selectedSpeakerIds = new Set(
-    (state.recording && state.liveWorkspaceSelected) ||
-      state.queueingProcessing ||
-      isSessionProcessing(selectedSession)
-      ? []
-      : state.selectedSegments.map((segment) => segment.speaker_id).filter(Boolean),
-  );
-  for (const speaker of state.speakers) {
-    elements.voiceLibraryList.append(
-      buildSpeakerCard(speaker, selectedSpeakerIds.has(speaker.id), true),
-    );
+  if (!page.items.length) {
+    const empty = document.createElement("div");
+    empty.className = "people-empty identity-empty";
+    empty.textContent =
+      state.identityManagerView === "profiles"
+        ? "No profiles match this search and status."
+        : "No unassigned transcript speakers match this search and status.";
+    elements.voiceLibraryList.append(empty);
+  } else {
+    for (const item of page.items) {
+      if (state.identityManagerView === "profiles") {
+        if (state.selectedIdentityProfiles.has(item.id)) {
+          state.selectedIdentityProfiles.set(item.id, item);
+        }
+        elements.voiceLibraryList.append(buildIdentityProfileRow(item));
+      } else {
+        const key = identityGroupKey(item.key);
+        if (state.selectedUnassignedGroups.has(key)) {
+          state.selectedUnassignedGroups.set(key, item);
+        }
+        elements.voiceLibraryList.append(buildUnassignedIdentityRow(item));
+      }
+    }
+  }
+  const start = page.total ? (page.page - 1) * page.page_size + 1 : 0;
+  const end = Math.min(page.total, page.page * page.page_size);
+  const noun = state.identityManagerView === "profiles" ? "profiles" : "groups";
+  elements.identityManagerStatus.textContent =
+    "Showing " +
+    start.toLocaleString() +
+    "–" +
+    end.toLocaleString() +
+    " of " +
+    Number(page.total || 0).toLocaleString() +
+    " " +
+    noun;
+  elements.identityPageStatus.textContent =
+    "Page " + page.page.toLocaleString() + " of " + page.page_count.toLocaleString();
+  elements.identityPreviousPage.disabled = page.page <= 1;
+  elements.identityNextPage.disabled = page.page >= page.page_count;
+  renderIdentitySelection();
+}
+
+async function loadIdentityManagerPage() {
+  const sequence = ++state.identityLoadSequence;
+  state.identityPageData = null;
+  renderIdentityManager();
+  const command =
+    state.identityManagerView === "profiles"
+      ? "list_identity_profiles"
+      : "list_unassigned_identities";
+  try {
+    const page = await invoke(command, {
+      search: state.identitySearch,
+      status: state.identityStatus,
+      page: state.identityPage,
+      pageSize: state.identityPageSize,
+    });
+    if (sequence !== state.identityLoadSequence) return;
+    state.identityPageData = page;
+    state.identityPage = Number(page.page || 1);
+    renderIdentityManager();
+  } catch (error) {
+    if (sequence !== state.identityLoadSequence) return;
+    const message = errorText(error);
+    elements.identityManagerStatus.textContent = "Could not load: " + message;
+    elements.voiceLibraryList.replaceChildren();
+    addActivity("Could not load People & Voices: " + message, "error");
   }
 }
 
@@ -1951,8 +2444,13 @@ async function createProfileForUnknownSegments() {
 function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
   const label = speaker.label || "Unnamed voice";
   const provisional = isProvisionalLabel(label);
+  const likelyMatch = provisional ? speaker.likely_match : null;
+  const duplicateNameConflict = Boolean(speaker.duplicate_name_conflict);
   const card = document.createElement("article");
-  card.className = "speaker-card" + (provisional ? " provisional" : "");
+  card.className =
+    "speaker-card" +
+    (provisional ? " provisional" : "") +
+    (duplicateNameConflict ? " duplicate-conflict" : "");
   const header = document.createElement("div");
   header.className = "speaker-header";
   const identity = document.createElement("div");
@@ -1995,9 +2493,19 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
     tag.textContent = "Needs identification";
     tags.append(tag);
     const matchingTag = document.createElement("span");
-    matchingTag.className = "legacy-voice-tag";
-    matchingTag.textContent = "Not auto-matched";
+    matchingTag.className = likelyMatch ? "likely-voice-tag" : "legacy-voice-tag";
+    matchingTag.textContent = likelyMatch
+      ? "Likely " + likelyMatch.label
+      : "Not auto-matched";
     tags.append(matchingTag);
+  } else if (duplicateNameConflict) {
+    const conflictTag = document.createElement("span");
+    conflictTag.className = "conflict-voice-tag";
+    conflictTag.textContent =
+      "Duplicate name · " +
+      Number(speaker.duplicate_name_count || 2) +
+      " profiles";
+    tags.append(conflictTag);
   } else if (speaker.embedding_count > 0) {
     const matchingTag = document.createElement("span");
     matchingTag.className = "recognition-voice-tag";
@@ -2018,6 +2526,37 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
   }
   if (tags.childElementCount) card.append(tags);
 
+  if (likelyMatch) {
+    const explanation = document.createElement("p");
+    explanation.className = "speaker-card-explanation likely-match-explanation";
+    const runnerUp = likelyMatch.runner_up_label
+      ? " The next different person was " +
+        likelyMatch.runner_up_label +
+        (Number.isFinite(Number(likelyMatch.runner_up_score))
+          ? " at " + Number(likelyMatch.runner_up_score).toFixed(3)
+          : "") +
+        "."
+      : "";
+    explanation.textContent =
+      "Best match: " +
+      likelyMatch.label +
+      " at " +
+      Number(likelyMatch.score).toFixed(3) +
+      " from " +
+      Number(likelyMatch.support_count || 0) +
+      " agreeing reference" +
+      (Number(likelyMatch.support_count) === 1 ? "" : "s") +
+      "." +
+      runnerUp;
+    card.append(explanation);
+  } else if (duplicateNameConflict) {
+    const explanation = document.createElement("p");
+    explanation.className = "speaker-card-explanation duplicate-match-explanation";
+    explanation.textContent =
+      "More than one person profile uses this name. Automatic matching ignores all of them until you merge the duplicates or rename one.";
+    card.append(explanation);
+  }
+
   const actions = document.createElement("div");
   actions.className = "speaker-actions";
   const preview = actionButton("Preview", () => previewSpeaker(speaker));
@@ -2030,12 +2569,24 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
       : "Play the excerpt used for this voiceprint";
   actions.append(preview);
   if (provisional) {
+    if (likelyMatch) {
+      actions.append(
+        actionButton(
+          "Assign to " + likelyMatch.label,
+          () => acceptLikelyMatch(speaker),
+          "primary-mini",
+        ),
+      );
+    }
     const nameButton = actionButton(
       "Name person",
       () => openNameDialog(speaker),
-      "primary-mini",
+      likelyMatch ? undefined : "primary-mini",
     );
-    const assignButton = actionButton("Assign…", () => openAssignDialog(speaker));
+    const assignButton = actionButton(
+      likelyMatch ? "Choose another person…" : "Assign…",
+      () => openAssignDialog(speaker),
+    );
     assignButton.disabled = !state.speakers.some(
       (candidate) => candidate.id !== speaker.id && !isProvisionalLabel(candidate.label),
     );
@@ -2062,9 +2613,375 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
   return card;
 }
 
+async function acceptLikelyMatch(speaker) {
+  const likelyMatch = speaker.likely_match;
+  if (!likelyMatch) {
+    showToast("This voice no longer has a likely-person suggestion.", "error");
+    return;
+  }
+  addActivity(
+    "Assigning " +
+      (speaker.label || "this voice") +
+      " to likely person " +
+      likelyMatch.label +
+      "…",
+  );
+  try {
+    const result = await invoke("accept_voice_match_suggestion", {
+      sourceId: speaker.id,
+      targetId: likelyMatch.speaker_id,
+    });
+    const quarantined = Number(result.quarantined_voiceprints || 0);
+    addActivity(
+      "Assigned voice history to " +
+        result.target_label +
+        "; " +
+        Number(result.activated_voiceprints || 0) +
+        " compatible voiceprint" +
+        (Number(result.activated_voiceprints) === 1 ? "" : "s") +
+        " activated" +
+        (quarantined
+          ? "; " +
+            quarantined +
+            " incompatible voiceprint" +
+            (quarantined === 1 ? "" : "s") +
+            " quarantined"
+          : ""),
+      quarantined ? undefined : "success",
+    );
+    showToast(
+      quarantined
+        ? "Person assigned; an incompatible voiceprint was kept out of automatic matching."
+        : "Voice assigned to " + result.target_label + ".",
+    );
+    await refreshIdentityViews();
+  } catch (error) {
+    addActivity("Could not accept likely person: " + errorText(error), "error");
+    showToast(errorText(error), "error");
+  }
+}
+
 async function openVoiceLibrary() {
-  await loadSpeakers();
   if (!elements.voiceLibraryDialog.open) elements.voiceLibraryDialog.showModal();
+  renderIdentityStatusOptions();
+  state.identitySearch = elements.identitySearch.value.trim();
+  await Promise.all([loadSpeakers(), loadIdentityManagerPage()]);
+}
+
+async function refreshIdentityViews() {
+  await loadSpeakers();
+  if (elements.voiceLibraryDialog.open) {
+    await loadIdentityManagerPage();
+  }
+  if (state.selectedSessionId) {
+    await selectSession(state.selectedSessionId);
+  }
+}
+
+function setIdentityManagerView(view) {
+  if (view === state.identityManagerView) return;
+  state.identityManagerView = view;
+  state.identityStatus = "all";
+  state.identityPage = 1;
+  state.identityPageData = null;
+  renderIdentityStatusOptions();
+  void loadIdentityManagerPage();
+}
+
+function scheduleIdentitySearch() {
+  if (state.identitySearchTimer) window.clearTimeout(state.identitySearchTimer);
+  state.identitySearchTimer = window.setTimeout(() => {
+    state.identitySearchTimer = null;
+    state.identitySearch = elements.identitySearch.value.trim();
+    state.identityPage = 1;
+    void loadIdentityManagerPage();
+  }, 180);
+}
+
+function clearIdentitySelection() {
+  state.selectedIdentityProfiles.clear();
+  state.selectedUnassignedGroups.clear();
+  state.identityPreview = null;
+  state.identityPreviewSignature = null;
+  renderIdentityManager();
+}
+
+function selectedIdentityProfiles() {
+  return Array.from(state.selectedIdentityProfiles.values()).sort((left, right) =>
+    String(left.label || "").localeCompare(String(right.label || ""), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    }),
+  );
+}
+
+function namedIdentityTargets() {
+  return state.speakers
+    .filter((speaker) => !isProvisionalLabel(speaker.label))
+    .sort((left, right) =>
+      String(left.label || "").localeCompare(String(right.label || ""), undefined, {
+        sensitivity: "base",
+        numeric: true,
+      }),
+    );
+}
+
+function invalidateIdentityPreview() {
+  state.identityPreview = null;
+  state.identityPreviewSignature = null;
+  elements.identityImpact.hidden = true;
+  elements.identityImpactStats.replaceChildren();
+  elements.identityImpactWarnings.replaceChildren();
+  elements.identityConfirmButton.disabled = true;
+  elements.identityMergeFeedback.textContent = "";
+}
+
+function setIdentityTargetOptions() {
+  const profiles = selectedIdentityProfiles();
+  const previous = elements.identityTarget.value;
+  elements.identityTarget.replaceChildren();
+  if (profiles.length) {
+    for (const profile of profiles) {
+      const option = document.createElement("option");
+      option.value = profile.id;
+      option.textContent =
+        profile.label +
+        (profile.provisional ? " · provisional" : "") +
+        " · " +
+        Number(profile.conversation_count || 0).toLocaleString() +
+        " conversations";
+      elements.identityTarget.append(option);
+    }
+  } else {
+    const create = document.createElement("option");
+    create.value = "__new__";
+    create.textContent = "Create a new name-only person";
+    elements.identityTarget.append(create);
+    for (const speaker of namedIdentityTargets()) {
+      const option = document.createElement("option");
+      option.value = speaker.id;
+      option.textContent =
+        (speaker.label || "Unnamed person") +
+        " · " +
+        Number(speaker.conversation_count || 0).toLocaleString() +
+        " conversations";
+      elements.identityTarget.append(option);
+    }
+  }
+  if (
+    previous &&
+    Array.from(elements.identityTarget.options).some(
+      (option) => option.value === previous,
+    )
+  ) {
+    elements.identityTarget.value = previous;
+  }
+  syncIdentityFinalLabelToTarget(true);
+}
+
+function identityTargetLabel() {
+  const targetId = elements.identityTarget.value;
+  if (!targetId || targetId === "__new__") return "";
+  const selected = state.selectedIdentityProfiles.get(targetId);
+  if (selected) return selected.label || "";
+  return (
+    state.speakers.find((speaker) => speaker.id === targetId)?.label || ""
+  );
+}
+
+function syncIdentityFinalLabelToTarget(force = false) {
+  const previousAutomatic = elements.identityFinalLabel.dataset.automaticValue || "";
+  const targetLabel = identityTargetLabel();
+  if (
+    force ||
+    !elements.identityFinalLabel.value.trim() ||
+    elements.identityFinalLabel.value === previousAutomatic
+  ) {
+    elements.identityFinalLabel.value = isProvisionalLabel(targetLabel)
+      ? ""
+      : targetLabel;
+  }
+  elements.identityFinalLabel.dataset.automaticValue =
+    elements.identityFinalLabel.value;
+  invalidateIdentityPreview();
+}
+
+async function openIdentityMergeDialog() {
+  if (!canConsolidateIdentitySelection()) return;
+  const { profiles, groups } = identitySelectionCounts();
+  elements.identityMergeSelection.textContent =
+    profiles.toLocaleString() +
+    " profile" +
+    (profiles === 1 ? "" : "s") +
+    " and " +
+    groups.toLocaleString() +
+    " unassigned group" +
+    (groups === 1 ? "" : "s") +
+    " will be reviewed together. Choose the person whose identity should remain.";
+  setIdentityTargetOptions();
+  invalidateIdentityPreview();
+  if (!elements.identityMergeDialog.open) {
+    elements.identityMergeDialog.showModal();
+  }
+  window.setTimeout(() => {
+    if (elements.identityFinalLabel.value) elements.identityFinalLabel.select();
+    else elements.identityFinalLabel.focus();
+  }, 0);
+}
+
+function identityConsolidationRequest() {
+  return {
+    profile_ids: Array.from(state.selectedIdentityProfiles.keys()),
+    unassigned_groups: Array.from(state.selectedUnassignedGroups.values()).map(
+      (group) => serializableCopy(group.key),
+    ),
+    target_speaker_id:
+      elements.identityTarget.value &&
+      elements.identityTarget.value !== "__new__"
+        ? elements.identityTarget.value
+        : null,
+    final_label: elements.identityFinalLabel.value.trim(),
+  };
+}
+
+function identityRequestSignature(request) {
+  return JSON.stringify({
+    profile_ids: [...request.profile_ids].sort(),
+    unassigned_groups: [...request.unassigned_groups].sort((left, right) =>
+      identityGroupKey(left).localeCompare(identityGroupKey(right)),
+    ),
+    target_speaker_id: request.target_speaker_id,
+    final_label: request.final_label,
+  });
+}
+
+function identityImpactStat(value, label) {
+  const item = document.createElement("div");
+  item.className = "identity-impact-stat";
+  const number = document.createElement("strong");
+  number.textContent = Number(value || 0).toLocaleString();
+  const copy = document.createElement("span");
+  copy.textContent = label;
+  item.append(number, copy);
+  return item;
+}
+
+function renderIdentityImpact(preview) {
+  elements.identityImpactStats.replaceChildren(
+    identityImpactStat(preview.affected_conversation_count, "conversations"),
+    identityImpactStat(preview.affected_intervention_count, "interventions"),
+    identityImpactStat(preview.stale_recap_count, "recaps made out of date"),
+    identityImpactStat(preview.active_voiceprint_count, "current voiceprints reviewed"),
+    identityImpactStat(preview.inactive_voiceprint_count, "inactive voiceprints kept"),
+    identityImpactStat(preview.samples_to_delete, "temporary samples deleted"),
+  );
+  elements.identityImpactWarnings.replaceChildren();
+  const warnings = preview.warnings || [];
+  if (!warnings.length) {
+    const item = document.createElement("li");
+    item.textContent = "No additional warnings.";
+    elements.identityImpactWarnings.append(item);
+  } else {
+    for (const warning of warnings) {
+      const item = document.createElement("li");
+      item.textContent = warning;
+      elements.identityImpactWarnings.append(item);
+    }
+  }
+  elements.identityImpact.hidden = false;
+}
+
+async function previewIdentityConsolidation() {
+  const request = identityConsolidationRequest();
+  if (!request.final_label) {
+    elements.identityMergeFeedback.textContent = "Enter the final display name.";
+    elements.identityFinalLabel.focus();
+    return;
+  }
+  elements.identityPreviewButton.disabled = true;
+  elements.identityMergeFeedback.textContent = "Calculating the exact impact…";
+  invalidateIdentityPreview();
+  elements.identityMergeFeedback.textContent = "Calculating the exact impact…";
+  try {
+    const preview = await invoke("preview_identity_consolidation", {
+      request: serializableCopy(request),
+    });
+    state.identityPreview = preview;
+    state.identityPreviewSignature = identityRequestSignature(request);
+    renderIdentityImpact(preview);
+    elements.identityMergeFeedback.textContent =
+      "Review the impact below before confirming.";
+    elements.identityConfirmButton.disabled = false;
+  } catch (error) {
+    const message = errorText(error);
+    elements.identityMergeFeedback.textContent = message;
+    addActivity("Could not preview the people and voices change: " + message, "error");
+  } finally {
+    elements.identityPreviewButton.disabled = false;
+  }
+}
+
+async function confirmIdentityConsolidation() {
+  const request = identityConsolidationRequest();
+  if (
+    !state.identityPreview ||
+    state.identityPreviewSignature !== identityRequestSignature(request)
+  ) {
+    invalidateIdentityPreview();
+    elements.identityMergeFeedback.textContent =
+      "The selection or final name changed. Review the impact again.";
+    return;
+  }
+  const preview = state.identityPreview;
+  const affectedSessionIds = new Set(preview.affected_session_ids || []);
+  if (elements.identityMergeDialog.open) elements.identityMergeDialog.close();
+  if (elements.voiceLibraryDialog.open) elements.voiceLibraryDialog.close();
+  state.identityOperationRunning = true;
+  elements.identityOperationBadge.hidden = false;
+  elements.peopleVoicesButton.classList.add("working");
+  renderIdentitySelection();
+  const startedAt = performance.now();
+  addActivity(
+    "People & Voices: changing " +
+      Number(preview.affected_conversation_count || 0).toLocaleString() +
+      " conversations…",
+  );
+  showToast("People and voice changes are running in the background.");
+  try {
+    const result = await invoke("consolidate_identities", {
+      request: serializableCopy(request),
+    });
+    const elapsedSeconds = (performance.now() - startedAt) / 1000;
+    addActivity(
+      "People & Voices: " +
+        result.target_label +
+        " saved across " +
+        Number(result.affected_conversation_count || 0).toLocaleString() +
+        " conversations in " +
+        elapsedSeconds.toFixed(1) +
+        "s; verified backup " +
+        result.backup_path,
+      "success",
+    );
+    showToast(result.target_label + " and the selected history were updated.");
+    clearIdentitySelection();
+    await loadSpeakers();
+    if (
+      state.selectedSessionId &&
+      affectedSessionIds.has(state.selectedSessionId)
+    ) {
+      await selectSession(state.selectedSessionId);
+    }
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("People & Voices change failed: " + message, "error");
+    showToast(message, "error");
+  } finally {
+    state.identityOperationRunning = false;
+    elements.identityOperationBadge.hidden = true;
+    elements.peopleVoicesButton.classList.remove("working");
+    renderIdentitySelection();
+  }
 }
 
 function actionButton(label, handler, className) {
@@ -2138,19 +3055,34 @@ async function saveSpeakerName(event) {
   const name = elements.speakerName.value.trim();
   if (!speakerId || !name) return;
   try {
-    await invoke("rename_speaker", { speakerId, newLabel: name });
+    const result = await invoke("rename_speaker", { speakerId, newLabel: name });
+    if (result?.status === "conflict" && result.conflicting_speaker_id) {
+      elements.nameDialog.close();
+      await loadSpeakers();
+      const source = state.speakers.find((speaker) => speaker.id === speakerId);
+      addActivity(
+        "The name " +
+          (result.conflicting_label || name) +
+          " already belongs to another profile; choose whether to assign or merge this voice",
+      );
+      showToast(
+        "That person already exists. Assign this voice to the existing profile instead.",
+        "error",
+      );
+      if (source) openAssignDialog(source, result.conflicting_speaker_id);
+      return;
+    }
     elements.nameDialog.close();
     addActivity("Voice profile named " + name + "; temporary sample deleted", "success");
     showToast("Voice profile saved as " + name + ".");
-    await Promise.all([loadSpeakers(), loadSessions()]);
-    if (state.selectedSessionId) await selectSession(state.selectedSessionId);
+    await refreshIdentityViews();
   } catch (error) {
     addActivity("Could not name voice profile: " + errorText(error), "error");
     showToast(errorText(error), "error");
   }
 }
 
-function openAssignDialog(source) {
+function openAssignDialog(source, preferredTargetId = null) {
   const candidates = state.speakers.filter(
     (candidate) => candidate.id !== source.id && !isProvisionalLabel(candidate.label),
   );
@@ -2160,11 +3092,30 @@ function openAssignDialog(source) {
   }
   elements.assignSourceId.value = source.id;
   elements.assignTarget.replaceChildren();
+  candidates.sort((left, right) =>
+    String(left.label || "").localeCompare(String(right.label || ""), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    }),
+  );
   for (const candidate of candidates) {
     const option = document.createElement("option");
     option.value = candidate.id;
-    option.textContent = candidate.label || "Unnamed voice";
+    option.textContent =
+      (candidate.label || "Unnamed voice") +
+      (candidate.duplicate_name_conflict
+        ? " · duplicate profile · " +
+          candidate.conversation_count +
+          " conversation" +
+          (candidate.conversation_count === 1 ? "" : "s")
+        : "");
     elements.assignTarget.append(option);
+  }
+  if (
+    preferredTargetId &&
+    candidates.some((candidate) => candidate.id === preferredTargetId)
+  ) {
+    elements.assignTarget.value = preferredTargetId;
   }
   const keep = elements.assignForm.querySelector('input[name="voiceprintMode"][value="keep"]');
   keep.checked = true;
@@ -2179,7 +3130,7 @@ async function assignVoiceProfile(event) {
   const replaceEmbeddings = mode && mode.value === "replace";
   if (!sourceId || !targetId) return;
   try {
-    await invoke("merge_speakers", {
+    const result = await invoke("merge_speakers", {
       sourceId,
       targetId,
       replaceEmbeddings,
@@ -2189,12 +3140,28 @@ async function assignVoiceProfile(event) {
     addActivity(
       "Voice profile assigned to " +
         (target ? target.label : "existing person") +
-        (replaceEmbeddings ? "; prior voiceprints replaced" : "; voiceprints combined"),
-      "success",
+        (replaceEmbeddings
+          ? "; prior voiceprints replaced"
+          : "; " +
+            Number(result.activated_voiceprints || 0) +
+            " compatible voiceprint" +
+            (Number(result.activated_voiceprints) === 1 ? "" : "s") +
+            " added") +
+        (Number(result.quarantined_voiceprints || 0)
+          ? "; " +
+            Number(result.quarantined_voiceprints) +
+            " incompatible voiceprint" +
+            (Number(result.quarantined_voiceprints) === 1 ? "" : "s") +
+            " quarantined"
+          : ""),
+      Number(result.quarantined_voiceprints || 0) ? undefined : "success",
     );
-    showToast("Voice profile assignment saved.");
-    await Promise.all([loadSpeakers(), loadSessions()]);
-    if (state.selectedSessionId) await selectSession(state.selectedSessionId);
+    showToast(
+      Number(result.quarantined_voiceprints || 0)
+        ? "Person assigned; an incompatible voiceprint was kept out of automatic matching."
+        : "Voice profile assignment saved.",
+    );
+    await refreshIdentityViews();
   } catch (error) {
     addActivity("Could not assign voice profile: " + errorText(error), "error");
     showToast(errorText(error), "error");
@@ -2236,8 +3203,7 @@ async function deleteSpeaker(speaker) {
   try {
     await invoke("delete_speaker", { speakerId: speaker.id });
     addActivity("Voice profile " + label + " deleted", "success");
-    await Promise.all([loadSpeakers(), loadSessions()]);
-    if (state.selectedSessionId) await selectSession(state.selectedSessionId);
+    await refreshIdentityViews();
   } catch (error) {
     addActivity("Could not delete voice profile: " + errorText(error), "error");
     showToast(errorText(error), "error");
@@ -2276,11 +3242,24 @@ function transcriptExport(markdown) {
 
 function generatedExport(markdown) {
   const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
-  const payload = state.recapState?.recap?.payload;
-  if (!session || !payload) return "";
+  if (!session) return "";
   const lines = [markdown ? "# " + sessionTitle(session) : sessionTitle(session), ""];
   const heading = (value, level = 2) =>
     markdown ? "#".repeat(level) + " " + value : value.toUpperCase();
+  if (state.activeRecapTab.startsWith("imported-")) {
+    const artifact = state.importedArtifact;
+    if (!artifact) return "";
+    const imported = {
+      "imported-executive": ["Executive summary", artifact.executive_summary],
+      "imported-full": ["Full summary", artifact.full_summary],
+      "imported-tasks": ["Tasks", artifact.tasks],
+    };
+    const [title, content] = imported[state.activeRecapTab] || imported["imported-full"];
+    lines.push(heading(title), "", content || "");
+    return lines.join("\n").trim();
+  }
+  const payload = state.recapState?.recap?.payload;
+  if (!payload) return "";
   const evidence = (ids) => evidenceLabel(ids);
   if (state.activeRecapTab === "executive") {
     lines.push(heading("Executive summary"), "", localized(payload.executive_summary));
@@ -2569,15 +3548,782 @@ async function runRecap(allowUnresolved) {
 }
 
 async function loadSettingsData() {
-  const [status, preferences, devices, translationLanguages] = await Promise.all([
+  return loadSettingsDataInner();
+}
+
+function normalizedImportName(value) {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+function jamieIdentityValidationIssue(identity, preview = state.jamieImportPreview) {
+  if (!preview || !identity || identity.generic) return null;
+  const decision = identity.decision;
+  if (!decision || decision.action === "review") {
+    return "Choose how to import this source name.";
+  }
+  if (decision.action === "proposed_map") {
+    return "Accept or change the suggested match.";
+  }
+  if (decision.action === "map_existing") {
+    const knownIds = new Set((preview.known_people || []).map((person) => person.id));
+    if (!knownIds.has(decision.target_speaker_id)) {
+      return "Choose an existing person.";
+    }
+  }
+  if (decision.action === "create_named") {
+    const name = normalizedImportName(decision.display_name);
+    if (!name) {
+      return "Enter a display name.";
+    }
+    const knownNames = new Set(
+      (preview.known_people || []).map((person) =>
+        normalizedImportName(person.label),
+      ),
+    );
+    if (knownNames.has(name)) {
+      return "That person already exists in Recall. Map the source name to the existing person instead.";
+    }
+  }
+  return null;
+}
+
+function jamieImportErrors() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return ["Choose a Jamie export first."];
+  const errors = [];
+  for (const warning of preview.archive_warnings || []) {
+    if (warning.blocking) errors.push(warning.message);
+  }
+  for (const identity of preview.identities || []) {
+    const issue = jamieIdentityValidationIssue(identity, preview);
+    if (issue) errors.push(identity.alias + ": " + issue);
+  }
+  for (const meeting of preview.meetings || []) {
+    if (!meeting.included || meeting.already_imported) continue;
+    for (const warning of meeting.warnings || []) {
+      if (warning.blocking) errors.push(meeting.title + ": " + warning.message);
+    }
+  }
+  const newMeetingCount = (preview.meetings || []).filter(
+    (meeting) => meeting.included && !meeting.already_imported,
+  ).length;
+  if (!newMeetingCount) errors.push("No new meetings are selected for import.");
+  return Array.from(new Set(errors));
+}
+
+function jamieDecisionCounts() {
+  const identities = (state.jamieImportPreview?.identities || []).filter(
+    (identity) => !identity.generic,
+  );
+  return {
+    total: identities.length,
+    review: identities.filter((identity) =>
+      Boolean(jamieIdentityValidationIssue(identity)),
+    ).length,
+    mapped: identities.filter(
+      (identity) => identity.decision?.action === "map_existing",
+    ).length,
+    created: identities.filter(
+      (identity) => identity.decision?.action === "create_named",
+    ).length,
+    unresolved: identities.filter(
+      (identity) => identity.decision?.action === "unresolved",
+    ).length,
+  };
+}
+
+function importStat(label, value) {
+  const item = document.createElement("div");
+  item.className = "import-stat";
+  const number = document.createElement("strong");
+  number.textContent = Number(value || 0).toLocaleString();
+  const copy = document.createElement("span");
+  copy.textContent = label;
+  item.append(number, copy);
+  return item;
+}
+
+function renderJamieImportOverview() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return;
+  const metadata = preview.metadata || {};
+  const selectedMeetings = (preview.meetings || []).filter(
+    (meeting) => meeting.included && !meeting.already_imported,
+  ).length;
+  const genericCount = (preview.identities || []).filter(
+    (identity) => identity.generic,
+  ).length;
+  elements.jamieImportSource.textContent =
+    metadata.user ? "Jamie export for " + metadata.user : "Jamie meeting export";
+  const sourceParts = [];
+  if (metadata.export_date) {
+    sourceParts.push("Exported " + new Date(metadata.export_date).toLocaleString());
+  }
+  sourceParts.push(
+    (Number(metadata.source_size_bytes || 0) / 1_000_000).toFixed(1) + " MB",
+  );
+  sourceParts.push("source " + String(metadata.source_sha256 || "").slice(0, 12));
+  elements.jamieImportSummary.textContent = sourceParts.join(" · ");
+  elements.jamieImportStats.replaceChildren(
+    importStat("meetings", preview.meetings.length),
+    importStat("selected", selectedMeetings),
+    importStat("interventions", preview.total_intervention_count),
+    importStat("source names", jamieDecisionCounts().total),
+  );
+  elements.jamieGenericIdentityNote.textContent =
+    genericCount.toLocaleString() +
+    " generic labels such as “Speaker 0” stay local to their meetings and will not create people in the Voice Library.";
+}
+
+function renderJamieValidation() {
+  const errors = jamieImportErrors();
+  const counts = jamieDecisionCounts();
+  elements.jamieValidationPanel.replaceChildren();
+  const title = document.createElement("strong");
+  const detail = document.createElement("span");
+  if (!errors.length) {
+    elements.jamieValidationPanel.className = "import-validation ready";
+    title.textContent = "Ready to import";
+    detail.textContent =
+      counts.mapped +
+      " mapped · " +
+      counts.created +
+      " new people · " +
+      counts.unresolved +
+      " left unresolved";
+  } else {
+    elements.jamieValidationPanel.className = "import-validation warning";
+    title.textContent =
+      errors.length.toLocaleString() +
+      " review item" +
+      (errors.length === 1 ? "" : "s") +
+      " remaining";
+    const visible = errors.slice(0, 4);
+    detail.textContent =
+      visible.join(" ") +
+      (errors.length > visible.length
+        ? " " + (errors.length - visible.length) + " more."
+        : "");
+  }
+  elements.jamieValidationPanel.append(title, detail);
+  elements.jamieImportButton.disabled = Boolean(errors.length) || state.jamieImportRunning;
+  renderJamieImportOverview();
+}
+
+function jamieIdentityIssueControl(identity, row) {
+  const existing = row.querySelector(".jamie-identity-issue");
+  if (existing) existing.remove();
+  const issue = jamieIdentityValidationIssue(identity);
+  if (!issue) return;
+  const message = document.createElement("p");
+  message.className = "jamie-identity-issue";
+  message.textContent = issue;
+  row.append(message);
+}
+
+function jamieIdentitySecondaryControl(identity, row) {
+  const decision = identity.decision;
+  const preview = state.jamieImportPreview;
+  const existing = row.querySelector(".jamie-identity-secondary");
+  if (existing) existing.remove();
+  const container = document.createElement("div");
+  container.className = "jamie-identity-secondary";
+  if (decision.action === "map_existing" || decision.action === "proposed_map") {
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "Existing person for " + identity.alias);
+    const empty = document.createElement("option");
+    empty.value = "";
+    empty.textContent = "Choose a person…";
+    select.append(empty);
+    for (const person of preview.known_people || []) {
+      const option = document.createElement("option");
+      option.value = person.id;
+      option.textContent = person.label;
+      option.selected = person.id === decision.target_speaker_id;
+      select.append(option);
+    }
+    select.addEventListener("change", () => {
+      decision.target_speaker_id = select.value || null;
+      const person = (preview.known_people || []).find(
+        (candidate) => candidate.id === select.value,
+      );
+      decision.display_name = person?.label || null;
+      if (decision.action === "proposed_map" && select.value) {
+        decision.action = "map_existing";
+        const action = row.querySelector(".jamie-identity-action");
+        if (action) action.value = "map_existing";
+      }
+      scheduleJamieImportDraftSave();
+      renderJamieValidation();
+      jamieIdentityIssueControl(identity, row);
+    });
+    container.append(select);
+    if (decision.action === "proposed_map" && decision.target_speaker_id) {
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "secondary-button compact-action";
+      accept.textContent = "Accept match";
+      accept.addEventListener("click", () => {
+        decision.action = "map_existing";
+        const action = row.querySelector(".jamie-identity-action");
+        if (action) action.value = "map_existing";
+        scheduleJamieImportDraftSave();
+        jamieIdentitySecondaryControl(identity, row);
+        renderJamieValidation();
+        jamieIdentityIssueControl(identity, row);
+      });
+      container.append(accept);
+    }
+  } else if (decision.action === "create_named") {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = decision.display_name || identity.alias;
+    input.placeholder = "Display name";
+    input.setAttribute("aria-label", "New Recall name for " + identity.alias);
+    input.addEventListener("input", () => {
+      decision.display_name = input.value;
+      scheduleJamieImportDraftSave();
+      renderJamieValidation();
+      jamieIdentityIssueControl(identity, row);
+    });
+    container.append(input);
+  } else if (decision.action === "unresolved") {
+    const note = document.createElement("span");
+    note.className = "field-help";
+    note.textContent =
+      "Transcript turns keep the source label. No person or voiceprint is created.";
+    container.append(note);
+  }
+  row.append(container);
+}
+
+function renderJamieIdentityList() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return;
+  const query = elements.jamieIdentitySearch.value.trim().toLocaleLowerCase();
+  const needsReviewOnly = elements.jamieIdentityNeedsReview.checked;
+  const identities = preview.identities.filter((identity) => {
+    if (identity.generic) return false;
+    if (query && !identity.alias.toLocaleLowerCase().includes(query)) return false;
+    if (
+      needsReviewOnly &&
+      !jamieIdentityValidationIssue(identity, preview)
+    ) {
+      return false;
+    }
+    return true;
+  });
+  elements.jamieIdentityList.replaceChildren();
+  if (!identities.length) {
+    const empty = document.createElement("p");
+    empty.className = "import-list-empty";
+    empty.textContent = needsReviewOnly
+      ? "No source names currently need attention."
+      : "No source names match this search.";
+    elements.jamieIdentityList.append(empty);
+    return;
+  }
+  for (const identity of identities) {
+    const row = document.createElement("article");
+    row.className = "jamie-identity-row";
+    const heading = document.createElement("div");
+    heading.className = "jamie-identity-heading";
+    const copy = document.createElement("div");
+    const name = document.createElement("strong");
+    name.textContent = identity.alias;
+    const meta = document.createElement("span");
+    meta.textContent =
+      identity.meeting_count.toLocaleString() +
+      " meeting" +
+      (identity.meeting_count === 1 ? "" : "s") +
+      " · " +
+      identity.intervention_count.toLocaleString() +
+      " intervention" +
+      (identity.intervention_count === 1 ? "" : "s");
+    copy.append(name, meta);
+    const action = document.createElement("select");
+    action.className = "jamie-identity-action";
+    action.setAttribute("aria-label", "Import action for " + identity.alias);
+    const actionOptions = [
+      ["review", "Choose…"],
+      ["proposed_map", "Review suggested match"],
+      ["map_existing", "Map to existing person"],
+      ["create_named", "Create name-only person"],
+      ["unresolved", "Leave unresolved"],
+    ];
+    for (const [value, label] of actionOptions) {
+      if (value === "proposed_map" && identity.decision.action !== value) continue;
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      option.selected = identity.decision.action === value;
+      action.append(option);
+    }
+    action.addEventListener("change", () => {
+      identity.decision.action = action.value;
+      if (action.value === "create_named" && !identity.decision.display_name) {
+        identity.decision.display_name = identity.alias;
+      }
+      if (action.value === "unresolved" || action.value === "review") {
+        identity.decision.target_speaker_id = null;
+      }
+      scheduleJamieImportDraftSave();
+      jamieIdentitySecondaryControl(identity, row);
+      renderJamieValidation();
+      jamieIdentityIssueControl(identity, row);
+    });
+    heading.append(copy, action);
+    row.append(heading);
+    if (identity.excerpts?.length) {
+      const details = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "Transcript excerpts";
+      details.append(summary);
+      for (const excerpt of identity.excerpts) {
+        const paragraph = document.createElement("p");
+        paragraph.textContent = excerpt;
+        details.append(paragraph);
+      }
+      row.append(details);
+    }
+    jamieIdentitySecondaryControl(identity, row);
+    jamieIdentityIssueControl(identity, row);
+    elements.jamieIdentityList.append(row);
+  }
+}
+
+function setJamieMeetingIncluded(meeting, included) {
+  meeting.included = included;
+  const excluded = new Set(state.jamieImportPreview.draft.excluded_meetings || []);
+  if (included) excluded.delete(meeting.source_fingerprint);
+  else excluded.add(meeting.source_fingerprint);
+  state.jamieImportPreview.draft.excluded_meetings = Array.from(excluded);
+  scheduleJamieImportDraftSave();
+  renderJamieValidation();
+}
+
+function renderJamieMeetingList() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return;
+  const query = elements.jamieMeetingSearch.value.trim().toLocaleLowerCase();
+  const issuesOnly = elements.jamieMeetingIssuesOnly.checked;
+  const meetings = preview.meetings.filter((meeting) => {
+    if (query && !meeting.title.toLocaleLowerCase().includes(query)) return false;
+    if (issuesOnly && !(meeting.warnings || []).length) return false;
+    return true;
+  });
+  elements.jamieMeetingList.replaceChildren();
+  if (!meetings.length) {
+    const empty = document.createElement("p");
+    empty.className = "import-list-empty";
+    empty.textContent = "No meetings match this view.";
+    elements.jamieMeetingList.append(empty);
+    return;
+  }
+  for (const meeting of meetings) {
+    const row = document.createElement("label");
+    row.className =
+      "jamie-meeting-row" +
+      ((meeting.warnings || []).some((warning) => warning.blocking)
+        ? " blocking"
+        : "") +
+      (meeting.already_imported ? " imported" : "");
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = meeting.included;
+    checkbox.disabled = meeting.already_imported;
+    checkbox.addEventListener("change", () =>
+      setJamieMeetingIncluded(meeting, checkbox.checked),
+    );
+    const body = document.createElement("span");
+    body.className = "jamie-meeting-copy";
+    const title = document.createElement("strong");
+    title.textContent = meeting.title || "Untitled meeting";
+    const metadata = document.createElement("span");
+    const parts = [];
+    if (meeting.started_at) {
+      parts.push(new Date(meeting.started_at).toLocaleString());
+    }
+    parts.push(
+      meeting.intervention_count.toLocaleString() +
+        " intervention" +
+        (meeting.intervention_count === 1 ? "" : "s"),
+    );
+    parts.push(
+      meeting.speaker_count.toLocaleString() +
+        " source speaker" +
+        (meeting.speaker_count === 1 ? "" : "s"),
+    );
+    metadata.textContent = parts.join(" · ");
+    body.append(title, metadata);
+    for (const warning of meeting.warnings || []) {
+      const warningCopy = document.createElement("em");
+      warningCopy.textContent = warning.message;
+      body.append(warningCopy);
+    }
+    if (meeting.already_imported) {
+      const badge = document.createElement("span");
+      badge.className = "imported-meeting-badge";
+      badge.textContent = "Already imported";
+      body.append(badge);
+    }
+    row.append(checkbox, body);
+    elements.jamieMeetingList.append(row);
+  }
+}
+
+function renderJamieImportReview() {
+  const preview = state.jamieImportPreview;
+  elements.jamieImportLoading.hidden = true;
+  elements.jamieImportError.hidden = true;
+  elements.jamieImportReview.hidden = !preview;
+  if (!preview) return;
+  renderJamieImportOverview();
+  renderJamieIdentityList();
+  renderJamieMeetingList();
+  renderJamieValidation();
+}
+
+function scheduleJamieImportDraftSave() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return;
+  preview.draft.updated_at = new Date().toISOString();
+  preview.draft.identity_decisions = preview.identities.map(
+    (identity) => identity.decision,
+  );
+  const revision = ++state.jamieImportRevision;
+  if (state.jamieImportSaveTimer) {
+    window.clearTimeout(state.jamieImportSaveTimer);
+  }
+  elements.jamieImportFeedback.textContent = "Saving review…";
+  state.jamieImportSaveTimer = window.setTimeout(async () => {
+    state.jamieImportSaveTimer = null;
+    try {
+      await invoke("save_jamie_import_draft", {
+        draft: serializableCopy(preview.draft),
+      });
+      if (revision === state.jamieImportRevision) {
+        elements.jamieImportFeedback.textContent = "Review saved locally.";
+      }
+    } catch (error) {
+      if (revision === state.jamieImportRevision) {
+        const message = errorText(error);
+        elements.jamieImportFeedback.textContent = message;
+        addActivity("Could not save Jamie import review: " + message, "error");
+      }
+    }
+  }, 450);
+}
+
+function showJamieImportLoading() {
+  state.jamieImportPreview = null;
+  elements.jamieImportReview.hidden = true;
+  elements.jamieImportError.hidden = true;
+  elements.jamieImportErrorMessage.textContent = "";
+  elements.jamieImportLoading.hidden = false;
+  elements.jamieImportFeedback.textContent = "";
+  if (elements.settingsDialog.open) elements.settingsDialog.close();
+  if (!elements.jamieImportDialog.open) elements.jamieImportDialog.showModal();
+}
+
+function showJamieImportError(message) {
+  elements.jamieImportLoading.hidden = true;
+  elements.jamieImportReview.hidden = true;
+  elements.jamieImportError.hidden = false;
+  elements.jamieImportErrorMessage.textContent = message;
+  elements.jamieImportFeedback.textContent = "";
+  if (!elements.jamieImportDialog.open) elements.jamieImportDialog.showModal();
+}
+
+async function openJamieImport(command) {
+  const choosingFile = command === "choose_jamie_export";
+  const settingsWasOpen = elements.settingsDialog.open;
+  addActivity(
+    choosingFile
+      ? "Choose a Jamie archive to inspect"
+      : "Opening the saved Jamie import review",
+  );
+  try {
+    let preview;
+    if (choosingFile) {
+      if (elements.settingsDialog.open) elements.settingsDialog.close();
+      const sourcePath = await invoke("choose_jamie_export");
+      if (!sourcePath) {
+        if (settingsWasOpen && !elements.settingsDialog.open) {
+          elements.settingsDialog.showModal();
+        }
+        return;
+      }
+      showJamieImportLoading();
+      preview = await invoke("inspect_jamie_export", { sourcePath });
+    } else {
+      showJamieImportLoading();
+      preview = await invoke(command);
+    }
+    if (!preview) {
+      if (elements.jamieImportDialog.open) elements.jamieImportDialog.close();
+      if (command === "resume_jamie_import") {
+        showToast("There is no saved Jamie import review.");
+      }
+      return;
+    }
+    state.jamieImportPreview = preview;
+    state.jamieImportRevision = 0;
+    elements.jamieIdentitySearch.value = "";
+    elements.jamieIdentityNeedsReview.checked = true;
+    elements.jamieMeetingSearch.value = "";
+    elements.jamieMeetingIssuesOnly.checked = false;
+    renderJamieImportReview();
+    addActivity(
+      "Jamie archive inspected: " +
+        preview.meetings.length.toLocaleString() +
+        " meetings, " +
+        preview.total_intervention_count.toLocaleString() +
+        " interventions",
+      "success",
+    );
+  } catch (error) {
+    const message = errorText(error);
+    showJamieImportError(message);
+    addActivity("Could not inspect the Jamie archive: " + message, "error");
+    showToast(message, "error");
+  }
+}
+
+function useJamieSourceNames() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return;
+  const peopleByName = new Map(
+    (preview.known_people || []).map((person) => [
+      normalizedImportName(person.label),
+      person,
+    ]),
+  );
+  for (const identity of preview.identities) {
+    if (identity.generic) continue;
+    const suggested = identity.decision.target_speaker_id
+      ? (preview.known_people || []).find(
+          (person) => person.id === identity.decision.target_speaker_id,
+        )
+      : null;
+    const exact = peopleByName.get(normalizedImportName(identity.alias));
+    const person = suggested || exact;
+    if (person) {
+      identity.decision.action = "map_existing";
+      identity.decision.target_speaker_id = person.id;
+      identity.decision.display_name = person.label;
+    } else {
+      identity.decision.action = "create_named";
+      identity.decision.target_speaker_id = null;
+      identity.decision.display_name = identity.alias;
+    }
+  }
+  scheduleJamieImportDraftSave();
+  renderJamieIdentityList();
+  renderJamieValidation();
+}
+
+function excludeUnreadableJamieMeetings() {
+  const preview = state.jamieImportPreview;
+  if (!preview) return;
+  for (const meeting of preview.meetings) {
+    if ((meeting.warnings || []).some((warning) => warning.blocking)) {
+      meeting.included = false;
+    }
+  }
+  preview.draft.excluded_meetings = preview.meetings
+    .filter((meeting) => !meeting.included)
+    .map((meeting) => meeting.source_fingerprint);
+  scheduleJamieImportDraftSave();
+  renderJamieMeetingList();
+  renderJamieValidation();
+}
+
+async function runJamieImport() {
+  const preview = state.jamieImportPreview;
+  if (!preview || state.jamieImportRunning) return;
+  const errors = jamieImportErrors();
+  if (errors.length) {
+    renderJamieValidation();
+    return;
+  }
+  const meetingCount = preview.meetings.filter(
+    (meeting) => meeting.included && !meeting.already_imported,
+  ).length;
+  const createdPeople = new Set(
+    preview.identities
+      .filter((identity) => identity.decision.action === "create_named")
+      .map((identity) => normalizedImportName(identity.decision.display_name)),
+  ).size;
+  const reviewWasOpen = elements.jamieImportDialog.open;
+  if (reviewWasOpen) elements.jamieImportDialog.close();
+  const confirmed = await requestConfirmation({
+    title: "Import this Jamie archive?",
+    message:
+      meetingCount.toLocaleString() +
+      " meetings will be added to Recall. " +
+      createdPeople.toLocaleString() +
+      " name-only people will be created. Recall will make a verified database backup first.",
+    acceptLabel: "Import archive",
+  });
+  if (!confirmed) {
+    if (reviewWasOpen && !elements.jamieImportDialog.open) {
+      elements.jamieImportDialog.showModal();
+    }
+    return;
+  }
+  if (state.jamieImportSaveTimer) {
+    window.clearTimeout(state.jamieImportSaveTimer);
+    state.jamieImportSaveTimer = null;
+  }
+  try {
+    await invoke("save_jamie_import_draft", {
+      draft: serializableCopy(preview.draft),
+    });
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not save the final Jamie import review: " + message, "error");
+    showToast(message, "error");
+    if (!elements.jamieImportDialog.open) elements.jamieImportDialog.showModal();
+    return;
+  }
+  state.jamieImportRunning = true;
+  elements.jamieImportButton.disabled = true;
+  elements.jamieImportFeedback.textContent = "Importing in the background…";
+  addActivity(
+    "Jamie import started: " + meetingCount.toLocaleString() + " meetings",
+  );
+  showToast("Jamie import is running in the background.");
+  try {
+    const result = await invoke("run_jamie_import", {
+      draft: serializableCopy(preview.draft),
+    });
+    state.jamieImportPreview = null;
+    addActivity(
+      "Jamie import finished: " +
+        result.imported_meetings.toLocaleString() +
+        " meetings and " +
+        result.imported_interventions.toLocaleString() +
+        " interventions added",
+      "success",
+    );
+    showToast(
+      result.imported_meetings.toLocaleString() +
+        " Jamie meetings imported. A verified backup was created.",
+    );
+    await Promise.all([loadSpeakers(), loadSessions(), loadJamieImportHistory()]);
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Jamie import failed: " + message, "error");
+    showToast(message, "error");
+    if (!elements.jamieImportDialog.open) elements.jamieImportDialog.showModal();
+    renderJamieImportReview();
+  } finally {
+    state.jamieImportRunning = false;
+    renderJamieValidation();
+  }
+}
+
+function renderJamieImportHistory() {
+  elements.jamieImportHistory.replaceChildren();
+  if (!state.importBatches.length) {
+    const empty = document.createElement("p");
+    empty.className = "field-help";
+    empty.textContent = "No external archives have been imported.";
+    elements.jamieImportHistory.append(empty);
+    return;
+  }
+  for (const batch of state.importBatches) {
+    const row = document.createElement("div");
+    row.className = "import-history-row";
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent =
+      batch.source_provider + " · " + batch.meeting_count.toLocaleString() + " meetings";
+    const meta = document.createElement("span");
+    meta.textContent =
+      new Date(batch.imported_at).toLocaleString() +
+      " · " +
+      (batch.status === "rolled_back" ? "Rolled back" : "Imported");
+    copy.append(title, meta);
+    row.append(copy);
+    if (batch.status === "imported") {
+      const rollback = document.createElement("button");
+      rollback.type = "button";
+      rollback.className = "text-button danger-text";
+      rollback.textContent = "Roll back";
+      rollback.addEventListener("click", () => rollbackJamieImport(batch));
+      row.append(rollback);
+    }
+    elements.jamieImportHistory.append(row);
+  }
+}
+
+async function loadJamieImportHistory() {
+  try {
+    state.importBatches = await invoke("list_import_batches");
+    renderJamieImportHistory();
+  } catch (error) {
+    addActivity("Could not load archive import history: " + errorText(error), "error");
+  }
+}
+
+async function rollbackJamieImport(batch) {
+  const settingsWasOpen = elements.settingsDialog.open;
+  if (settingsWasOpen) elements.settingsDialog.close();
+  const confirmed = await requestConfirmation({
+    title: "Roll back this Jamie import?",
+    message:
+      batch.meeting_count.toLocaleString() +
+      " imported meetings will be removed. People created by the import are removed only when no remaining conversation uses them. Recall will make another verified backup first.",
+    acceptLabel: "Roll back import",
+  });
+  if (!confirmed) {
+    if (settingsWasOpen) await openSettings();
+    return;
+  }
+  addActivity("Rolling back Jamie import " + batch.id.slice(0, 8) + "…");
+  try {
+    const result = await invoke("rollback_jamie_import", {
+      importId: batch.id,
+    });
+    addActivity(
+      "Jamie rollback finished: " +
+        result.removed_meetings.toLocaleString() +
+        " meetings removed",
+      "success",
+    );
+    showToast(result.removed_meetings.toLocaleString() + " imported meetings removed.");
+    await Promise.all([loadSpeakers(), loadSessions(), loadJamieImportHistory()]);
+    if (!state.selectedSessionId && state.sessions.length && !state.recording) {
+      await selectSession(state.sessions[0].id);
+    }
+    if (settingsWasOpen) await openSettings();
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not roll back the Jamie import: " + message, "error");
+    showToast(message, "error");
+    if (settingsWasOpen) await openSettings();
+  }
+}
+
+async function loadSettingsDataInner() {
+  const [status, preferences, devices, translationLanguages, importBatches] = await Promise.all([
     invoke("app_status"),
     invoke("get_preferences"),
     invoke("list_input_devices"),
     invoke("list_translation_languages"),
+    JAMIE_IMPORT_UI_ENABLED ? invoke("list_import_batches") : Promise.resolve([]),
   ]);
   state.status = status;
   state.preferences = preferences;
   state.translationLanguages = translationLanguages || [];
+  state.importBatches = importBatches || [];
+  renderJamieImportHistory();
   setServiceStatus(status.soniox_key_configured);
   setOpenAIStatus(status.openai_key_configured);
   if (status.recording && !state.recording) {
@@ -2914,6 +4660,12 @@ async function registerListeners() {
 }
 
 function bindInterface() {
+  elements.jamieImportSettingsSection.hidden = !JAMIE_IMPORT_UI_ENABLED;
+  elements.jamieImportDialog.hidden = !JAMIE_IMPORT_UI_ENABLED;
+  if (JAMIE_IMPORT_UI_ENABLED) {
+    elements.jamieImportSettingsSection.removeAttribute("aria-hidden");
+    elements.jamieImportDialog.removeAttribute("aria-hidden");
+  }
   elements.recordButton.addEventListener("click", startRecording);
   elements.emptyRecordButton.addEventListener("click", startRecording);
   elements.refreshSessions.addEventListener("click", () => loadSessions());
@@ -2926,6 +4678,51 @@ function bindInterface() {
   });
   elements.jumpToLiveButton.addEventListener("click", () => setLiveFollow(true));
   elements.voiceLibraryButton.addEventListener("click", openVoiceLibrary);
+  elements.peopleVoicesButton.addEventListener("click", openVoiceLibrary);
+  elements.identityProfilesTab.addEventListener("click", () =>
+    setIdentityManagerView("profiles"),
+  );
+  elements.identityUnassignedTab.addEventListener("click", () =>
+    setIdentityManagerView("unassigned"),
+  );
+  elements.identitySearch.addEventListener("input", scheduleIdentitySearch);
+  elements.identityStatusFilter.addEventListener("change", () => {
+    state.identityStatus = elements.identityStatusFilter.value;
+    state.identityPage = 1;
+    void loadIdentityManagerPage();
+  });
+  elements.identityRefreshButton.addEventListener("click", () =>
+    loadIdentityManagerPage(),
+  );
+  elements.identityPreviousPage.addEventListener("click", () => {
+    if (state.identityPage <= 1) return;
+    state.identityPage -= 1;
+    void loadIdentityManagerPage();
+  });
+  elements.identityNextPage.addEventListener("click", () => {
+    if (
+      state.identityPageData &&
+      state.identityPage >= state.identityPageData.page_count
+    ) {
+      return;
+    }
+    state.identityPage += 1;
+    void loadIdentityManagerPage();
+  });
+  elements.identityClearSelection.addEventListener("click", clearIdentitySelection);
+  elements.identityMergeButton.addEventListener("click", openIdentityMergeDialog);
+  elements.identityTarget.addEventListener("change", () =>
+    syncIdentityFinalLabelToTarget(false),
+  );
+  elements.identityFinalLabel.addEventListener("input", invalidateIdentityPreview);
+  elements.identityPreviewButton.addEventListener(
+    "click",
+    previewIdentityConsolidation,
+  );
+  elements.identityConfirmButton.addEventListener(
+    "click",
+    confirmIdentityConsolidation,
+  );
   elements.agendaButton.addEventListener("click", openAgendaDialog);
   elements.recapButton.addEventListener("click", requestRecap);
   elements.staleRegenerateButton.addEventListener("click", requestRecap);
@@ -2967,6 +4764,30 @@ function bindInterface() {
   });
   elements.deleteSessionButton.addEventListener("click", deleteSelectedSession);
   elements.settingsButton.addEventListener("click", openSettings);
+  if (JAMIE_IMPORT_UI_ENABLED) {
+    elements.chooseJamieExportButton.addEventListener("click", () => {
+      void openJamieImport("choose_jamie_export");
+    });
+    elements.resumeJamieImportButton.addEventListener("click", () => {
+      void openJamieImport("resume_jamie_import");
+    });
+    elements.jamieUseSourceNamesButton.addEventListener("click", useJamieSourceNames);
+    elements.jamieExcludeInvalidButton.addEventListener(
+      "click",
+      excludeUnreadableJamieMeetings,
+    );
+    elements.jamieIdentitySearch.addEventListener("input", renderJamieIdentityList);
+    elements.jamieIdentityNeedsReview.addEventListener(
+      "change",
+      renderJamieIdentityList,
+    );
+    elements.jamieMeetingSearch.addEventListener("input", renderJamieMeetingList);
+    elements.jamieMeetingIssuesOnly.addEventListener(
+      "change",
+      renderJamieMeetingList,
+    );
+    elements.jamieImportButton.addEventListener("click", runJamieImport);
+  }
   elements.gettingStartedButton.addEventListener("click", openOnboarding);
   elements.onboardingExploreButton.addEventListener("click", () => {
     void finishOnboarding(false);

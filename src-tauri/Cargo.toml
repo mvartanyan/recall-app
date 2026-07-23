@@ -1,6 +1,6 @@
 [package]
 name = "recall"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -27,6 +27,7 @@ bytemuck = { version = "1.15", features = ["derive"] }
 sherpa-onnx = "1.13.4"
 sha2 = "0.10"
 rfd = "0.17.2"
+unicode-normalization = "0.1"
 
 [build-dependencies]
 tauri-build = { version = "2.5.2", features = [] }

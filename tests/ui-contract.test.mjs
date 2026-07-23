@@ -9,6 +9,10 @@ const rustDb = fs.readFileSync(new URL("../src-tauri/src/db.rs", import.meta.url
 const rustSoniox = fs.readFileSync(new URL("../src-tauri/src/soniox.rs", import.meta.url), "utf8");
 const rustOpenAI = fs.readFileSync(new URL("../src-tauri/src/openai.rs", import.meta.url), "utf8");
 const rustRecap = fs.readFileSync(new URL("../src-tauri/src/recap.rs", import.meta.url), "utf8");
+const rustJamieImport = fs.readFileSync(
+  new URL("../src-tauri/src/jamie_import.rs", import.meta.url),
+  "utf8",
+);
 const rustState = fs.readFileSync(new URL("../src-tauri/src/state.rs", import.meta.url), "utf8");
 const rustConfig = fs.readFileSync(new URL("../src-tauri/src/config.rs", import.meta.url), "utf8");
 const rustCredentials = fs.readFileSync(
@@ -367,11 +371,85 @@ test("named people used by history cannot be deleted", () => {
   assert.match(rustDb, /Reassign or delete those conversations before deleting/);
 });
 
+test("People & Voices is paginated, conversation-scoped, previewed, and atomic", () => {
+  for (const id of [
+    "peopleVoicesButton",
+    "voiceLibraryDialog",
+    "identityProfilesTab",
+    "identityUnassignedTab",
+    "identitySearch",
+    "identityStatusFilter",
+    "identityPreviousPage",
+    "identityNextPage",
+    "identityMergeButton",
+    "identityMergeDialog",
+    "identityPreviewButton",
+    "identityConfirmButton",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(javascript, /new Map\(\)[\s\S]*selectedUnassignedGroups/);
+  assert.match(
+    javascript,
+    /JSON\.stringify\(\[\s*String\(key\?\.session_id[\s\S]*key\?\.speaker_label/,
+  );
+  assert.match(javascript, /"list_identity_profiles"/);
+  assert.match(javascript, /"list_unassigned_identities"/);
+  assert.match(javascript, /invoke\("preview_identity_consolidation"/);
+  assert.match(javascript, /invoke\("consolidate_identities"/);
+  const consolidationUi = javascript.slice(
+    javascript.indexOf("async function confirmIdentityConsolidation"),
+    javascript.indexOf("function actionButton"),
+  );
+  assert.doesNotMatch(consolidationUi, /loadSessions\(/);
+  assert.match(consolidationUi, /identityOperationBadge\.hidden = false/);
+  assert.match(rustMain, /tokio::task::spawn_blocking/);
+  assert.match(rustMain, /claim_identity_sessions/);
+  assert.match(rustDb, /verified_runtime_backup\("pre-identity-merge"\)/);
+  assert.match(rustDb, /The affected conversations changed after the impact preview/);
+  assert.match(rustDb, /rebuild_session_transcripts_in_transaction/);
+  assert.match(rustDb, /segments_speaker_session_idx/);
+  assert.match(rustDb, /embeddings_speaker_model_reference_idx/);
+});
+
 test("speaker matching requires trusted names and unique meeting claims", () => {
   assert.match(rustMain, /if is_provisional_label\(label\)/);
   assert.match(rustMain, /resolve_unique_profile_matches/);
   assert.match(rustMain, /reference left unchanged/);
   assert.match(rustMain, /if is_new \{\s*db\.insert_embedding/);
+});
+
+test("ambiguous voice matches remain reviewable and survive navigation", () => {
+  assert.match(javascript, /speaker\.likely_match/);
+  assert.match(javascript, /Likely " \+ likelyMatch\.label/);
+  assert.match(javascript, /Assign to " \+ likelyMatch\.label/);
+  assert.match(javascript, /Choose another person/);
+  assert.match(javascript, /invoke\("accept_voice_match_suggestion"/);
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS voice_match_decisions/);
+  assert.match(rustDb, /pub fn insert_voice_match_decision/);
+  assert.match(rustDb, /pub fn accept_voice_match_suggestion/);
+  assert.match(rustMain, /VoiceMatchKind::Suggested/);
+});
+
+test("duplicate person names are blocked and legacy conflicts are visible", () => {
+  assert.match(javascript, /duplicate_name_conflict/);
+  assert.match(javascript, /Duplicate name/);
+  assert.match(javascript, /Automatic matching ignores all of them/);
+  assert.match(javascript, /result\?\.status === "conflict"/);
+  assert.match(rustDb, /normalized_person_name/);
+  assert.match(rustDb, /status: "conflict"/);
+  assert.match(rustMain, /conflicted_profiles/);
+});
+
+test("voice observations use centroids and suggestion reference hygiene", () => {
+  assert.match(rustMain, /average_embeddings\(selected_vectors\.iter\(\)\.cloned\(\)\)/);
+  assert.doesNotMatch(
+    rustMain,
+    /selected_windows == 1[\s\S]{0,500}embedder\.embed\(&pcm/,
+  );
+  assert.match(rustDb, /SUGGESTION_REFERENCE_COMPATIBILITY_THRESHOLD/);
+  assert.match(rustDb, /is_reference=0 WHERE speaker_id/);
+  assert.match(javascript, /incompatible voiceprint/);
 });
 
 test("voice sampling uses clean central windows and quarantines the previous pipeline", () => {
@@ -551,4 +629,61 @@ test("active desktop code has no localhost API or Azure dependency", () => {
     assert.doesNotMatch(source, /localhost:\d+|api base url|azure/i);
   }
   assert.doesNotMatch(packageJson, /http-server|npm-run-all/i);
+});
+
+test("Jamie archives use a reviewable, recoverable native import workflow", () => {
+  for (const id of [
+    "chooseJamieExportButton",
+    "resumeJamieImportButton",
+    "jamieImportDialog",
+    "jamieImportError",
+    "jamieImportErrorMessage",
+    "jamieIdentityList",
+    "jamieMeetingList",
+    "jamieImportButton",
+    "importedExecutiveTab",
+    "importedFullSummaryTab",
+    "importedTasksTab",
+  ]) {
+    assert.match(html, new RegExp(`id="${id}"`));
+  }
+  assert.match(
+    html,
+    /id="jamieImportSettingsSection"[^>]*hidden[^>]*aria-hidden="true"/,
+  );
+  assert.match(
+    html,
+    /id="jamieImportDialog"[^>]*hidden[^>]*aria-hidden="true"/,
+  );
+  assert.match(
+    javascript,
+    /const JAMIE_IMPORT_UI_ENABLED = window\.__RECALL_ENABLE_JAMIE_IMPORT__ === true/,
+  );
+  assert.match(
+    javascript,
+    /JAMIE_IMPORT_UI_ENABLED \? invoke\("list_import_batches"\) : Promise\.resolve\(\[\]\)/,
+  );
+  assert.match(javascript, /openJamieImport\("choose_jamie_export"\)/);
+  assert.match(javascript, /const sourcePath = await invoke\("choose_jamie_export"\)/);
+  assert.match(javascript, /invoke\("inspect_jamie_export", \{ sourcePath \}\)/);
+  assert.match(javascript, /jamieIdentityValidationIssue\(identity, preview\)/);
+  assert.match(html, /Needs attention only/);
+  assert.match(
+    stylesheet,
+    /\.jamie-import-modal\s*\{[^}]*height:\s*min\(900px,\s*calc\(100vh - 40px\)\)/s,
+  );
+  assert.match(javascript, /invoke\("save_jamie_import_draft"/);
+  assert.match(javascript, /invoke\("run_jamie_import"/);
+  assert.match(javascript, /invoke\("rollback_jamie_import"/);
+  assert.match(javascript, /It was not generated by Recall/);
+  assert.match(rustJamieImport, /BufReader/);
+  assert.match(rustJamieImport, /JAMIE_IMPORTER_VERSION/);
+  assert.match(rustJamieImport, /proposed_map/);
+  assert.match(rustJamieImport, /alias == "Mv"/);
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS import_batches/);
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS imported_sessions/);
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS session_import_artifacts/);
+  assert.match(rustDb, /verified_runtime_backup\("pre-jamie-import"\)/);
+  assert.match(rustDb, /verified_runtime_backup\("pre-jamie-rollback"\)/);
+  assert.match(rustDb, /PRAGMA integrity_check/);
 });

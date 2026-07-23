@@ -19,6 +19,7 @@ pub struct AppState {
     pub progress: Arc<Mutex<HashMap<String, Vec<ProgressEvent>>>>,
     pub live_transcript: Arc<Mutex<crate::soniox::LiveTranscriptEvent>>,
     pub recap_in_flight: Arc<Mutex<HashSet<String>>>,
+    pub identity_in_flight: Arc<Mutex<HashSet<String>>>,
     pub model_path: PathBuf,
 }
 
@@ -39,6 +40,7 @@ impl AppState {
             progress: Arc::new(Mutex::new(HashMap::new())),
             live_transcript: Arc::new(Mutex::new(crate::soniox::LiveTranscriptEvent::idle())),
             recap_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            identity_in_flight: Arc::new(Mutex::new(HashSet::new())),
             model_path,
         }
     }
