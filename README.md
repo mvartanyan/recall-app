@@ -51,14 +51,6 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Enable speaker diarization, language identification, and code-switching-friendly language hints.
 - Merge adjacent interventions from the same diarized speaker.
 - Store conversations locally and edit their title, speaker assignment, and transcript text.
-- Retain the Jamie data-mobility parser and transactional migration backend for
-  existing archives and development verification. Recall 0.2.x does not expose
-  this importer in the release interface.
-- Keep imported executive summaries, full summaries, and tasks in
-  source-labelled tabs distinct from Recall's optional LLM recap. Re-importing
-  the same source meetings does not duplicate them, deleting an imported
-  conversation leaves an idempotency tombstone, and an import batch can be
-  rolled back after another verified backup.
 - Put intervention time and a wide person button on one metadata line above
   the intervention text, so long human names remain readable without narrowing
   the transcript. One shared searchable picker handles attribution instead of
@@ -66,10 +58,10 @@ Recall stores its archive locally. During transcription, it sends audio directly
   text, create an expanding editor only when requested, and load in
   100-intervention batches for very long meetings.
 - Keep the conversation list metadata-only. Opening a conversation loads one
-  native payload with that meeting, its interventions, recap state, and
-  imported notes; a bounded five-conversation cache makes recent revisits
-  immediate and is invalidated by relevant mutations. Transcript-text search
-  remains available through a debounced native search.
+  native payload with that meeting, its interventions, and recap state; a
+  bounded five-conversation cache makes recent revisits immediate and is
+  invalidated by relevant mutations. Transcript-text search remains available
+  through a debounced native search.
 - Build 192-dimensional ECAPA voiceprints locally through sherpa-onnx.
 - Match only named people, conservatively and at most once per recording.
   Strong, unambiguous evidence assigns automatically; plausible evidence is
@@ -90,8 +82,8 @@ Recall stores its archive locally. During transcription, it sends audio directly
   conversation-scoped Unassigned views.
 - Preview the full impact before merging profiles or assigning unassigned
   groups. Revalidate the affected conversations, create an integrity-checked
-  database backup, and apply transcript, recap, voiceprint, sample, and import
-  provenance changes atomically.
+  database backup, and apply transcript, recap, voiceprint, and sample changes
+  atomically.
 - Filter historical conversations by a named person. Duplicate profiles with
   the same display name appear once, alphabetically, and the filter includes
   conversations attached to any of those profile IDs. Provisional `VOICE<n>`
@@ -165,39 +157,6 @@ Recall stores its archive locally. During transcription, it sends audio directly
   metadata; it does not rewrite their stored generated payload.
 
 Recall never generates a recap automatically.
-
-## Jamie migration tooling
-
-Recall 0.2.x hides Jamie archive import and rollback from the release
-interface. Existing imported conversations, source-labelled summaries, tasks,
-people, and provenance remain available; hiding the controls does not delete or
-rewrite them.
-
-The local parser, review model, verified-backup transaction, idempotency
-records, and rollback implementation remain in the source tree for migration
-work and regression tests. They are not a supported end-user workflow in this
-release.
-
-The importer does not infer voiceprints from transcript text. Imported names
-can label historical interventions, but automatic voice recognition starts
-only after Recall later receives and reviews a real audio-derived voiceprint
-for that person. Imported Jamie summaries and tasks appear in visibly
-source-labelled tabs; they are not represented as Recall-generated recaps.
-
-At the data layer, repeating the same export is idempotent. Deleting an
-imported conversation keeps its source fingerprint as a tombstone, and rollback
-removes people created by a batch only when no other conversation uses them.
-
-Developers can inspect an export without opening or modifying the live Recall
-database:
-
-~~~sh
-cd src-tauri
-cargo run --offline --example inspect_jamie_export -- /path/to/export.txt
-~~~
-
-The real archive and transcript excerpts must not be committed to the
-repository.
 
 ## First launch on macOS
 
@@ -371,13 +330,6 @@ Model provenance and both checksums are recorded in models/README.md.
   local-only `0600` contract; never returned to JavaScript or stored in SQLite
 - Pre-recap migration backup: recall.pre-recap-v1.db
 - Pre-processing-job migration backup: recall.pre-processing-v1.db
-- Pre-import-schema migration backup: recall.pre-import-v1.db
-- Verified runtime import/rollback backups:
-  `recall.pre-jamie-import-<timestamp>-<suffix>.db` and
-  `recall.pre-jamie-rollback-<timestamp>-<suffix>.db`
-- Resumable Jamie review drafts: `imports/jamie-<source-hash>.json`, mode
-  `0600`; these contain the source path/fingerprint and review decisions, not
-  transcript, summary, task, or agenda content
 - SQLite archive and migration-backup permissions: user-only `0600`, enforced
   whenever Recall opens the archive
 - Agenda originals and structured recap payloads: stored with the conversation
@@ -387,9 +339,6 @@ Model provenance and both checksums are recorded in models/README.md.
   final commit, successful retry, or explicit conversation deletion
 - Soniox uploads/transcriptions: deleted after final transcript retrieval on a best-effort basis
 - New-speaker preview: retained locally only while the profile remains an unnamed VOICE<n>; deleted on naming or assignment to a named profile
-- Imported source summaries/tasks and provenance: encrypted-capable SQLite
-  fields associated with the imported conversation; imported source files are
-  read in place and are not copied into Recall
 
 Transcript fields and embedding vectors have application-level AES-GCM support in the schema, but safe migration to encrypted-at-rest storage is not implemented. Existing databases therefore remain unencrypted unless they were already configured with the older password mode. Recall refuses the old destructive “enable encryption” path instead of recreating the database.
 
