@@ -185,6 +185,9 @@
                   </div>
                 </div>
                 <div id="segmentsList" class="segments-list"></div>
+                <button id="loadMoreSegments" class="secondary-button load-more-segments" type="button" hidden>
+                  Show more interventions
+                </button>
                 <div id="legacyTranscript" class="legacy-transcript" hidden></div>
               </section>
 
@@ -598,6 +601,24 @@
           <button class="text-button" type="button" data-close-dialog="jamieImportDialog">Close</button>
           <button id="jamieImportButton" class="primary-button" type="button" disabled>Import reviewed meetings</button>
         </div>
+      </div>
+    </dialog>
+
+    <dialog id="speakerPickerDialog" class="modal compact-modal speaker-picker-modal" aria-labelledby="speakerPickerTitle">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow">Transcript attribution</span>
+          <h2 id="speakerPickerTitle">Choose a person</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog="speakerPickerDialog" aria-label="Close speaker picker">×</button>
+      </div>
+      <div class="speaker-picker-body">
+        <input id="speakerPickerSearch" type="search" placeholder="Search people and voices" autocomplete="off" aria-label="Search people and voices" />
+        <div id="speakerPickerResults" class="speaker-picker-results" role="listbox" aria-label="People and voices"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="speakerPickerUnknown" class="text-button" type="button">Set as unknown</button>
+        <button class="secondary-button" type="button" data-close-dialog="speakerPickerDialog">Cancel</button>
       </div>
     </dialog>
 

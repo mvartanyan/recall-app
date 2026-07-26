@@ -118,6 +118,18 @@ pub struct Session {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub created_at: DateTime<Utc>,
+    pub title: String,
+    pub duration_ms: i64,
+    pub processing_status: Option<String>,
+    pub processing_error: Option<String>,
+    pub processing_run_id: Option<String>,
+    pub recoverable_audio: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcessingJob {
     pub session_id: String,
     pub run_id: String,
@@ -1029,7 +1041,9 @@ impl Db {
         }
         conn_guard
             .execute_batch(
-                "CREATE INDEX IF NOT EXISTS segments_speaker_session_idx
+                "CREATE INDEX IF NOT EXISTS sessions_created_at_idx
+                    ON sessions(created_at DESC);
+                 CREATE INDEX IF NOT EXISTS segments_speaker_session_idx
                     ON segments(speaker_id, session_id);
                  CREATE INDEX IF NOT EXISTS segments_session_start_idx
                     ON segments(session_id, start_ms, id);
@@ -1583,6 +1597,7 @@ impl Db {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn list_sessions(&self) -> Result<Vec<Session>, String> {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let mut stmt = conn
@@ -1658,6 +1673,179 @@ impl Db {
             });
         }
         Ok(sessions)
+    }
+
+    pub fn list_session_summaries(&self) -> Result<Vec<SessionSummary>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.id, s.created_at, COALESCE(s.title, ''),
+                        COALESCE(s.duration_ms, 0),
+                        p.status, p.error, p.run_id, p.audio_path
+                   FROM sessions s
+                   LEFT JOIN processing_jobs p ON p.session_id = s.id
+                  ORDER BY s.created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let created_at: String = row.get(1)?;
+                let title: String = row.get(2)?;
+                let duration_ms: i64 = row.get(3)?;
+                let processing_status: Option<String> = row.get(4)?;
+                let processing_error: Option<String> = row.get(5)?;
+                let processing_run_id: Option<String> = row.get(6)?;
+                let audio_path: Option<String> = row.get(7)?;
+                Ok((
+                    id,
+                    created_at,
+                    title,
+                    duration_ms,
+                    processing_status,
+                    processing_error,
+                    processing_run_id,
+                    audio_path,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (
+                id,
+                created_at,
+                title,
+                duration_ms,
+                processing_status,
+                processing_error,
+                processing_run_id,
+                audio_path,
+            ) = row.map_err(|e| e.to_string())?;
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|e| e.to_string())?
+                .with_timezone(&Utc);
+            let recoverable_audio = audio_path
+                .as_deref()
+                .map(|path| Path::new(path).is_file())
+                .unwrap_or(false);
+            sessions.push(SessionSummary {
+                id,
+                created_at,
+                title,
+                duration_ms,
+                processing_status,
+                processing_error,
+                processing_run_id,
+                recoverable_audio,
+            });
+        }
+        Ok(sessions)
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Result<Option<Session>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT s.id, s.created_at, COALESCE(s.title, ''),
+                        COALESCE(s.duration_ms, 0), s.transcript_nonce, s.transcript_ct,
+                        p.status, p.error, p.run_id, p.audio_path
+                   FROM sessions s
+                   LEFT JOIN processing_jobs p ON p.session_id = s.id
+                  WHERE s.id=?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some((
+            id,
+            created_at,
+            title,
+            duration_ms,
+            nonce,
+            ct,
+            processing_status,
+            processing_error,
+            processing_run_id,
+            audio_path,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let created_at = DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|e| e.to_string())?
+            .with_timezone(&Utc);
+        let transcript_bytes = self.crypto.decrypt(&nonce, &ct)?;
+        let transcript = String::from_utf8(transcript_bytes).unwrap_or_default();
+        let recoverable_audio = audio_path
+            .as_deref()
+            .map(|path| Path::new(path).is_file())
+            .unwrap_or(false);
+        Ok(Some(Session {
+            id,
+            created_at,
+            title,
+            duration_ms,
+            transcript,
+            processing_status,
+            processing_error,
+            processing_run_id,
+            recoverable_audio,
+        }))
+    }
+
+    pub fn search_session_ids(&self, query: &str) -> Result<Vec<String>, String> {
+        let normalized = query.trim().to_lowercase();
+        if normalized.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, COALESCE(title, ''), transcript_nonce, transcript_ct
+                   FROM sessions
+                  ORDER BY created_at DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut matching_ids = Vec::new();
+        for row in rows {
+            let (id, title, nonce, ct) = row.map_err(|e| e.to_string())?;
+            if title.to_lowercase().contains(&normalized) {
+                matching_ids.push(id);
+                continue;
+            }
+            let transcript = String::from_utf8(self.crypto.decrypt(&nonce, &ct)?)
+                .unwrap_or_default()
+                .to_lowercase();
+            if transcript.contains(&normalized) {
+                matching_ids.push(id);
+            }
+        }
+        Ok(matching_ids)
     }
 
     pub fn jamie_known_people(&self) -> Result<Vec<JamieKnownPerson>, String> {
@@ -5041,6 +5229,55 @@ mod tests {
     }
 
     #[test]
+    fn archive_summaries_defer_transcript_decryption_until_one_session_is_opened() {
+        let db = Db::open(":memory:", Crypto::new(Some("local test password"), None)).unwrap();
+        let first = db
+            .insert_session("Planning", "Alice: private roadmap phrase", 5_000)
+            .unwrap();
+        let second = db
+            .insert_session("Review", "Bob: ordinary update", 7_000)
+            .unwrap();
+
+        let summaries = db.list_session_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().any(|session| session.id == first));
+        assert!(summaries.iter().any(|session| session.id == second));
+
+        let selected = db.get_session(&first).unwrap().unwrap();
+        assert_eq!(selected.transcript, "Alice: private roadmap phrase");
+        assert!(db.get_session("missing").unwrap().is_none());
+        assert_eq!(
+            db.search_session_ids("private roadmap").unwrap(),
+            vec![first]
+        );
+        assert_eq!(db.search_session_ids("Review").unwrap(), vec![second]);
+    }
+
+    #[test]
+    fn large_archive_summary_payload_is_independent_of_transcript_size() {
+        let db = memory_db();
+        let transcript = format!(
+            "archive-only-secret {}",
+            "substantial transcript content ".repeat(1_200)
+        );
+        for index in 0..545 {
+            db.insert_session(&format!("Meeting {index}"), &transcript, 60_000)
+                .unwrap();
+        }
+
+        let summaries = db.list_session_summaries().unwrap();
+        let serialized = serde_json::to_string(&summaries).unwrap();
+
+        assert_eq!(summaries.len(), 545);
+        assert!(!serialized.contains("archive-only-secret"));
+        assert!(
+            serialized.len() < 160_000,
+            "summary payload was {} bytes",
+            serialized.len()
+        );
+    }
+
+    #[test]
     fn jamie_import_is_transactional_idempotent_and_rollback_preserves_mapped_people() {
         let path = std::env::temp_dir().join(format!(
             "recall-jamie-import-test-{}.sqlite",
@@ -6264,6 +6501,7 @@ mod tests {
 
         let conn = db.conn.lock().unwrap();
         let indexes = [
+            "sessions_created_at_idx",
             "segments_speaker_session_idx",
             "segments_session_start_idx",
             "embeddings_speaker_model_reference_idx",
@@ -6291,6 +6529,32 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("segments_speaker_session_idx"), "{plan}");
+        let session_order_plan = {
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT s.id, s.created_at, COALESCE(s.title, ''),
+                            COALESCE(s.duration_ms, 0),
+                            p.status, p.error, p.run_id, p.audio_path
+                       FROM sessions s
+                       LEFT JOIN processing_jobs p ON p.session_id = s.id
+                      ORDER BY s.created_at DESC",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            session_order_plan.contains("sessions_created_at_idx"),
+            "{session_order_plan}"
+        );
+        assert!(
+            !session_order_plan.contains("USE TEMP B-TREE"),
+            "{session_order_plan}"
+        );
     }
 
     #[test]

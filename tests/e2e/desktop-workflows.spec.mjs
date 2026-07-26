@@ -19,6 +19,9 @@ async function installTauriMock(page) {
     let releaseJamieChoice = null;
     let jamieInspectionGate = null;
     let releaseJamieInspection = null;
+    const conversationLoadGates = new Map();
+    const releaseConversationLoads = new Map();
+    const commandCounts = {};
     const native = {
       recording: false,
       sessions: [session],
@@ -241,6 +244,11 @@ async function installTauriMock(page) {
       total_intervention_count: 3,
     };
     const invoke = async (command, args = {}) => {
+      commandCounts[command] = (commandCounts[command] || 0) + 1;
+      if (command === "load_conversation" && args.sessionId) {
+        const scopedKey = command + ":" + args.sessionId;
+        commandCounts[scopedKey] = (commandCounts[scopedKey] || 0) + 1;
+      }
       switch (command) {
         case "app_status":
           return {
@@ -266,7 +274,51 @@ async function installTauriMock(page) {
             { code: "fr", name: "French" },
           ];
         case "list_sessions":
-          return structuredClone(native.sessions);
+          return structuredClone(
+            native.sessions.map(({ transcript: _transcript, ...summary }) => summary),
+          );
+        case "search_session_ids": {
+          const query = String(args.query || "").trim().toLocaleLowerCase();
+          return native.sessions
+            .filter((candidate) =>
+              (String(candidate.title || "") + " " + String(candidate.transcript || ""))
+                .toLocaleLowerCase()
+                .includes(query),
+            )
+            .map((candidate) => candidate.id);
+        }
+        case "load_conversation": {
+          const gate = conversationLoadGates.get(args.sessionId);
+          if (gate) await gate;
+          const selected = native.sessions.find(
+            (candidate) => candidate.id === args.sessionId,
+          );
+          if (!selected) throw new Error("Conversation not found");
+          return structuredClone({
+            session: selected,
+            segments: native.segments[args.sessionId] || [],
+            recap_state: recapState,
+            imported_artifact: native.importedArtifacts[args.sessionId] || null,
+          });
+        }
+        case "update_segment_text": {
+          const segment = (native.segments[args.sessionId] || []).find(
+            (candidate) => candidate.id === args.segmentId,
+          );
+          if (!segment) throw new Error("Intervention not found");
+          segment.text = args.text;
+          return null;
+        }
+        case "assign_segment_speaker": {
+          const segment = (native.segments[args.sessionId] || []).find(
+            (candidate) => candidate.id === args.segmentId,
+          );
+          if (!segment) throw new Error("Intervention not found");
+          const speaker = speakers.find((candidate) => candidate.id === args.speakerId);
+          segment.speaker_id = speaker?.id || null;
+          segment.speaker_label = speaker?.label || null;
+          return null;
+        }
         case "list_import_batches":
           return structuredClone(native.importBatches);
         case "list_segments":
@@ -638,6 +690,80 @@ async function installTauriMock(page) {
     window.__setMockPreferredLanguage = (language) => {
       preferences.preferred_language = language;
     };
+    window.__mockCommandCount = (command) => commandCounts[command] || 0;
+    window.__mockConversationLoadCount = (sessionId) =>
+      commandCounts["load_conversation:" + sessionId] || 0;
+    window.__addConversationFixture = ({
+      sessionId = "session-large",
+      title = "Large archive meeting",
+      segmentCount = 2_163,
+      unknownIndex = null,
+    } = {}) => {
+      const fixtureSession = {
+        id: sessionId,
+        created_at: "2026-07-24T08:00:00Z",
+        title,
+        duration_ms: 7_200_000,
+        transcript: "Person 1: scale-only transcript phrase",
+        processing_status: null,
+        processing_error: null,
+        processing_run_id: null,
+        recoverable_audio: false,
+      };
+      native.sessions = [
+        fixtureSession,
+        ...native.sessions.filter((candidate) => candidate.id !== sessionId),
+      ];
+      native.segments[fixtureSession.id] = Array.from(
+        { length: segmentCount },
+        (_, index) => ({
+        id: sessionId + "-segment-" + index,
+        session_id: fixtureSession.id,
+        start_ms: index * 3_000,
+        end_ms: index * 3_000 + 2_500,
+        speaker_id:
+          index === unknownIndex ? null : "large-speaker-" + (index % 260),
+        speaker_label:
+          index === unknownIndex
+            ? "Unknown speaker"
+            : "Person " + String((index % 260) + 1).padStart(3, "0"),
+        text: "Intervention " + (index + 1) + " with enough text to exercise layout.",
+      }),
+      );
+      for (let index = 0; index < 260; index += 1) {
+        if (speakers.some((speaker) => speaker.id === "large-speaker-" + index)) {
+          continue;
+        }
+        speakers.push({
+          id: "large-speaker-" + index,
+          label: "Person " + String(index + 1).padStart(3, "0"),
+          created_at: "2026-07-24T08:00:00Z",
+          last_seen_at: "2026-07-24T08:00:00Z",
+          sample_count: 0,
+          embedding_count: 1,
+          conversation_count: 1,
+        });
+      }
+      return fixtureSession.id;
+    };
+    window.__addLargeConversation = () =>
+      window.__addConversationFixture({
+        sessionId: "session-large",
+        title: "Large archive meeting",
+        segmentCount: 2_163,
+        unknownIndex: 720,
+      });
+    window.__deferConversationLoad = (sessionId) => {
+      conversationLoadGates.set(
+        sessionId,
+        new Promise((resolve) => releaseConversationLoads.set(sessionId, resolve)),
+      );
+    };
+    window.__releaseConversationLoad = (sessionId) => {
+      releaseConversationLoads.get(sessionId)?.();
+      releaseConversationLoads.delete(sessionId);
+      conversationLoadGates.delete(sessionId);
+    };
     window.__deferJamieChoice = () => {
       jamieChoiceGate = new Promise((resolve) => {
         releaseJamieChoice = resolve;
@@ -752,6 +878,116 @@ test("stopping from the live workspace opens the durable processing draft", asyn
   await expect(page.locator('[data-current-recording="true"]')).toHaveCount(0);
 });
 
+test("large conversations render in bounded batches with one searchable speaker picker and cache", async ({
+  page,
+}) => {
+  await page.evaluate(() => window.__addLargeConversation());
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.locator("#refreshSpeakers").click();
+  await page.getByRole("button", { name: /Large archive meeting/ }).click();
+
+  const rows = page.locator("#segmentsList .segment");
+  await expect(rows).toHaveCount(100);
+  await expect(page.locator("#segmentsList textarea")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Show next 100 interventions/ })).toBeVisible();
+
+  await rows.first().locator(".segment-speaker-button").click();
+  const picker = page.getByRole("dialog", { name: "Choose a person" });
+  await expect(picker).toBeVisible();
+  await expect(picker.locator(".speaker-picker-option")).toHaveCount(264);
+  await picker.getByLabel("Search people and voices").fill("Person 260");
+  await expect(picker.locator(".speaker-picker-option")).toHaveCount(1);
+  await picker.getByRole("button", { name: "Cancel" }).click();
+
+  await page.getByRole("button", { name: /Show next 100 interventions/ }).click();
+  await expect(rows).toHaveCount(200);
+
+  expect(
+    await page.evaluate(() => window.__mockConversationLoadCount("session-large")),
+  ).toBe(1);
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+  await page.getByRole("button", { name: /Large archive meeting/ }).click();
+  expect(
+    await page.evaluate(() => window.__mockConversationLoadCount("session-large")),
+  ).toBe(1);
+
+  await rows.first().locator(".segment-speaker-button").click();
+  await picker.getByLabel("Search people and voices").fill("Alice");
+  await picker.locator(".speaker-picker-option").filter({ hasText: "Alice" }).first().click();
+  await expect(rows.first().locator(".segment-speaker-button")).toHaveText("Alice");
+
+  await rows.first().getByRole("button", { name: "Edit transcript" }).click();
+  const editor = rows.first().getByLabel("Transcript intervention");
+  await editor.fill("Corrected intervention text.");
+  await editor.press("Meta+Enter");
+  await expect(rows.first().locator(".segment-text-display")).toHaveText(
+    "Corrected intervention text.",
+  );
+
+  await page.locator("#speakersList").getByRole("button", { name: "Review turns" }).click();
+  await expect(rows).toHaveCount(800);
+  await expect(picker).toBeVisible();
+  await picker.getByRole("button", { name: "Cancel" }).click();
+});
+
+test("a 149-intervention conversation remains bounded and fully reachable", async ({
+  page,
+}) => {
+  await page.evaluate(() =>
+    window.__addConversationFixture({
+      sessionId: "session-medium",
+      title: "Medium archive meeting",
+      segmentCount: 149,
+    }),
+  );
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Medium archive meeting/ }).click();
+  const rows = page.locator("#segmentsList .segment");
+  await expect(rows).toHaveCount(100);
+  await page.getByRole("button", { name: /Show next 49 interventions/ }).click();
+  await expect(rows).toHaveCount(149);
+  await expect(page.locator("#loadMoreSegments")).toBeHidden();
+});
+
+test("a stale delayed conversation load cannot replace a newer selection", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    window.__addConversationFixture({
+      sessionId: "session-delayed",
+      title: "Delayed archive meeting",
+      segmentCount: 149,
+    });
+    window.__deferConversationLoad("session-delayed");
+  });
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Delayed archive meeting/ }).click();
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+  await expect(page.getByLabel("Conversation title")).toHaveValue(
+    "Earlier planning meeting",
+  );
+  await page.evaluate(() => window.__releaseConversationLoad("session-delayed"));
+  await expect(page.getByLabel("Conversation title")).toHaveValue(
+    "Earlier planning meeting",
+  );
+});
+
+test("metadata-only conversation search still finds transcript text on demand", async ({
+  page,
+}) => {
+  await page.evaluate(() => window.__addLargeConversation());
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  const search = page.getByPlaceholder("Search conversations");
+  await search.fill("scale-only transcript phrase");
+  await expect(page.getByRole("button", { name: /Large archive meeting/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Earlier planning meeting/ })).toHaveCount(0);
+  await search.fill("Earlier discussion");
+  await expect(page.getByRole("button", { name: /Earlier planning meeting/ })).toBeVisible();
+  expect(await page.evaluate(() => window.__mockCommandCount("search_session_ids"))).toBeGreaterThan(
+    0,
+  );
+});
+
 test("the conversation filter contains named people only", async ({ page }) => {
   const filter = page.getByLabel("Filter conversations by voice");
   await expect(filter.locator("option")).toHaveText(["All voices", "Alice"]);
@@ -822,11 +1058,11 @@ test("an ambiguous voice suggestion survives review and can be accepted once", a
   await expect(page.locator("#activityLog")).toContainText(
     "Assigned voice history to Alice; 1 compatible voiceprint activated",
   );
-  const speakerSelectors = page.locator("#segmentsList select");
-  await expect(speakerSelectors).toHaveCount(2);
+  const speakerButtons = page.locator("#segmentsList .segment-speaker-button");
+  await expect(speakerButtons).toHaveCount(2);
   await expect
-    .poll(() => speakerSelectors.evaluateAll((items) => items.map((item) => item.value)))
-    .toEqual(["speaker-alice", "speaker-alice"]);
+    .poll(() => speakerButtons.allTextContents())
+    .toEqual(["Alice", "Alice"]);
 });
 
 test("preferred language is selected from provider capabilities and removed from exclusions", async ({ page }) => {

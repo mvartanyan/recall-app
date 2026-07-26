@@ -52,17 +52,24 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Merge adjacent interventions from the same diarized speaker.
 - Store conversations locally and edit their title, speaker assignment, and transcript text.
 - Retain the Jamie data-mobility parser and transactional migration backend for
-  existing archives and development verification. Recall 0.2.0 does not expose
+  existing archives and development verification. Recall 0.2.x does not expose
   this importer in the release interface.
 - Keep imported executive summaries, full summaries, and tasks in
   source-labelled tabs distinct from Recall's optional LLM recap. Re-importing
   the same source meetings does not duplicate them, deleting an imported
   conversation leaves an idempotency tombstone, and an import batch can be
   rolled back after another verified backup.
-- Put intervention time and a wide person selector on one metadata line above
+- Put intervention time and a wide person button on one metadata line above
   the intervention text, so long human names remain readable without narrowing
-  the transcript. Editors expand to show the full intervention and are
-  remeasured after processing becomes visible or the window width changes.
+  the transcript. One shared searchable picker handles attribution instead of
+  duplicating the whole voice library in every row. Interventions render as
+  text, create an expanding editor only when requested, and load in
+  100-intervention batches for very long meetings.
+- Keep the conversation list metadata-only. Opening a conversation loads one
+  native payload with that meeting, its interventions, recap state, and
+  imported notes; a bounded five-conversation cache makes recent revisits
+  immediate and is invalidated by relevant mutations. Transcript-text search
+  remains available through a debounced native search.
 - Build 192-dimensional ECAPA voiceprints locally through sherpa-onnx.
 - Match only named people, conservatively and at most once per recording.
   Strong, unambiguous evidence assigns automatically; plausible evidence is
@@ -161,7 +168,7 @@ Recall never generates a recap automatically.
 
 ## Jamie migration tooling
 
-Recall 0.2.0 hides Jamie archive import and rollback from the release
+Recall 0.2.x hides Jamie archive import and rollback from the release
 interface. Existing imported conversations, source-labelled summaries, tasks,
 people, and provenance remain available; hiding the controls does not delete or
 rewrite them.
@@ -328,7 +335,7 @@ can open a downloaded build without a Gatekeeper warning. See
 credentials, architecture choices, and the external-release checklist.
 
 The latest explicitly unsigned Apple-silicon preview is
-[Recall v0.2.0](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.0).
+[Recall v0.2.1](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.1).
 
 Speaker-model smoke test with a mono WAV:
 

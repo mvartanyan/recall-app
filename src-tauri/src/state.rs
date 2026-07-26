@@ -115,9 +115,15 @@ impl AppState {
     pub fn unlock_db(&self, crypto: Crypto) -> Result<(), String> {
         std::fs::create_dir_all(&self.data_dir).map_err(|error| error.to_string())?;
         let candidate = Arc::new(Db::open(self.db_path(), crypto)?);
-        candidate
-            .list_sessions()
-            .map_err(|_| "The database password is incorrect or the data is damaged".to_string())?;
+        if let Some(first) = candidate
+            .list_session_summaries()
+            .map_err(|_| "The database password is incorrect or the data is damaged".to_string())?
+            .first()
+        {
+            candidate.get_session(&first.id).map_err(|_| {
+                "The database password is incorrect or the data is damaged".to_string()
+            })?;
+        }
         if let Err(error) = self.recover_orphaned_recordings(&candidate) {
             eprintln!("[recovery] could not reconcile retained recordings: {error}");
         }
@@ -132,7 +138,7 @@ impl AppState {
             return Ok(0);
         }
         let known_sessions = db
-            .list_sessions()?
+            .list_session_summaries()?
             .into_iter()
             .map(|session| session.id)
             .collect::<HashSet<_>>();

@@ -333,20 +333,32 @@ test("an active recording is a selectable sidebar workspace", () => {
   assert.match(javascript, /Voice preview is unavailable during recording/);
 });
 
-test("interventions put time and a wide speaker selector above the text", () => {
-  assert.match(javascript, /speakerColumn\.append\(time, select\)/);
+test("interventions put time and one shared speaker picker above the text", () => {
+  assert.match(javascript, /speakerColumn\.append\(time, speakerButton\)/);
   assert.match(stylesheet, /\.segment\s*\{\s*display:\s*block;/);
-  assert.match(stylesheet, /\.segment-speaker select[\s\S]*?width:\s*min\(320px/);
-  assert.match(stylesheet, /\.segment-text[\s\S]*?margin-left:\s*12px/);
+  assert.match(stylesheet, /\.segment-speaker-button[\s\S]*?width:\s*min\(320px/);
+  assert.match(html, /id="speakerPickerDialog"/);
+  assert.match(javascript, /function renderSpeakerPicker\(\)/);
 });
 
-test("intervention editors are measured after mounting and again when layout changes", () => {
-  assert.match(
-    javascript,
-    /elements\.segmentsList\.append\(row\);\s*autoResize\(text\);/,
-  );
-  assert.match(javascript, /if \(mode === "conversation"\) scheduleTranscriptResize\(\)/);
-  assert.match(javascript, /window\.addEventListener\("resize", scheduleTranscriptResize\)/);
+test("interventions render progressively as text and create editors only on demand", () => {
+  assert.match(javascript, /const SEGMENT_RENDER_BATCH = 100/);
+  assert.match(javascript, /state\.selectedSegments\.slice\(0, state\.renderedSegmentCount\)/);
+  assert.match(javascript, /function beginSegmentEdit\(/);
+  assert.match(javascript, /document\.createElement\("textarea"\)/);
+  assert.match(javascript, /function showMoreSegments\(\)/);
+  assert.match(stylesheet, /\.segment-text-display[\s\S]*?margin-left:\s*12px/);
+});
+
+test("conversation navigation loads one scoped payload while the archive stays metadata-only", () => {
+  assert.match(rustMain, /fn list_sessions[\s\S]*?Result<Vec<SessionSummary>, String>/);
+  assert.match(rustMain, /fn load_conversation[\s\S]*?Result<ConversationPayload, String>/);
+  assert.match(rustMain, /recap_state_view_from\(app_state\.inner\(\), &db, &session, &segments\)/);
+  assert.match(javascript, /invoke\("load_conversation", \{ sessionId \}\)/);
+  assert.match(javascript, /const CONVERSATION_CACHE_LIMIT = 5/);
+  assert.match(javascript, /invoke\("search_session_ids", \{ query \}\)/);
+  assert.match(rustDb, /pub struct SessionSummary/);
+  assert.match(rustDb, /CREATE INDEX IF NOT EXISTS sessions_created_at_idx/);
 });
 
 test("conversation deletion reports orphan unnamed voice cleanup", () => {

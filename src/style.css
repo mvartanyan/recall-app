@@ -920,7 +920,7 @@ body.recording-active .live-transcript {
   margin-bottom: 7px;
 }
 
-.segment-speaker select {
+.segment-speaker-button {
   width: min(320px, calc(100% - 64px));
   min-width: 220px;
   padding: 7px 26px 7px 9px;
@@ -930,6 +930,16 @@ body.recording-active .live-transcript {
   color: #285f50;
   font-size: 13px;
   font-weight: 720;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-speaker-button:hover:not(:disabled),
+.segment-speaker-button:focus-visible {
+  border-color: #9dbbb2;
+  background: #f0f7f4;
 }
 
 .segment-speaker time {
@@ -955,8 +965,24 @@ body.recording-active .live-transcript {
   font: 18px/1.62 Georgia, "Times New Roman", serif;
 }
 
+.segment-text-display {
+  width: calc(100% - 12px);
+  min-height: 40px;
+  margin-left: 12px;
+  padding: 0 0 14px;
+  border-bottom: 1px solid var(--line);
+  color: #25312e;
+  font: 18px/1.62 Georgia, "Times New Roman", serif;
+  white-space: pre-wrap;
+}
+
 .segment-text:hover {
   border-bottom-color: #c5cfcc;
+}
+
+.load-more-segments {
+  justify-self: center;
+  margin: 8px auto 4px;
 }
 
 .legacy-transcript {
@@ -1637,6 +1663,60 @@ body.recording-active .live-transcript {
 
 .compact-modal {
   width: min(510px, calc(100vw - 48px));
+}
+
+.speaker-picker-body {
+  display: grid;
+  gap: 13px;
+  padding: 18px 24px 4px;
+}
+
+.speaker-picker-results {
+  display: grid;
+  max-height: min(48vh, 410px);
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.speaker-picker-option {
+  display: grid;
+  gap: 2px;
+  padding: 11px 13px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: white;
+  color: var(--ink);
+  text-align: left;
+}
+
+.speaker-picker-option:last-child {
+  border-bottom: 0;
+}
+
+.speaker-picker-option:hover,
+.speaker-picker-option:focus-visible {
+  background: #f3f8f6;
+}
+
+.speaker-picker-option.selected {
+  background: var(--brand-soft);
+  color: var(--brand-dark);
+}
+
+.speaker-picker-option strong {
+  font-size: 14px;
+}
+
+.speaker-picker-option span,
+.speaker-picker-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.speaker-picker-empty {
+  margin: 0;
+  padding: 18px 13px;
 }
 
 .voice-library-modal {

@@ -136,14 +136,78 @@ export function isNearScrollBottom(
   return Number(scrollHeight) - (Number(scrollTop) + Number(clientHeight)) <= threshold;
 }
 
-export function filterSessions(sessions, query, allowedSessionIds = null) {
+export function filterSessions(
+  sessions,
+  query,
+  allowedSessionIds = null,
+  transcriptMatchIds = null,
+) {
   const normalizedQuery = String(query || "").trim().toLowerCase();
   return (sessions || []).filter((session) => {
     if (allowedSessionIds && !allowedSessionIds.has(session.id)) return false;
     const title = String(session.title || "Untitled conversation");
     const searchable = (title + " " + String(session.transcript || "")).toLowerCase();
-    return !normalizedQuery || searchable.includes(normalizedQuery);
+    return (
+      !normalizedQuery ||
+      searchable.includes(normalizedQuery) ||
+      Boolean(transcriptMatchIds?.has(session.id))
+    );
   });
+}
+
+export function indexTranslations(translations) {
+  const index = new Map();
+  for (const translation of translations || []) {
+    const segmentId = String(translation?.segment_id || "");
+    if (!segmentId) continue;
+    const entries = index.get(segmentId);
+    if (entries) entries.push(translation);
+    else index.set(segmentId, [translation]);
+  }
+  return index;
+}
+
+export function getCachedConversation(cache, sessionId) {
+  if (!cache?.has(sessionId)) return null;
+  const payload = cache.get(sessionId);
+  cache.delete(sessionId);
+  cache.set(sessionId, payload);
+  return payload;
+}
+
+export function setCachedConversation(cache, sessionId, payload, limit = 5) {
+  if (!cache || !sessionId) return payload;
+  cache.delete(sessionId);
+  cache.set(sessionId, payload);
+  const boundedLimit = Math.max(1, Number(limit) || 1);
+  while (cache.size > boundedLimit) {
+    cache.delete(cache.keys().next().value);
+  }
+  return payload;
+}
+
+export function invalidateConversationCache(cache, sessionId = null) {
+  if (!cache) return;
+  if (sessionId) cache.delete(sessionId);
+  else cache.clear();
+}
+
+export function nextRenderedSegmentCount(
+  total,
+  current = 0,
+  batchSize = 100,
+  requiredIndex = null,
+) {
+  const boundedTotal = Math.max(0, Number(total) || 0);
+  const boundedBatch = Math.max(1, Number(batchSize) || 1);
+  let desired = Math.max(Number(current) || 0, boundedBatch);
+  if (Number.isInteger(requiredIndex) && requiredIndex >= 0) {
+    desired = Math.max(
+      desired,
+      Math.ceil((requiredIndex + 1) / boundedBatch) * boundedBatch,
+    );
+  }
+  return Math.min(boundedTotal, desired);
 }
 
 export function groupVoiceFilters(speakers) {

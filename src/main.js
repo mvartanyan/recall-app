@@ -5,15 +5,20 @@ import {
   filterSessions,
   formatDuration,
   formatTimestamp,
+  getCachedConversation,
   groupVoiceFilters,
+  indexTranslations,
+  invalidateConversationCache,
   isNearScrollBottom,
   isProvisionalLabel,
   isSessionProcessing,
+  nextRenderedSegmentCount,
   normalizePreferredLanguage,
   parseLanguageHints,
   parseNoTranslationLanguages,
   processingRunIds,
   recapTabAvailability,
+  setCachedConversation,
   shouldShowOnboarding,
   transcriptFromSegments,
   translatedSegmentText,
@@ -22,6 +27,8 @@ import {
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const JAMIE_IMPORT_UI_ENABLED = window.__RECALL_ENABLE_JAMIE_IMPORT__ === true;
+const CONVERSATION_CACHE_LIMIT = 5;
+const SEGMENT_RENDER_BATCH = 100;
 
 const elements = {
   recordButton: document.getElementById("recordButton"),
@@ -88,6 +95,7 @@ const elements = {
   copyGeneratedText: document.getElementById("copyGeneratedText"),
   copyGeneratedMarkdown: document.getElementById("copyGeneratedMarkdown"),
   segmentsList: document.getElementById("segmentsList"),
+  loadMoreSegments: document.getElementById("loadMoreSegments"),
   legacyTranscript: document.getElementById("legacyTranscript"),
   saveState: document.getElementById("saveState"),
   speakersList: document.getElementById("speakersList"),
@@ -201,6 +209,10 @@ const elements = {
   assignForm: document.getElementById("assignForm"),
   assignSourceId: document.getElementById("assignSourceId"),
   assignTarget: document.getElementById("assignTarget"),
+  speakerPickerDialog: document.getElementById("speakerPickerDialog"),
+  speakerPickerSearch: document.getElementById("speakerPickerSearch"),
+  speakerPickerResults: document.getElementById("speakerPickerResults"),
+  speakerPickerUnknown: document.getElementById("speakerPickerUnknown"),
   unlockDialog: document.getElementById("unlockDialog"),
   unlockForm: document.getElementById("unlockForm"),
   databasePassword: document.getElementById("databasePassword"),
@@ -249,6 +261,13 @@ const state = {
   transcriptResizeFrame: null,
   recapState: null,
   importedArtifact: null,
+  conversationCache: new Map(),
+  translationIndex: new Map(),
+  renderedSegmentCount: 0,
+  speakerPickerSegmentId: null,
+  conversationSearchIds: null,
+  conversationSearchSequence: 0,
+  conversationSearchTimer: null,
   activeRecapTab: "transcript",
   generatedLanguage: "original",
   recapJobs: new Map(),
@@ -1085,9 +1104,48 @@ function sessionDate(session) {
   });
 }
 
-async function loadSessions() {
+async function loadSessions({ invalidateCache = false } = {}) {
   try {
-    state.sessions = await invoke("list_sessions");
+    const selectedTranscript = state.sessions.find(
+      (session) => session.id === state.selectedSessionId,
+    )?.transcript;
+    const previousSessions = new Map(
+      state.sessions.map((session) => [
+        session.id,
+        [
+          session.processing_status,
+          session.processing_error,
+          session.processing_run_id,
+        ].join("\u0000"),
+      ]),
+    );
+    const sessions = await invoke("list_sessions");
+    if (invalidateCache) {
+      invalidateConversationCache(state.conversationCache);
+    } else {
+      for (const session of sessions) {
+        const previous = previousSessions.get(session.id);
+        const current = [
+          session.processing_status,
+          session.processing_error,
+          session.processing_run_id,
+        ].join("\u0000");
+        if (previous !== undefined && previous !== current) {
+          invalidateConversationCache(state.conversationCache, session.id);
+        }
+        previousSessions.delete(session.id);
+      }
+      for (const removedId of previousSessions.keys()) {
+        invalidateConversationCache(state.conversationCache, removedId);
+      }
+    }
+    if (selectedTranscript !== undefined) {
+      const selected = sessions.find(
+        (session) => session.id === state.selectedSessionId,
+      );
+      if (selected) selected.transcript = selectedTranscript;
+    }
+    state.sessions = sessions;
     reconcileTrackedRuns(state.sessions);
     renderSessions();
     if (
@@ -1098,6 +1156,8 @@ async function loadSessions() {
       state.selectedSegments = [];
       state.recapState = null;
       state.importedArtifact = null;
+      state.translationIndex = new Map();
+      state.renderedSegmentCount = 0;
     }
     renderSpeakers();
     updateContentVisibility();
@@ -1108,7 +1168,12 @@ async function loadSessions() {
 
 function renderSessions() {
   const query = elements.conversationSearch.value.trim().toLowerCase();
-  const filtered = filterSessions(state.sessions, query, state.voiceFilteredSessionIds);
+  const filtered = filterSessions(
+    state.sessions,
+    query,
+    state.voiceFilteredSessionIds,
+    query ? state.conversationSearchIds : null,
+  );
   elements.sessionsList.replaceChildren();
   if (state.recording) {
     const current = document.createElement("button");
@@ -1166,6 +1231,35 @@ function renderSessions() {
   }
 }
 
+function scheduleConversationSearch() {
+  if (state.conversationSearchTimer) {
+    window.clearTimeout(state.conversationSearchTimer);
+    state.conversationSearchTimer = null;
+  }
+  const query = elements.conversationSearch.value.trim();
+  const sequence = ++state.conversationSearchSequence;
+  state.conversationSearchIds = null;
+  renderSessions();
+  if (!query) return;
+  state.conversationSearchTimer = window.setTimeout(async () => {
+    state.conversationSearchTimer = null;
+    try {
+      const matchingIds = await invoke("search_session_ids", { query });
+      if (
+        sequence !== state.conversationSearchSequence ||
+        query !== elements.conversationSearch.value.trim()
+      ) {
+        return;
+      }
+      state.conversationSearchIds = new Set(matchingIds);
+      renderSessions();
+    } catch (error) {
+      if (sequence !== state.conversationSearchSequence) return;
+      addActivity("Could not search transcript text: " + errorText(error), "error");
+    }
+  }, 250);
+}
+
 function selectCurrentRecording() {
   if (!state.recording) return;
   state.navigationRevision += 1;
@@ -1190,46 +1284,57 @@ async function selectSession(sessionId, { userInitiated = true } = {}) {
   state.selectedSegments = [];
   state.recapState = null;
   state.importedArtifact = null;
+  state.translationIndex = new Map();
+  state.renderedSegmentCount = 0;
   state.activeRecapTab = "transcript";
   renderSpeakers();
   elements.segmentsList.replaceChildren();
+  elements.loadMoreSegments.hidden = true;
   elements.legacyTranscript.hidden = false;
-  elements.legacyTranscript.textContent = "Loading conversation…";
   renderSessions();
-  elements.saveState.textContent = "Loading…";
   updateContentVisibility();
+  const cached = getCachedConversation(state.conversationCache, sessionId);
+  if (cached) {
+    applyConversationPayload(session, cached);
+    return;
+  }
+  elements.legacyTranscript.textContent = "Loading conversation…";
+  elements.saveState.textContent = "Loading…";
   try {
-    const [segmentsResult, recapResult, importedArtifactResult] = await Promise.allSettled([
-      invoke("list_segments", { sessionId }),
-      invoke("get_recap_state", { sessionId }),
-      invoke("get_imported_session_artifact", { sessionId }),
-    ]);
+    const payload = await invoke("load_conversation", { sessionId });
     if (sequence !== state.sessionLoadSequence) return;
-    if (segmentsResult.status === "rejected") throw segmentsResult.reason;
-    state.selectedSegments = segmentsResult.value;
-    if (recapResult.status === "fulfilled") {
-      state.recapState = recapResult.value;
-      rememberNativeRecapState(sessionId, state.recapState);
-    } else {
-      addActivity("Could not load recap data: " + errorText(recapResult.reason), "error");
-    }
-    if (importedArtifactResult.status === "fulfilled") {
-      state.importedArtifact = importedArtifactResult.value;
-    } else {
-      addActivity(
-        "Could not load imported meeting notes: " +
-          errorText(importedArtifactResult.reason),
-        "error",
-      );
-    }
-    renderRecapShell();
-    renderTranscript(session);
-    renderSpeakers();
-    elements.saveState.textContent = "Saved locally";
+    setCachedConversation(
+      state.conversationCache,
+      sessionId,
+      payload,
+      CONVERSATION_CACHE_LIMIT,
+    );
+    applyConversationPayload(session, payload);
   } catch (error) {
     addActivity("Could not load conversation: " + errorText(error), "error");
     showToast(errorText(error), "error");
   }
+  updateContentVisibility();
+}
+
+function applyConversationPayload(session, payload) {
+  if (payload?.session) Object.assign(session, payload.session);
+  state.selectedSegments = payload?.segments || [];
+  state.recapState = payload?.recap_state || null;
+  state.importedArtifact = payload?.imported_artifact || null;
+  state.translationIndex = indexTranslations(
+    state.recapState?.recap?.payload?.translations || [],
+  );
+  state.renderedSegmentCount = nextRenderedSegmentCount(
+    state.selectedSegments.length,
+    0,
+    SEGMENT_RENDER_BATCH,
+  );
+  rememberNativeRecapState(session.id, state.recapState);
+  renderRecapShell();
+  renderTranscript(session);
+  renderSpeakers();
+  elements.saveState.textContent = "Saved locally";
   updateContentVisibility();
 }
 
@@ -1243,6 +1348,11 @@ async function refreshRecapState({ rerenderTranscript = true } = {}) {
   const recapState = await invoke("get_recap_state", { sessionId });
   if (sessionId !== state.selectedSessionId) return;
   state.recapState = recapState;
+  state.translationIndex = indexTranslations(
+    state.recapState?.recap?.payload?.translations || [],
+  );
+  const cached = state.conversationCache.get(sessionId);
+  if (cached) cached.recap_state = recapState;
   rememberNativeRecapState(sessionId, recapState);
   renderRecapShell();
   if (rerenderTranscript) {
@@ -1508,6 +1618,7 @@ function renderTranscript(session) {
     elements.saveState.textContent = "Saved locally";
   }
   if (!state.selectedSegments.length) {
+    elements.loadMoreSegments.hidden = true;
     elements.legacyTranscript.hidden = false;
     const legacyText = (session && session.transcript) || "This conversation has no transcript.";
     const legacyId = session ? "legacy-" + session.id : "";
@@ -1518,45 +1629,40 @@ function renderTranscript(session) {
     return;
   }
   elements.legacyTranscript.hidden = true;
-  for (const segment of state.selectedSegments) {
+  if (!state.renderedSegmentCount) {
+    state.renderedSegmentCount = nextRenderedSegmentCount(
+      state.selectedSegments.length,
+      0,
+      SEGMENT_RENDER_BATCH,
+    );
+  }
+  const visibleSegments = state.selectedSegments.slice(0, state.renderedSegmentCount);
+  for (const segment of visibleSegments) {
     const row = document.createElement("article");
     row.className = "segment";
     row.dataset.segmentId = segment.id;
     const speakerColumn = document.createElement("div");
     speakerColumn.className = "segment-speaker";
-    const select = buildSpeakerSelect(segment.speaker_id, segment.speaker_label);
-    select.setAttribute("aria-label", "Speaker for this intervention");
-    select.disabled = conversationLocked;
-    select.addEventListener("change", async () => {
-      await assignSegmentSpeaker(segment, select.value || null);
+    const speakerButton = document.createElement("button");
+    speakerButton.type = "button";
+    speakerButton.className = "segment-speaker-button";
+    speakerButton.textContent = segment.speaker_label || "Unknown speaker";
+    speakerButton.setAttribute(
+      "aria-label",
+      "Speaker for intervention at " + formatTimestamp(segment.start_ms),
+    );
+    speakerButton.disabled = conversationLocked;
+    speakerButton.addEventListener("click", () => {
+      openSpeakerPicker(segment);
     });
     const time = document.createElement("time");
     time.textContent = formatTimestamp(segment.start_ms);
-    speakerColumn.append(time, select);
+    speakerColumn.append(time, speakerButton);
 
     const body = document.createElement("div");
     body.className = "segment-body";
-    const text = document.createElement("textarea");
-    text.className = "segment-text";
-    text.value = segment.text || "";
-    text.setAttribute("aria-label", "Transcript intervention");
-    text.disabled = conversationLocked;
-    text.addEventListener("input", () => {
-      autoResize(text);
-      elements.saveState.textContent = "Unsaved changes";
-    });
-    text.addEventListener("blur", async () => {
-      const value = text.value.trim();
-      if (value === (segment.text || "").trim()) {
-        elements.saveState.textContent = "Saved locally";
-        if (segmentTranslations(segment.id).length) renderTranscript(session);
-        return;
-      }
-      await saveSegmentText(segment, value);
-    });
-    text.addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") text.blur();
-    });
+    const presentation = document.createElement("div");
+    presentation.dataset.segmentPresentation = "true";
     const translations = segmentTranslations(segment.id);
     if (translations.length) {
       const plan = buildTranslationPlan(segment.text, translations);
@@ -1571,7 +1677,7 @@ function renderTranscript(session) {
           rich.append(document.createTextNode(" "), translation);
         }
       }
-      body.append(rich);
+      presentation.append(rich);
       if (plan.fallbacks.length) {
         const fallbacks = document.createElement("div");
         fallbacks.className = "translation-fallbacks";
@@ -1594,54 +1700,174 @@ function renderTranscript(session) {
             );
           }
         }
-        body.append(fallbacks);
+        presentation.append(fallbacks);
       }
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.className = "text-button segment-edit-button";
-      edit.textContent = "Edit transcript";
-      edit.disabled = conversationLocked;
-      text.hidden = true;
-      edit.addEventListener("click", () => {
-        rich.hidden = true;
-        const fallbacks = body.querySelector(".translation-fallbacks");
-        if (fallbacks) fallbacks.hidden = true;
-        edit.hidden = true;
-        text.hidden = false;
-        autoResize(text);
-        text.focus();
-      });
-      body.append(edit);
+    } else {
+      const text = document.createElement("div");
+      text.className = "segment-text-display";
+      text.textContent = segment.text || "";
+      presentation.append(text);
     }
-    body.append(text);
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "text-button segment-edit-button";
+    edit.textContent = "Edit transcript";
+    edit.disabled = conversationLocked;
+    edit.addEventListener("click", () => {
+      beginSegmentEdit(segment, session, body, presentation, edit);
+    });
+    body.append(presentation, edit);
     row.append(speakerColumn, body);
     elements.segmentsList.append(row);
-    autoResize(text);
   }
-  scheduleTranscriptResize();
+  const remaining = state.selectedSegments.length - visibleSegments.length;
+  elements.loadMoreSegments.hidden = remaining <= 0;
+  if (remaining > 0) {
+    elements.loadMoreSegments.textContent =
+      "Show next " +
+      Math.min(SEGMENT_RENDER_BATCH, remaining) +
+      " interventions · " +
+      remaining +
+      " remaining";
+  }
 }
 
 function segmentTranslations(segmentId) {
   if (!state.recapState?.recap || state.recapState.stale) return [];
-  return (state.recapState.recap.payload.translations || []).filter(
-    (translation) => translation.segment_id === segmentId,
-  );
+  return state.translationIndex.get(segmentId) || [];
 }
 
-function buildSpeakerSelect(selectedId, fallbackLabel) {
-  const select = document.createElement("select");
-  const unknown = document.createElement("option");
-  unknown.value = "";
-  unknown.textContent = fallbackLabel && !selectedId ? fallbackLabel : "Unknown speaker";
-  select.append(unknown);
-  for (const speaker of state.speakers) {
-    const option = document.createElement("option");
-    option.value = speaker.id;
-    option.textContent = speaker.label || "Unnamed voice";
-    option.selected = speaker.id === selectedId;
-    select.append(option);
+function beginSegmentEdit(segment, session, body, presentation, editButton) {
+  if (body.querySelector(".segment-text")) return;
+  presentation.hidden = true;
+  editButton.hidden = true;
+  const textarea = document.createElement("textarea");
+  textarea.className = "segment-text";
+  textarea.value = segment.text || "";
+  textarea.setAttribute("aria-label", "Transcript intervention");
+  body.append(textarea);
+  autoResize(textarea);
+  textarea.focus();
+  textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+  let cancelled = false;
+  textarea.addEventListener("input", () => {
+    autoResize(textarea);
+    elements.saveState.textContent = "Unsaved changes";
+  });
+  textarea.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      cancelled = true;
+      renderTranscript(session);
+      return;
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") textarea.blur();
+  });
+  textarea.addEventListener("blur", async () => {
+    if (cancelled || !textarea.isConnected) return;
+    const value = textarea.value.trim();
+    if (value === (segment.text || "").trim()) {
+      elements.saveState.textContent = "Saved locally";
+      renderTranscript(session);
+      return;
+    }
+    await saveSegmentText(segment, value);
+  });
+}
+
+function showMoreSegments() {
+  if (state.renderedSegmentCount >= state.selectedSegments.length) return;
+  state.renderedSegmentCount = nextRenderedSegmentCount(
+    state.selectedSegments.length,
+    state.renderedSegmentCount + SEGMENT_RENDER_BATCH,
+    SEGMENT_RENDER_BATCH,
+  );
+  const session = state.sessions.find(
+    (candidate) => candidate.id === state.selectedSessionId,
+  );
+  renderTranscript(session);
+}
+
+function ensureSegmentRendered(index) {
+  const requiredCount = nextRenderedSegmentCount(
+    state.selectedSegments.length,
+    state.renderedSegmentCount,
+    SEGMENT_RENDER_BATCH,
+    index,
+  );
+  if (requiredCount <= state.renderedSegmentCount) return;
+  state.renderedSegmentCount = requiredCount;
+  const session = state.sessions.find(
+    (candidate) => candidate.id === state.selectedSessionId,
+  );
+  renderTranscript(session);
+}
+
+function openSpeakerPicker(segment) {
+  if (!segment || recapIsRunning(segment.session_id)) return;
+  state.speakerPickerSegmentId = segment.id;
+  elements.speakerPickerSearch.value = "";
+  renderSpeakerPicker();
+  elements.speakerPickerDialog.showModal();
+  window.setTimeout(() => elements.speakerPickerSearch.focus(), 0);
+}
+
+function renderSpeakerPicker() {
+  const segment = state.selectedSegments.find(
+    (candidate) => candidate.id === state.speakerPickerSegmentId,
+  );
+  const query = elements.speakerPickerSearch.value.trim().toLocaleLowerCase();
+  const speakers = state.speakers
+    .filter((speaker) =>
+      String(speaker.label || "Unnamed voice").toLocaleLowerCase().includes(query),
+    )
+    .sort((left, right) =>
+      String(left.label || "Unnamed voice").localeCompare(
+        String(right.label || "Unnamed voice"),
+        undefined,
+        { sensitivity: "base", numeric: true },
+      ),
+    );
+  elements.speakerPickerResults.replaceChildren();
+  for (const speaker of speakers) {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className =
+      "speaker-picker-option" +
+      (speaker.id === segment?.speaker_id ? " selected" : "");
+    option.setAttribute("role", "option");
+    option.setAttribute(
+      "aria-selected",
+      speaker.id === segment?.speaker_id ? "true" : "false",
+    );
+    const label = document.createElement("strong");
+    label.textContent = speaker.label || "Unnamed voice";
+    const detail = document.createElement("span");
+    const conversations = Number(speaker.conversation_count) || 0;
+    detail.textContent =
+      conversations +
+      " conversation" +
+      (conversations === 1 ? "" : "s");
+    option.append(label, detail);
+    option.addEventListener("click", () => chooseSpeakerFromPicker(speaker.id));
+    elements.speakerPickerResults.append(option);
   }
-  return select;
+  if (!speakers.length) {
+    const empty = document.createElement("p");
+    empty.className = "speaker-picker-empty";
+    empty.textContent = "No matching people or voices.";
+    elements.speakerPickerResults.append(empty);
+  }
+  elements.speakerPickerUnknown.disabled = !segment?.speaker_id;
+}
+
+async function chooseSpeakerFromPicker(speakerId) {
+  const segment = state.selectedSegments.find(
+    (candidate) => candidate.id === state.speakerPickerSegmentId,
+  );
+  if (!segment) return;
+  if (elements.speakerPickerDialog.open) elements.speakerPickerDialog.close();
+  state.speakerPickerSegmentId = null;
+  await assignSegmentSpeaker(segment, speakerId || null);
 }
 
 function autoResize(textarea) {
@@ -1682,6 +1908,7 @@ async function saveSegmentText(segment, text) {
       sessionId: segment.session_id,
       text,
     });
+    invalidateConversationCache(state.conversationCache, segment.session_id);
     segment.text = text;
     syncSelectedSessionTranscript();
     await refreshRecapState({ rerenderTranscript: false });
@@ -1705,6 +1932,7 @@ async function assignSegmentSpeaker(segment, speakerId) {
       sessionId: segment.session_id,
       speakerId,
     });
+    invalidateConversationCache(state.conversationCache, segment.session_id);
     const speaker = state.speakers.find((candidate) => candidate.id === speakerId);
     segment.speaker_id = speakerId;
     segment.speaker_label = speaker ? speaker.label : null;
@@ -1734,18 +1962,20 @@ function syncSelectedSessionTranscript() {
 async function saveConversationTitle() {
   if (!state.selectedSessionId) return;
   if (recapIsRunning(state.selectedSessionId)) return;
+  const sessionId = state.selectedSessionId;
   const title = elements.conversationTitle.value.trim();
   if (!title) {
-    const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
+    const session = state.sessions.find((candidate) => candidate.id === sessionId);
     elements.conversationTitle.value = sessionTitle(session);
     return;
   }
   try {
     await invoke("update_session_title", {
-      sessionId: state.selectedSessionId,
+      sessionId,
       title,
     });
-    const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
+    invalidateConversationCache(state.conversationCache, sessionId);
+    const session = state.sessions.find((candidate) => candidate.id === sessionId);
     if (session) session.title = title;
     renderSessions();
     addActivity("Conversation title saved", "success");
@@ -1831,6 +2061,7 @@ async function deleteSelectedSession() {
     const removedVoices = await invoke("delete_session", {
       sessionId,
     });
+    invalidateConversationCache(state.conversationCache, sessionId);
     addActivity(
       "Conversation deleted" +
         (removedVoices
@@ -1844,6 +2075,8 @@ async function deleteSelectedSession() {
     state.selectedSessionId = null;
     state.selectedSegments = [];
     state.recapState = null;
+    state.translationIndex = new Map();
+    state.renderedSegmentCount = 0;
     state.activeRecapTab = "transcript";
     elements.conversationTitle.value = "New conversation";
     elements.conversationTitle.disabled = true;
@@ -1860,7 +2093,13 @@ async function deleteSelectedSession() {
 
 async function loadSpeakers() {
   try {
-    state.speakers = await invoke("list_speakers_with_stats");
+    const previousSignature = speakerLibrarySignature(state.speakers);
+    const speakers = await invoke("list_speakers_with_stats");
+    const nextSignature = speakerLibrarySignature(speakers);
+    if (previousSignature && previousSignature !== nextSignature) {
+      invalidateConversationCache(state.conversationCache);
+    }
+    state.speakers = speakers;
     renderConversationSpeakerFilter();
     renderSpeakers();
     renderVoiceLibrary();
@@ -1871,6 +2110,21 @@ async function loadSpeakers() {
   } catch (error) {
     addActivity("Could not load voice profiles: " + errorText(error), "error");
   }
+}
+
+function speakerLibrarySignature(speakers) {
+  return (speakers || [])
+    .map((speaker) =>
+      [
+        speaker.id,
+        speaker.label,
+        speaker.embedding_count,
+        speaker.sample_count,
+        speaker.conversation_count,
+      ].join("\u0000"),
+    )
+    .sort()
+    .join("\u0001");
 }
 
 function renderConversationSpeakerFilter() {
@@ -2403,7 +2657,9 @@ function buildUnknownSpeakerCard(segments) {
 }
 
 function reviewUnknownInterventions() {
-  const segment = state.selectedSegments.find((candidate) => !candidate.speaker_id);
+  const index = state.selectedSegments.findIndex((candidate) => !candidate.speaker_id);
+  const segment = index >= 0 ? state.selectedSegments[index] : null;
+  if (index >= 0) ensureSegmentRendered(index);
   const row = segment
     ? Array.from(elements.segmentsList.children).find(
         (candidate) => candidate.dataset.segmentId === segment.id,
@@ -2411,8 +2667,13 @@ function reviewUnknownInterventions() {
     : null;
   if (!row) return;
   row.scrollIntoView({ behavior: "smooth", block: "center" });
-  const select = row.querySelector("select");
-  if (select) window.setTimeout(() => select.focus(), 250);
+  const speakerButton = row.querySelector(".segment-speaker-button");
+  if (speakerButton) {
+    window.setTimeout(() => {
+      speakerButton.focus();
+      openSpeakerPicker(segment);
+    }, 250);
+  }
 }
 
 async function createProfileForUnknownSegments() {
@@ -3362,6 +3623,7 @@ function openAgendaDialog() {
 async function saveAgendaText(event) {
   event.preventDefault();
   if (!state.selectedSessionId) return;
+  const sessionId = state.selectedSessionId;
   const text = elements.agendaText.value;
   if (!text.trim()) {
     elements.agendaFeedback.textContent = "Paste agenda text, or choose a file.";
@@ -3370,7 +3632,8 @@ async function saveAgendaText(event) {
   elements.saveAgendaTextButton.disabled = true;
   elements.agendaFeedback.textContent = "Saving locally…";
   try {
-    await invoke("save_agenda_text", { sessionId: state.selectedSessionId, text });
+    await invoke("save_agenda_text", { sessionId, text });
+    invalidateConversationCache(state.conversationCache, sessionId);
     await refreshRecapState({ rerenderTranscript: false });
     elements.agendaFeedback.textContent = "Saved.";
     elements.agendaDialog.close();
@@ -3386,16 +3649,18 @@ async function saveAgendaText(event) {
 
 async function chooseAgendaFile() {
   if (!state.selectedSessionId) return;
+  const sessionId = state.selectedSessionId;
   elements.attachAgendaButton.disabled = true;
   elements.agendaFeedback.textContent = "Waiting for file selection…";
   try {
     const agenda = await invoke("choose_agenda_file", {
-      sessionId: state.selectedSessionId,
+      sessionId,
     });
     if (!agenda) {
       elements.agendaFeedback.textContent = "No file selected.";
       return;
     }
+    invalidateConversationCache(state.conversationCache, sessionId);
     await refreshRecapState({ rerenderTranscript: false });
     renderAgendaDialog();
     elements.agendaFeedback.textContent = "File stored locally.";
@@ -3411,6 +3676,7 @@ async function chooseAgendaFile() {
 
 async function removeAgenda() {
   if (!state.selectedSessionId || !state.recapState?.agenda) return;
+  const sessionId = state.selectedSessionId;
   const confirmed = await requestConfirmation({
     title: "Remove this agenda?",
     message:
@@ -3419,7 +3685,8 @@ async function removeAgenda() {
   });
   if (!confirmed) return;
   try {
-    await invoke("remove_agenda", { sessionId: state.selectedSessionId });
+    await invoke("remove_agenda", { sessionId });
+    invalidateConversationCache(state.conversationCache, sessionId);
     await refreshRecapState({ rerenderTranscript: false });
     renderAgendaDialog();
     elements.agendaFeedback.textContent = "Agenda removed.";
@@ -3456,10 +3723,12 @@ function reviewUnresolvedParticipants() {
   elements.unresolvedDialog.close();
   selectRecapTab("transcript");
   const unresolved = new Set(state.recapState?.unresolved_profiles || []);
-  const segment = state.selectedSegments.find(
+  const index = state.selectedSegments.findIndex(
     (candidate) =>
       !candidate.speaker_id || unresolved.has(candidate.speaker_label || "Unknown speaker"),
   );
+  const segment = index >= 0 ? state.selectedSegments[index] : null;
+  if (index >= 0) ensureSegmentRendered(index);
   const row = segment
     ? Array.from(elements.segmentsList.children).find(
         (candidate) => candidate.dataset.segmentId === segment.id,
@@ -3467,8 +3736,13 @@ function reviewUnresolvedParticipants() {
     : null;
   if (row) {
     row.scrollIntoView({ behavior: "smooth", block: "center" });
-    const select = row.querySelector("select");
-    if (select) window.setTimeout(() => select.focus(), 250);
+    const speakerButton = row.querySelector(".segment-speaker-button");
+    if (speakerButton) {
+      window.setTimeout(() => {
+        speakerButton.focus();
+        openSpeakerPicker(segment);
+      }, 250);
+    }
   }
   showToast("Assign or name the highlighted participant, then click Recap again.");
 }
@@ -3499,6 +3773,10 @@ async function runRecap(allowUnresolved) {
         throw new Error("The LLM provider finished, but Recall could not load the saved recap.");
       }
       state.recapState = persistedState;
+      state.translationIndex = indexTranslations(
+        state.recapState?.recap?.payload?.translations || [],
+      );
+      invalidateConversationCache(state.conversationCache, sessionId);
       state.activeRecapTab = "executive";
       const session = state.sessions.find((candidate) => candidate.id === sessionId);
       renderRecapShell();
@@ -4668,10 +4946,17 @@ function bindInterface() {
   }
   elements.recordButton.addEventListener("click", startRecording);
   elements.emptyRecordButton.addEventListener("click", startRecording);
-  elements.refreshSessions.addEventListener("click", () => loadSessions());
+  elements.refreshSessions.addEventListener("click", () =>
+    loadSessions({ invalidateCache: true }),
+  );
   elements.refreshSpeakers.addEventListener("click", loadSpeakers);
-  elements.conversationSearch.addEventListener("input", renderSessions);
+  elements.conversationSearch.addEventListener("input", scheduleConversationSearch);
   elements.conversationSpeakerFilter.addEventListener("change", applyConversationVoiceFilter);
+  elements.loadMoreSegments.addEventListener("click", showMoreSegments);
+  elements.speakerPickerSearch.addEventListener("input", renderSpeakerPicker);
+  elements.speakerPickerUnknown.addEventListener("click", () =>
+    chooseSpeakerFromPicker(null),
+  );
   elements.liveTranscript.addEventListener("scroll", handleLiveScroll, { passive: true });
   elements.liveTranslatedTranscript.addEventListener("scroll", handleLiveScroll, {
     passive: true,

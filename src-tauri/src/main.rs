@@ -41,8 +41,8 @@ mod state;
 
 use config::AppConfig;
 use db::{
-    AgendaMetadata, AgendaRecord, Crypto, Db, RecapRecord, RecapSave, SegmentRecord, Session,
-    Speaker, StoredEmbedding, VoiceMatchDecisionSave,
+    AgendaMetadata, AgendaRecord, Crypto, Db, ImportedSessionArtifact, RecapRecord, RecapSave,
+    SegmentRecord, Session, SessionSummary, Speaker, StoredEmbedding, VoiceMatchDecisionSave,
 };
 use embedding::EMBEDDING_VERSION;
 use jamie_import::{JamieImportDraft, JamieImportPreview};
@@ -194,6 +194,14 @@ struct RecapStateView {
     stale: bool,
     unresolved_profiles: Vec<String>,
     in_flight: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ConversationPayload {
+    session: Session,
+    segments: Vec<SegmentRecord>,
+    recap_state: RecapStateView,
+    imported_artifact: Option<ImportedSessionArtifact>,
 }
 
 struct RecapSnapshot {
@@ -1112,9 +1120,7 @@ fn retry_processing(
     let path = PathBuf::from(&job.audio_path);
     validate_managed_audio_path(&path, app_state.inner())?;
     let session = db
-        .list_sessions()?
-        .into_iter()
-        .find(|candidate| candidate.id == session_id)
+        .get_session(&session_id)?
         .ok_or_else(|| "Conversation not found".to_string())?;
     let run_id = Uuid::new_v4().to_string();
     db.restart_processing_session(&session_id, &run_id)?;
@@ -2374,8 +2380,13 @@ fn app_status(
 }
 
 #[tauri::command]
-fn list_sessions(app_state: State<AppState>) -> Result<Vec<Session>, String> {
-    app_state.db_handle()?.list_sessions()
+fn list_sessions(app_state: State<AppState>) -> Result<Vec<SessionSummary>, String> {
+    app_state.db_handle()?.list_session_summaries()
+}
+
+#[tauri::command]
+fn search_session_ids(query: String, app_state: State<AppState>) -> Result<Vec<String>, String> {
+    app_state.db_handle()?.search_session_ids(&query)
 }
 
 #[tauri::command]
@@ -2454,34 +2465,41 @@ fn delete_session(session_id: String, app_state: State<AppState>) -> Result<usiz
 
 fn recap_snapshot(db: &Db, session_id: &str) -> Result<RecapSnapshot, String> {
     let session = db
-        .list_sessions()?
-        .into_iter()
-        .find(|session| session.id == session_id)
+        .get_session(session_id)?
         .ok_or_else(|| "Conversation not found".to_string())?;
     let stored_segments = db.list_segments(session_id)?;
+    recap_snapshot_from(db, &session, &stored_segments)
+}
+
+fn recap_snapshot_from(
+    db: &Db,
+    session: &Session,
+    stored_segments: &[SegmentRecord],
+) -> Result<RecapSnapshot, String> {
     let mut segments = stored_segments
-        .into_iter()
+        .iter()
         .filter(|segment| !segment.text.trim().is_empty())
         .map(|segment| RecapSourceSegment {
-            id: segment.id,
+            id: segment.id.clone(),
             start_ms: segment.start_ms,
             end_ms: segment.end_ms,
-            speaker_id: segment.speaker_id,
+            speaker_id: segment.speaker_id.clone(),
             speaker_label: segment
                 .speaker_label
+                .clone()
                 .filter(|label| !label.trim().is_empty())
                 .unwrap_or_else(|| "Unknown speaker".to_string()),
-            text: segment.text,
+            text: segment.text.clone(),
         })
         .collect::<Vec<_>>();
     if segments.is_empty() && !session.transcript.trim().is_empty() {
         segments.push(RecapSourceSegment {
-            id: format!("legacy-{session_id}"),
+            id: format!("legacy-{}", session.id),
             start_ms: 0,
             end_ms: session.duration_ms,
             speaker_id: None,
             speaker_label: "Unknown speaker".into(),
-            text: session.transcript,
+            text: session.transcript.clone(),
         });
     }
     if segments.is_empty() {
@@ -2498,7 +2516,7 @@ fn recap_snapshot(db: &Db, session_id: &str) -> Result<RecapSnapshot, String> {
                 .then(|| segment.speaker_label.clone())
         })
         .collect::<Vec<_>>();
-    let agenda = db.load_agenda(session_id)?;
+    let agenda = db.load_agenda(&session.id)?;
     let agenda_fingerprint = agenda.as_ref().map(|agenda| AgendaFingerprint {
         source_kind: &agenda.source_kind,
         filename: &agenda.filename,
@@ -2516,7 +2534,21 @@ fn recap_snapshot(db: &Db, session_id: &str) -> Result<RecapSnapshot, String> {
 
 fn recap_state_view(app_state: &AppState, session_id: &str) -> Result<RecapStateView, String> {
     let db = app_state.db_handle()?;
-    let snapshot = recap_snapshot(&db, session_id)?;
+    let session = db
+        .get_session(session_id)?
+        .ok_or_else(|| "Conversation not found".to_string())?;
+    let segments = db.list_segments(session_id)?;
+    recap_state_view_from(app_state, &db, &session, &segments)
+}
+
+fn recap_state_view_from(
+    app_state: &AppState,
+    db: &Db,
+    session: &Session,
+    segments: &[SegmentRecord],
+) -> Result<RecapStateView, String> {
+    let session_id = session.id.as_str();
+    let snapshot = recap_snapshot_from(db, session, segments)?;
     let mut recap = db.load_recap(session_id)?;
     if let Some(saved) = recap.as_mut() {
         if saved.source_fingerprint != snapshot.source_fingerprint
@@ -2560,6 +2592,26 @@ fn recap_state_view(app_state: &AppState, session_id: &str) -> Result<RecapState
         stale,
         unresolved_profiles: snapshot.unresolved_profiles,
         in_flight,
+    })
+}
+
+#[tauri::command]
+fn load_conversation(
+    session_id: String,
+    app_state: State<AppState>,
+) -> Result<ConversationPayload, String> {
+    let db = app_state.db_handle()?;
+    let session = db
+        .get_session(&session_id)?
+        .ok_or_else(|| "Conversation not found".to_string())?;
+    let segments = db.list_segments(&session_id)?;
+    let recap_state = recap_state_view_from(app_state.inner(), &db, &session, &segments)?;
+    let imported_artifact = db.load_imported_session_artifact(&session_id)?;
+    Ok(ConversationPayload {
+        session,
+        segments,
+        recap_state,
+        imported_artifact,
     })
 }
 
@@ -3290,6 +3342,8 @@ fn main() {
             enable_encryption,
             app_status,
             list_sessions,
+            search_session_ids,
+            load_conversation,
             list_segments,
             update_transcript,
             update_session_title,
@@ -3359,6 +3413,28 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_legacy_session_uses_its_cached_transcript_without_segments() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db
+            .insert_session(
+                "Legacy conversation",
+                "Unknown speaker: cached legacy transcript",
+                4_000,
+            )
+            .unwrap();
+        let session = db.get_session(&session_id).unwrap().unwrap();
+
+        let snapshot = recap_snapshot_from(&db, &session, &[]).unwrap();
+
+        assert_eq!(snapshot.segments.len(), 1);
+        assert_eq!(snapshot.segments[0].id, format!("legacy-{session_id}"));
+        assert_eq!(
+            snapshot.segments[0].text,
+            "Unknown speaker: cached legacy transcript"
+        );
+    }
 
     fn write_test_wav(path: &Path, seconds: u32) {
         let spec = hound::WavSpec {

@@ -8,15 +8,20 @@ import {
   filterSessions,
   formatDuration,
   formatTimestamp,
+  getCachedConversation,
   groupVoiceFilters,
+  indexTranslations,
+  invalidateConversationCache,
   isNearScrollBottom,
   isProvisionalLabel,
   isSessionProcessing,
+  nextRenderedSegmentCount,
   normalizePreferredLanguage,
   parseLanguageHints,
   parseNoTranslationLanguages,
   processingRunIds,
   recapTabAvailability,
+  setCachedConversation,
   shouldShowOnboarding,
   translatedSegmentText,
   transcriptFromSegments,
@@ -162,6 +167,49 @@ test("conversation filtering combines text and selected voice", () => {
     ["two"],
   );
   assert.deepEqual(filterSessions(sessions, "planning", new Set(["two"])), []);
+});
+
+test("conversation filtering accepts backend transcript matches for metadata-only rows", () => {
+  const sessions = [
+    { id: "one", title: "Planning" },
+    { id: "two", title: "Review" },
+  ];
+  assert.deepEqual(
+    filterSessions(sessions, "spoken phrase", null, new Set(["two"])).map(
+      (session) => session.id,
+    ),
+    ["two"],
+  );
+});
+
+test("translations are indexed once by segment", () => {
+  const first = { segment_id: "one", translated_text: "Hello" };
+  const second = { segment_id: "one", translated_text: "Again" };
+  const index = indexTranslations([first, second, { segment_id: "", translated_text: "Skip" }]);
+  assert.deepEqual(index.get("one"), [first, second]);
+  assert.equal(index.size, 1);
+});
+
+test("conversation cache is bounded, recent, and explicitly invalidated", () => {
+  const cache = new Map();
+  setCachedConversation(cache, "one", { id: 1 }, 2);
+  setCachedConversation(cache, "two", { id: 2 }, 2);
+  assert.deepEqual(getCachedConversation(cache, "one"), { id: 1 });
+  setCachedConversation(cache, "three", { id: 3 }, 2);
+  assert.equal(cache.has("two"), false);
+  assert.equal(cache.has("one"), true);
+  invalidateConversationCache(cache, "one");
+  assert.equal(cache.has("one"), false);
+  invalidateConversationCache(cache);
+  assert.equal(cache.size, 0);
+});
+
+test("progressive transcript rendering grows by batches and can reveal a required row", () => {
+  assert.equal(nextRenderedSegmentCount(2_163), 100);
+  assert.equal(nextRenderedSegmentCount(2_163, 100), 100);
+  assert.equal(nextRenderedSegmentCount(2_163, 200, 100), 200);
+  assert.equal(nextRenderedSegmentCount(2_163, 100, 100, 721), 800);
+  assert.equal(nextRenderedSegmentCount(45, 0, 100), 45);
 });
 
 test("voice filters collapse named people and omit provisional or unknown profiles", () => {
