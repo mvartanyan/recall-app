@@ -53,10 +53,11 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Store conversations locally and edit their title, speaker assignment, and transcript text.
 - Put intervention time and a wide person button on one metadata line above
   the intervention text, so long human names remain readable without narrowing
-  the transcript. One shared searchable picker handles attribution instead of
-  duplicating the whole voice library in every row. Interventions render as
-  text, create an expanding editor only when requested, and load in
-  100-intervention batches for very long meetings.
+  the transcript. The button uses the available row width and shortens its label
+  only when the full name genuinely does not fit. One shared searchable picker
+  handles attribution instead of duplicating the whole voice library in every
+  row. Interventions render as text, create an expanding editor only when
+  requested, and load in 100-intervention batches for very long meetings.
 - Keep the conversation list metadata-only. Opening a conversation loads one
   native payload with that meeting, its interventions, and recap state; a
   bounded five-conversation cache makes recent revisits immediate and is
@@ -79,7 +80,8 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Show only voices attributed in the selected conversation in the right pane.
   Keep the complete identity database in the sidebar's paginated
   **People & Voices** manager, with separate searchable Profiles and exact
-  conversation-scoped Unassigned views.
+  conversation-scoped Unassigned views. Long person names wrap inside their
+  cards instead of widening the Voices pane.
 - Preview the full impact before merging profiles or assigning unassigned
   groups. Revalidate the affected conversations, create an integrity-checked
   database backup, and apply transcript, recap, voiceprint, and sample changes
@@ -294,7 +296,7 @@ can open a downloaded build without a Gatekeeper warning. See
 credentials, architecture choices, and the external-release checklist.
 
 The latest explicitly unsigned Apple-silicon preview is
-[Recall v0.2.1](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.1).
+[Recall v0.2.2](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.2).
 
 Speaker-model smoke test with a mono WAV:
 

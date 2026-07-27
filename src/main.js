@@ -2613,6 +2613,7 @@ function buildUnknownSpeakerCard(segments) {
   avatar.className = "speaker-avatar";
   avatar.textContent = "?";
   const copy = document.createElement("div");
+  copy.className = "speaker-copy";
   const name = document.createElement("div");
   name.className = "speaker-name";
   name.textContent = "Unknown speaker";
@@ -2720,6 +2721,7 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
   avatar.className = "speaker-avatar";
   avatar.textContent = speakerInitial(label);
   const copy = document.createElement("div");
+  copy.className = "speaker-copy";
   const name = document.createElement("div");
   name.className = "speaker-name";
   name.textContent = label;

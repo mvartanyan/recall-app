@@ -336,9 +336,25 @@ test("an active recording is a selectable sidebar workspace", () => {
 test("interventions put time and one shared speaker picker above the text", () => {
   assert.match(javascript, /speakerColumn\.append\(time, speakerButton\)/);
   assert.match(stylesheet, /\.segment\s*\{\s*display:\s*block;/);
-  assert.match(stylesheet, /\.segment-speaker-button[\s\S]*?width:\s*min\(320px/);
+  assert.match(
+    stylesheet,
+    /\.segment-speaker-button[\s\S]*?flex:\s*1 1 auto;[\s\S]*?min-width:\s*0;[\s\S]*?max-width:\s*100%/,
+  );
   assert.match(html, /id="speakerPickerDialog"/);
   assert.match(javascript, /function renderSpeakerPicker\(\)/);
+});
+
+test("long participant names use available transcript width and wrap inside voice cards", () => {
+  assert.match(javascript, /copy\.className = "speaker-copy"/);
+  assert.match(
+    stylesheet,
+    /\.speaker-card[\s\S]*?width:\s*100%;[\s\S]*?min-width:\s*0;[\s\S]*?max-width:\s*100%/,
+  );
+  assert.match(stylesheet, /\.speaker-copy\s*\{\s*min-width:\s*0;/);
+  assert.match(
+    stylesheet,
+    /\.speaker-name[\s\S]*?line-height:\s*1\.2;[\s\S]*?overflow-wrap:\s*anywhere;/,
+  );
 });
 
 test("interventions render progressively as text and create editors only on demand", () => {

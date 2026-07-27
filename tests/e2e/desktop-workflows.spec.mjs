@@ -693,6 +693,16 @@ async function installTauriMock(page) {
     window.__mockCommandCount = (command) => commandCounts[command] || 0;
     window.__mockConversationLoadCount = (sessionId) =>
       commandCounts["load_conversation:" + sessionId] || 0;
+    window.__setMockSpeakerLabel = (speakerId, label) => {
+      const speaker = speakers.find((candidate) => candidate.id === speakerId);
+      if (!speaker) throw new Error("Mock speaker not found");
+      speaker.label = label;
+      for (const segments of Object.values(native.segments)) {
+        for (const segment of segments) {
+          if (segment.speaker_id === speakerId) segment.speaker_label = label;
+        }
+      }
+    };
     window.__addConversationFixture = ({
       sessionId = "session-large",
       title = "Large archive meeting",
@@ -947,6 +957,55 @@ test("a 149-intervention conversation remains bounded and fully reachable", asyn
   await page.getByRole("button", { name: /Show next 49 interventions/ }).click();
   await expect(rows).toHaveCount(149);
   await expect(page.locator("#loadMoreSegments")).toBeHidden();
+});
+
+test("long participant names use transcript space and remain inside the Voices pane", async ({
+  page,
+}) => {
+  const longName = "Maria de la Trinidad Valdivieso Gonsales (IARC)";
+  await page.evaluate(
+    ({ speakerId, label }) => window.__setMockSpeakerLabel(speakerId, label),
+    { speakerId: "speaker-alice", label: longName },
+  );
+  await page.locator("#refreshSpeakers").click();
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+
+  const speakerButton = page.locator("#segmentsList .segment-speaker-button").first();
+  await expect(speakerButton).toHaveText(longName);
+  const transcriptFit = await speakerButton.evaluate((button) => {
+    const row = button.closest(".segment-speaker").getBoundingClientRect();
+    const bounds = button.getBoundingClientRect();
+    return {
+      usesAvailableWidth: bounds.width >= row.width * 0.75,
+      textFits: button.scrollWidth <= button.clientWidth + 1,
+    };
+  });
+  expect(transcriptFit).toEqual({
+    usesAvailableWidth: true,
+    textFits: true,
+  });
+
+  const card = page.locator("#speakersList .speaker-card").filter({ hasText: longName });
+  await expect(card).toBeVisible();
+  const cardLayout = await card.evaluate((element) => {
+    const pane = element.closest(".people-pane").getBoundingClientRect();
+    const bounds = element.getBoundingClientRect();
+    const name = element.querySelector(".speaker-name");
+    const nameBounds = name.getBoundingClientRect();
+    const lineHeight = Number.parseFloat(getComputedStyle(name).lineHeight);
+    return {
+      contained: bounds.left >= pane.left - 1 && bounds.right <= pane.right + 1,
+      nameWrapped: nameBounds.height > lineHeight * 1.5,
+      pageContained:
+        document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    };
+  });
+  expect(cardLayout).toEqual({
+    contained: true,
+    nameWrapped: true,
+    pageContained: true,
+  });
 });
 
 test("a stale delayed conversation load cannot replace a newer selection", async ({
