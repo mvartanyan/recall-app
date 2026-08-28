@@ -39,16 +39,41 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Use the same transparent frontal-brain-with-headset identity mark in the
   macOS Dock and the in-app sidebar; the sidebar mark spans the combined height
   of the product name and subtitle.
-- Stream provisional original-language captions through Soniox stt-rt-v5 and,
-  when useful, show a separate live translation in the user's preferred
-  language. Speech already in the preferred language or an explicitly excluded
-  language is not translated on screen.
+- Stream provisional original-language captions through Soniox stt-rt-v5 as
+  one naturally wrapping paragraph per contiguous speaker turn. Code switches
+  change colour inline instead of starting new rows. When at least one language
+  run in a turn is translated, place one complete preferred-language line
+  underneath: translated runs use the provider output, while preferred or
+  excluded runs carry their source text through unchanged. Every run in that
+  line begins with its normalized source-language marker, such as `[ru]` or
+  `[en]`, and corresponding runs in both lines share a recording-local soft
+  colour. Locale variants such as `de-DE` and `de` share a colour. The mapping
+  survives provisional updates and archive navigation, and resets for the next
+  recording. Speech already in the preferred language or an explicitly
+  excluded language is not translated on screen.
 - Keep original live captions working when a previously saved target is no
   longer supported by the active STT adapter. Settings preserves the unavailable
   value for correction and Activity reports the omitted translation; Recall
   does not silently choose another target.
 - Run higher-quality final transcription through Soniox stt-async-v5.
 - Enable speaker diarization, language identification, and code-switching-friendly language hints.
+- Send both live and final STT short meeting context that asks the provider to
+  preserve the language actually spoken, keep speaker labels stable across
+  code-switches, and separate distinct voices. The **Current recording** view
+  exposes likely languages and an optional expected-speaker count from 1 to 15
+  for that meeting only. Changes wait for 1.5 seconds of locally detected quiet
+  audio, or at most five seconds, then finalize the old realtime socket and
+  reconnect with the new context. The visible **Pending**, **Sending**, and
+  **Sent to STT** states report Recall's delivery attempt and exact requested
+  hints/count; they do not claim that the provider accepted or obeyed them.
+  Microphone capture and WAV writing continue throughout; queued PCM is flushed
+  to the new socket, and a persistent restart marker appears in the live feed.
+  The last context is also persisted with the final-processing job and reused
+  by retries.
+- Validate likely-language hints as normalized ISO-style language tags before
+  starting or updating a meeting; the common legacy code `jp` is normalized to
+  `ja`. Hints remain non-strict, so unexpected languages and code-switches are
+  still possible.
 - Merge adjacent interventions from the same diarized speaker.
 - Store conversations locally and edit their title, speaker assignment, and transcript text.
 - Put intervention time and a wide person button on one metadata line above
@@ -63,14 +88,24 @@ Recall stores its archive locally. During transcription, it sends audio directly
   bounded five-conversation cache makes recent revisits immediate and is
   invalidated by relevant mutations. Transcript-text search remains available
   through a debounced native search.
-- Build 192-dimensional ECAPA voiceprints locally through sherpa-onnx.
+- Run the bundled Silero VAD locally over the recording once, then build
+  192-dimensional ECAPA voiceprints only from VAD-confirmed speech through
+  sherpa-onnx. Digital silence, keyboard-like impulses, overlapping turns,
+  short speech, and inconsistent excerpts do not enter the voice database.
 - Match only named people, conservatively and at most once per recording.
   Strong, unambiguous evidence assigns automatically; plausible evidence is
   shown as a one-click likely-person suggestion; unmatched voices become
   VOICE1, VOICE2, and so on.
-- Build references only from clean central windows in longer interventions;
-  reject overlapping, silent, short, or acoustically inconsistent candidates,
-  and combine obvious split provider labels only at very high agreement.
+- Preserve the STT provider label and its exact intervention provenance even
+  when no safe global profile can be made. Such a label remains scoped to that
+  conversation, with no `VOICE<n>`, preview, or reusable voiceprint.
+- Build references only from clean central windows in longer interventions.
+  Combine separate provider labels only when each has repeated, internally
+  consistent clean speech and their centroids agree at 0.995 or better.
+- Compare VAD-confirmed intervention observations inside each provider label.
+  When two substantial, internally consistent clusters disagree, flag a
+  possible mixed voice and preselect a reviewable split. Recall never applies
+  the split automatically; the user chooses the interventions first.
 - Keep Unicode-normalized human names unique. Legacy duplicate-name profiles
   are shown for merge or rename and excluded from automatic matching.
 - Preview the temporary excerpt for a new voice, give it a name, or assign it to an existing named person.
@@ -100,6 +135,12 @@ Recall stores its archive locally. During transcription, it sends audio directly
   will become Unknown speaker.
 - Confirm destructive actions in a visible app-owned overlay, including when
   the People & Voices modal is already open.
+- Offer a guarded **Voice recognition data** reset in Settings for archives
+  contaminated by older pipelines. It previews exact counts, refuses to run
+  during recording/processing/recap/identity work, creates and verifies a
+  private backup, then atomically removes voiceprints, temporary samples,
+  match decisions, observations, and provisional profiles while preserving
+  named people, conversations, transcript text, and historical labels.
 - Record again while one or more completed recordings are still being processed.
 - Navigate and use unrelated features while a final transcript or recap runs.
   Status stays with the affected conversation; only conflicting changes to
@@ -119,9 +160,9 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Inspect all transcription and attribution stages in the in-app Activity drawer.
 - Keep live captions at the full remaining viewport height while recording,
   use the sidebar **Stop recording** control as the only in-window stop action,
-  recover missed
-  native events by polling an in-memory snapshot, and log connection,
-  first-text, no-text, and error states in Activity.
+  recover missed caption events by polling an in-memory snapshot, reconcile the
+  visible recording state with the native recorder while capture is active,
+  and log connection, first-text, no-text, and error states in Activity.
 - Follow the latest live caption by default; scrolling upward pauses auto-follow
   and shows **Jump to latest** until the user resumes following.
 - Sort people by when they were last heard and mark which profiles occur in the
@@ -211,7 +252,8 @@ After launching from source:
    app-data key file with user-only permissions, clears the input, and reuses it
    on later launches without a Keychain prompt.
 3. Choose an audio input.
-4. Adjust likely languages if needed. The defaults are en, fr, de, es, ru; these are hints, not a restriction on code-switching.
+4. Adjust default likely languages if needed. The defaults are en, fr, de, es,
+   ru; these are hints, not a restriction on code-switching.
 5. Choose whether to enable live captions. They may increase STT charges because
    final transcription still runs after recording.
 6. Choose your preferred language. Recall uses it for live translation and for
@@ -219,6 +261,12 @@ After launching from source:
    the no-translation list.
 7. To use recaps, save an OpenAI key, choose the model, and optionally list
    other source-language codes that should not receive translations.
+
+After recording starts, use **Likely languages** and **Expected speakers** at
+the top of **Current recording** when this meeting differs from the defaults.
+Applying a change does not interrupt recording. Recall waits for a quiet pause,
+restarts only the live-caption socket, and records the handoff in the live feed
+and Activity drawer.
 
 Configured Soniox/OpenAI status badges stay hidden. A missing key is shown as
 an actionable warning instead of consuming permanent topbar space.
@@ -296,7 +344,7 @@ can open a downloaded build without a Gatekeeper warning. See
 credentials, architecture choices, and the external-release checklist.
 
 The latest explicitly unsigned Apple-silicon preview is
-[Recall v0.2.2](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.2).
+[Recall v0.2.3](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.3).
 
 Speaker-model smoke test with a mono WAV:
 
@@ -332,6 +380,10 @@ Model provenance and both checksums are recorded in models/README.md.
   local-only `0600` contract; never returned to JavaScript or stored in SQLite
 - Pre-recap migration backup: recall.pre-recap-v1.db
 - Pre-processing-job migration backup: recall.pre-processing-v1.db
+- Pre-per-meeting-STT-context backup: recall.pre-stt-context-v1.db
+- Voice-recognition reset backup: a uniquely named
+  `recall.pre-voice-reset-v4-*.db`; Recall verifies it before mutation and keeps
+  only the newest backup from this reset family
 - SQLite archive and migration-backup permissions: user-only `0600`, enforced
   whenever Recall opens the archive
 - Agenda originals and structured recap payloads: stored with the conversation
@@ -372,40 +424,53 @@ already exists.
 Soniox assigns speaker labels within a recording. Recall handles persistent identity across meetings locally:
 
 1. Final Soniox tokens are grouped into contiguous speaker interventions.
-2. Recall examines the longest interventions first, rejects intervals that
+2. The bundled Silero VAD runs once over the mono recording. There is no RMS
+   or energy-only fallback: if VAD is unavailable or finds no safe speech,
+   Recall does not create a global profile.
+3. Recall examines the longest interventions first, rejects intervals that
    overlap another provider speaker, trims turn boundaries, and extracts
-   centered four-second windows.
-3. sherpa-onnx computes a 192-dimensional official WeSpeaker ECAPA-TDNN-512
-   embedding with the correct feature-extraction frontend.
-4. Candidate windows must contain audible speech and form a consistent
-   acoustic majority. Recall retains at most about 12 seconds from that
-   majority. Mixed or tied candidates are excluded from matching, while the
-   provider speaker remains available as a reviewable VOICE profile without a
-   trusted reference.
-5. Recall compares the result only with reference voiceprints produced by this
-   versioned pipeline and belonging to people the user has named.
-6. At least three seconds of usable speech is required for a trusted
-   voiceprint. Shorter or failed samples produce a manual-review VOICE profile
-   rather than a matchable reference.
-7. Below 0.94 creates a new provisional voice. At or above 0.94 creates a
+   centered VAD-confirmed windows of up to four seconds.
+4. sherpa-onnx computes a 192-dimensional official WeSpeaker ECAPA-TDNN-512
+   embedding for each clean window with the correct feature frontend.
+5. Candidate windows must form a consistent acoustic majority. Recall retains
+   at most about 12 seconds from that majority for global matching. A tied or
+   inconsistent set, silence, short speech, keyboard-like impulses, and
+   overlap do not create a reusable voiceprint.
+6. The recording-local provider label and its intervention provenance are
+   still stored. If no safe global observation exists, it stays meeting-local:
+   no `VOICE<n>`, no preview, and no automatic-recognition target.
+7. Recall compares a valid centroid only with reference voiceprints produced
+   by the current pipeline and belonging to people the user has named. At least
+   three seconds of VAD-confirmed speech is required.
+8. Below 0.94 creates a new provisional voice. At or above 0.94 creates a
    likely-person suggestion unless automatic evidence is stronger.
-8. Automatic assignment requires either one score of at least 0.97 with a lead
+9. Automatic assignment requires either one score of at least 0.97 with a lead
    of at least 0.03 over every different identity, or two references for the
    same person scoring at least 0.94 while every different identity remains
    below 0.94.
-9. A named person can claim at most one diarized voice in a recording. When
+10. A named person can claim at most one diarized voice in a recording. When
    several voices claim that person, only a claim leading the next by at least
    0.06 can remain automatic.
-10. Duplicate normalized human names are excluded from automatic matching until
+11. Duplicate normalized human names are excluded from automatic matching until
    the user merges or renames them.
-11. Separate provider labels are treated as one voice only when every clean
-   label voiceprint agrees with every other at 0.97 or better.
-12. Automatic matches do not add their vectors back to the person's references.
+12. Separate provider labels are treated as one voice only when each label has
+   at least two clean windows, at least six seconds of selected speech, internal
+   consistency of at least 0.95, and every label centroid agrees at 0.995 or
+   better.
+13. Within one provider label, Recall retains per-intervention observations
+   even when there is no safe global majority. It suggests a split only when
+   both clusters contain at least two observed interventions and six seconds of
+   speech, each cluster's mean agreement is at least 0.94, and the two
+   centroids are at most 0.90 similar. The user reviews and selects the turns;
+   nothing is split automatically.
+14. Automatic matches do not add their vectors back to the person's references.
    Only naming or explicitly assigning a provisional profile expands the
    reference library.
 
 These rules favor precision. A duplicate `VOICE<n>` profile is safer than an
-incorrect automatic identity. A likely-person card shows its score, runner-up,
+incorrect automatic identity. A provider label with no safe speech is safer
+still as a meeting-local group rather than a fabricated global profile. A
+likely-person card shows its score, runner-up,
 reference support, and a one-click assignment. Accepting it activates the
 incoming voiceprint only if it agrees with an existing reference at 0.94 or
 better; incompatible observations stay quarantined. The user can preview and
@@ -414,19 +479,21 @@ compatible prior patterns or replace them. A no-voiceprint profile labels the
 current transcript but does not participate in later automatic recognition
 until a clean profile is assigned to it. Existing generic Unknown turns can be
 grouped into one provisional profile or assigned intervention by intervention.
+A **Possible mixed voice** card opens a local split review showing every
+intervention and the preselected smaller cluster.
 
 The current pipeline version is
-`wespeaker-ecapa512-lm-v3-clean-window`. Embeddings from the replaced v1 and v2
-pipelines are preserved but ignored. This intentionally quarantines references
-created under the old sampling and 0.90 matching policy; measured current-data
-cross-person similarity reached 0.904. Existing names and history remain, but a
-clean v3 provisional occurrence must be assigned once to establish a reviewed
-current reference. The database distinguishes reference vectors from
-unconfirmed observations. During the earlier additive migration, the oldest
-vector for each existing profile/model was retained as its reference; later
-accumulated vectors were preserved but quarantined from matching. A current
-database copy was created as `recall.pre-voice-reference-v1.db` before that
-migration and is never overwritten.
+`wespeaker-ecapa512-lm-v4-vad`. Embeddings from v1-v3 are ignored by the current
+matcher. Existing names and history remain usable, but a clean v4 provisional
+occurrence must be explicitly named or assigned to establish a reviewed current
+reference. Because old archives may contain contaminated vectors and previews,
+Settings offers an explicit reset. It previews the impact, blocks while any
+recording, final processing, recap, or identity operation is active, creates an
+integrity-checked backup, and transactionally removes all old/current
+voiceprints, samples, match evidence, voice observations, meeting groups, and
+provisional global profiles. Named people, conversations, transcript text, and
+historical labels are preserved. Existing meetings are not speculatively
+reclustered or relabelled.
 
 The current matcher stores its decision evidence in `voice_match_decisions`.
 Before that schema is added or upgraded in an existing archive, Recall creates
@@ -437,17 +504,24 @@ Before that schema is added or upgraded in an existing archive, Recall creates
 - The user confirmed visible microphone-to-native live captions after the
   Rustls and event-plus-snapshot fixes. The manual-scroll/follow control, Voice
   Library modal, named-person history filter, selectable **Current recording**
-  view, preferred-language settings, translated-caption stream, stacked
-  intervention layout, and conversation cleanup have automated coverage and
-  still need one native visual smoke test.
-- Live speaker labels are provisional and may shift; final async diarization is authoritative.
-- The v3 clean-window, identity-level consensus, likely-person review, and
-  unique-claim voice policy has model, unit, migration, and mocked UI coverage
-  but still needs a real repeated one-person test and a labelled multi-person
-  false-accept test. Provider diarization has no exposed sensitivity or
-  expected-speaker-count setting. Recall can repair only very high-confidence
-  split labels; it cannot recover a provider intervention that already mixes
-  or mislabels speakers.
+  view, preferred-language settings, language-stable inline translated-caption
+  stream, stacked intervention layout, and conversation cleanup have automated
+  coverage and still need one native visual smoke test.
+- Live speaker and language labels are provisional and may shift; final async
+  transcription is authoritative. Recall sends multilingual meeting context
+  and an optional per-meeting expected-speaker count, but Soniox exposes no
+  dedicated speaker-sensitivity control. A context change can improve future
+  realtime tokens after the next quiet-pause restart; it cannot relabel earlier
+  captions. A wrong-script source transcript or one provider label covering
+  several actual speakers cannot be repaired reliably from text metadata alone.
+- The v4 VAD-gated pipeline, identity-level consensus, 0.995 cross-label
+  coalescence, meeting-local fallback, reviewable within-label split, guarded
+  reset, and unique-claim policy have Rust, database, UI-contract, and real-
+  browser coverage. They still need a labelled native corpus with repeated
+  one-person recordings, similar voices, keyboard noise, and real overlap.
+  Recall can suggest a split between separate interventions; it cannot recover
+  two people mixed inside one provider intervention or repair historical
+  meetings without new v4 observations.
 - Native macOS system-audio capture is pending; virtual/aggregate input is the current route.
 - Local database encryption migration is pending.
 - The legacy bundle identifier com.example.recall is retained to avoid silently moving existing user data.

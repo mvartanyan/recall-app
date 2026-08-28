@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -16,11 +17,15 @@ pub struct AppState {
     pub openai_key_path: PathBuf,
     pub config: Arc<Mutex<AppConfig>>,
     pub embedder: Arc<Mutex<Option<crate::embedding::Embedder>>>,
+    pub vad: Arc<Mutex<Option<crate::vad::VadDetector>>>,
     pub progress: Arc<Mutex<HashMap<String, Vec<ProgressEvent>>>>,
     pub live_transcript: Arc<Mutex<crate::soniox::LiveTranscriptEvent>>,
+    live_transcript_revision: Arc<AtomicU64>,
     pub recap_in_flight: Arc<Mutex<HashSet<String>>>,
     pub identity_in_flight: Arc<Mutex<HashSet<String>>>,
+    pub maintenance_in_flight: Arc<Mutex<bool>>,
     pub model_path: PathBuf,
+    pub vad_model_path: PathBuf,
 }
 
 impl AppState {
@@ -29,6 +34,10 @@ impl AppState {
         let soniox_key_path = data_dir.join(crate::credentials::SONIOX_KEY_FILENAME);
         let openai_key_path = data_dir.join(crate::credentials::OPENAI_KEY_FILENAME);
         let config = AppConfig::load(&config_path);
+        let vad_model_path = model_path
+            .parent()
+            .map(|directory| directory.join("silero_vad.onnx"))
+            .unwrap_or_else(|| PathBuf::from("silero_vad.onnx"));
         Self {
             db: Arc::new(Mutex::new(None)),
             data_dir,
@@ -37,11 +46,15 @@ impl AppState {
             openai_key_path,
             config: Arc::new(Mutex::new(config)),
             embedder: Arc::new(Mutex::new(None)),
+            vad: Arc::new(Mutex::new(None)),
             progress: Arc::new(Mutex::new(HashMap::new())),
             live_transcript: Arc::new(Mutex::new(crate::soniox::LiveTranscriptEvent::idle())),
+            live_transcript_revision: Arc::new(AtomicU64::new(0)),
             recap_in_flight: Arc::new(Mutex::new(HashSet::new())),
             identity_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            maintenance_in_flight: Arc::new(Mutex::new(false)),
             model_path,
+            vad_model_path,
         }
     }
 
@@ -92,12 +105,19 @@ impl AppState {
     }
 
     pub fn reset_live_transcript(&self, enabled: bool) -> Result<(), String> {
+        let mut snapshot = crate::soniox::LiveTranscriptEvent::starting(enabled);
+        snapshot.revision = self.next_live_transcript_revision();
         *self
             .live_transcript
             .lock()
-            .map_err(|_| "Live transcription lock poisoned".to_string())? =
-            crate::soniox::LiveTranscriptEvent::starting(enabled);
+            .map_err(|_| "Live transcription lock poisoned".to_string())? = snapshot;
         Ok(())
+    }
+
+    pub fn next_live_transcript_revision(&self) -> u64 {
+        self.live_transcript_revision
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
     }
 
     pub fn open_db(&self, crypto: Crypto) -> Result<(), String> {
@@ -228,6 +248,20 @@ impl AppState {
             .lock()
             .map_err(|_| "embedder lock".to_string())?;
         *guard = Some(embedder);
+        Ok(())
+    }
+
+    pub fn load_vad(&self) -> Result<(), String> {
+        if !self.vad_model_path.is_file() {
+            return Err(format!(
+                "Silero VAD model is missing at {}",
+                self.vad_model_path.display()
+            ));
+        }
+        let detector =
+            crate::vad::VadDetector::new(self.vad_model_path.to_string_lossy().as_ref())?;
+        let mut guard = self.vad.lock().map_err(|_| "VAD lock".to_string())?;
+        *guard = Some(detector);
         Ok(())
     }
 

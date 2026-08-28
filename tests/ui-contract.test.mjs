@@ -124,6 +124,14 @@ test("the macOS package declares its runtime, microphone, model, and notice cont
   assert.match(macEntitlements, /com\.apple\.security\.device\.audio-input/);
   assert.match(macEntitlements, /<true\s*\/>/);
   assert.equal(
+    tauriSettings.bundle.resources["../models/spkrec-ecapa-voxceleb.onnx"],
+    "models/spkrec-ecapa-voxceleb.onnx",
+  );
+  assert.equal(
+    tauriSettings.bundle.resources["../models/silero_vad.onnx"],
+    "models/silero_vad.onnx",
+  );
+  assert.equal(
     tauriSettings.bundle.resources["../THIRD_PARTY_NOTICES.md"],
     "THIRD_PARTY_NOTICES.md",
   );
@@ -199,7 +207,6 @@ test("runtime copy uses provider-neutral STT and LLM terms", () => {
   assert.match(rustSoniox, /progress\("stt:upload:start"/);
   assert.doesNotMatch(rustSoniox, /progress\("soniox:/);
   assert.match(rustMain, /emit_recap_progress\(\s*app_handle,\s*session_id,\s*"llm:start"/);
-  assert.doesNotMatch(rustSoniox, /Soniox/);
   assert.doesNotMatch(rustOpenAI, /OpenAI/);
   assert.doesNotMatch(rustRecap, /OpenAI/);
 });
@@ -223,17 +230,38 @@ test("live captions have event delivery plus a native polling fallback", () => {
   assert.match(javascript, /listen\("live-transcription"/);
   assert.match(javascript, /invoke\("get_live_transcription"\)/);
   assert.match(rustMain, /fn get_live_transcription/);
+  assert.match(rustSoniox, /pub revision: u64/);
+  assert.match(rustSoniox, /pub final_audio_proc_ms: u64/);
+  assert.match(rustSoniox, /pub total_audio_proc_ms: u64/);
+  assert.match(javascript, /isNewerLiveCaptionRevision\(state\.lastLiveRevision, revision\)/);
+  assert.match(javascript, /state\.livePollInFlight/);
+  assert.match(javascript, /recordingRevision !== state\.recordingRevision/);
   assert.match(javascript, /Live captions are receiving speech/);
   assert.match(javascript, /Live captions finished without receiving speech/);
 });
 
-test("live captions carry separate original and preferred-language streams", () => {
-  assert.match(html, /id="liveTranslatedTranscript"/);
+test("live captions render speaker turns with inline language runs", () => {
+  assert.match(html, /id="liveTranscript" class="live-transcript" role="log"/);
   assert.match(html, /id="liveTranslationWarning"/);
+  assert.doesNotMatch(html, /id="liveTranslatedTranscript"|id="liveTranslationSection"/);
   assert.match(rustSoniox, /"type": "one_way"/);
   assert.match(rustSoniox, /"target_language": target_language/);
   assert.match(rustSoniox, /translation_status\.as_deref\(\) == Some\("translation"\)/);
-  assert.match(javascript, /payload\.translated_text/);
+  assert.match(rustSoniox, /pub turns: Vec<LiveCaptionTurn>/);
+  assert.match(rustSoniox, /pub segments: Vec<LiveCaptionSegment>/);
+  assert.match(javascript, /normalizeLiveCaptionTurns\(payload\?\.turns\)/);
+  assert.match(javascript, /buildLiveCaptionDisplayRuns/);
+  assert.match(javascript, /live-caption-translation/);
+  assert.match(javascript, /"\[" \+ run\.language \+ "\]"/);
+  assert.match(javascript, /liveCaptionLanguageSlots: new Map\(\)/);
+  assert.match(javascript, /liveCaptionStyleForLanguage\(run\.language\)/);
+  assert.match(javascript, /live-caption-language-styled/);
+  assert.match(javascript, /live-caption-language-run/);
+  assert.match(stylesheet, /--live-caption-language-bg/);
+  assert.match(stylesheet, /--live-caption-language-fg/);
+  assert.doesNotMatch(javascript, /pairSequence|liveCaptionBand|live-caption-band/);
+  assert.doesNotMatch(stylesheet, /live-caption-band/);
+  assert.doesNotMatch(stylesheet, /\.live-caption-source\s*\{[^}]*border-left/);
   assert.match(rustSoniox, /Original live captions will continue/);
   assert.match(javascript, /Live translation: /);
 });
@@ -243,6 +271,7 @@ test("live captions can pause auto-follow and jump back to the latest text", () 
   assert.match(javascript, /isNearScrollBottom\(event\?\.currentTarget \|\| elements\.liveTranscript\)/);
   assert.match(javascript, /if \(state\.liveFollow\) scrollLiveToLatest\(\)/);
   assert.match(javascript, /jumpToLiveButton\.addEventListener\("click"/);
+  assert.equal(matches(html, /id="liveTranscript"/g).length, 1);
 });
 
 test("recording and processing replace rather than overlay the old transcript", () => {
@@ -256,7 +285,7 @@ test("final transcription is recovery-safe and retryable", () => {
   assert.match(rustDb, /fn mark_interrupted_processing_jobs/);
   assert.match(rustDb, /status='failed'[\s\S]*?interrupted when Recall closed/);
   assert.match(rustMain, /fn persist_recording_audio/);
-  assert.match(rustMain, /create_processing_session\(/);
+  assert.match(rustMain, /create_processing_session_with_context\(/);
   assert.match(rustMain, /"audio:retained"/);
   assert.match(rustMain, /fn retry_processing/);
   assert.match(javascript, /invoke\("retry_processing"/);
@@ -308,8 +337,8 @@ test("unknown interventions remain reviewable without inventing a voiceprint", (
   assert.match(javascript, /invoke\("create_profile_for_unknown_segments"/);
   assert.match(rustMain, /fn create_profile_for_unknown_segments/);
   assert.match(rustDb, /create_speaker_for_unattributed_segments/);
-  assert.match(rustMain, /no safe automatic match was available/);
-  assert.match(rustMain, /no trusted voiceprint was created/);
+  assert.match(rustMain, /no global VOICE profile or preview was created/);
+  assert.match(rustMain, /meeting_local_no_safe_speech/);
 });
 
 test("conversation history can be filtered by a voice profile", () => {
@@ -480,17 +509,53 @@ test("voice observations use centroids and suggestion reference hygiene", () => 
   assert.match(javascript, /incompatible voiceprint/);
 });
 
-test("voice sampling uses clean central windows and quarantines the previous pipeline", () => {
+test("voice sampling uses local VAD and quarantines the previous pipeline", () => {
   assert.match(rustMain, /SAMPLE_EDGE_TRIM_MS/);
   assert.match(rustMain, /fn clean_sample_windows/);
   assert.match(rustMain, /overlaps_other_speaker/);
   assert.match(rustMain, /dominant_consistent_indices/);
   assert.match(rustMain, /SAME_VOICE_SPLIT_THRESHOLD/);
   assert.match(rustMain, /voiceprint:labels:coalesced/);
+  assert.match(rustMain, /MIN_COALESCE_WINDOWS_PER_LABEL/);
+  assert.match(rustMain, /SAME_VOICE_SPLIT_THRESHOLD:\s*f32\s*=\s*0\.995/);
+  assert.match(
+    fs.readFileSync(new URL("../src-tauri/src/vad.rs", import.meta.url), "utf8"),
+    /SileroVadModelConfig/,
+  );
   assert.match(
     fs.readFileSync(new URL("../src-tauri/src/embedding.rs", import.meta.url), "utf8"),
-    /wespeaker-ecapa512-lm-v3-clean-window/,
+    /wespeaker-ecapa512-lm-v4-vad/,
   );
+});
+
+test("provider speaker provenance stays reviewable and mixed voices split only after confirmation", () => {
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS session_voice_groups/);
+  assert.match(rustDb, /CREATE TABLE IF NOT EXISTS voice_observations/);
+  assert.match(rustDb, /provider_speaker_label/);
+  assert.match(rustMain, /voice_groups: Vec<SessionVoiceGroup>/);
+  assert.match(rustMain, /SPLIT_BETWEEN_CLUSTER_MAX/);
+  assert.match(rustMain, /voiceprint:split:suggested/);
+  assert.match(javascript, /function openVoiceSplitDialog\(group\)/);
+  assert.match(javascript, /invoke\("split_voice_group"/);
+  assert.match(javascript, /invoke\("dismiss_voice_group_split"/);
+  assert.match(html, /id="voiceSplitList"/);
+  assert.match(html, /Nothing is split automatically/);
+  assert.match(javascript, /No safe voiceprint/);
+  assert.match(javascript, /did not find enough clean speech to create a reusable VOICE profile/);
+});
+
+test("voice recognition reset is explicit, backed up, and preserves historical labels", () => {
+  assert.match(html, /id="previewVoiceResetButton"/);
+  assert.match(html, /id="voiceResetDialog"/);
+  assert.match(html, /Named people, conversations, transcript text, and historical speaker labels stay in place/);
+  assert.match(javascript, /invoke\("preview_voice_recognition_reset"/);
+  assert.match(javascript, /invoke\("reset_voice_recognition"/);
+  assert.match(rustMain, /maintenance_in_flight/);
+  assert.match(rustDb, /verified_runtime_backup\("pre-voice-reset-v4"\)/);
+  assert.match(rustDb, /UPDATE segments SET speaker_id=NULL WHERE speaker_id=\?1/);
+  assert.match(rustDb, /DELETE FROM voice_observations/);
+  assert.match(rustDb, /PRAGMA integrity_check/);
+  assert.match(rustDb, /prune_reset_backups/);
 });
 
 test("compact modal fields remain inside their horizontal inset", () => {
@@ -602,6 +667,18 @@ test("recording uses the sidebar stop control and live captions fill the remaini
   assert.match(stylesheet, /body\.recording-active \.live-transcript[\s\S]*?max-height:\s*none/);
 });
 
+test("recording state is reconciled in both directions with the native recorder", () => {
+  assert.match(javascript, /const RECORDING_STATUS_POLL_MS = 2_000/);
+  assert.match(javascript, /function applyNativeRecordingStatus\(status, announce = false\)/);
+  assert.match(javascript, /if \(nativeRecording === state\.recording\) return false/);
+  assert.match(javascript, /startRecordingStatusPolling\(\)/);
+  assert.match(javascript, /stopRecordingStatusPolling\(\)/);
+  assert.match(javascript, /if \(recording !== wasRecording\) state\.recordingRevision \+= 1/);
+  assert.match(javascript, /if \(revision !== state\.recordingRevision\)/);
+  assert.match(javascript, /message\.includes\("There is no active recording"\)/);
+  assert.match(javascript, /applyNativeRecordingStatus\(status\)/);
+});
+
 test("summaries and actions keep evidence internal instead of displaying links", () => {
   assert.doesNotMatch(javascript, /section\.evidence_segment_ids/);
   const actionRenderer = javascript.slice(
@@ -638,15 +715,27 @@ test("configured services stay quiet while missing keys remain visible", () => {
   assert.match(javascript, /Key needed/);
 });
 
-test("recap preferences separate Soniox hints from translation exclusions", () => {
+test("STT defaults and translation preferences are separate from per-meeting speaker context", () => {
   assert.match(rustConfig, /openai_model/);
   assert.match(rustConfig, /preferred_language/);
   assert.match(rustConfig, /no_translation_languages/);
+  assert.doesNotMatch(rustConfig, /pub expected_speakers\s*:/);
   assert.match(html, /id="preferredLanguage"/);
   assert.match(html, /id="languageHints"/);
   assert.match(html, /id="noTranslationLanguages"/);
+  assert.match(html, /id="liveExpectedSpeakers"/);
+  assert.match(html, /id="liveLanguageHints"/);
+  assert.match(html, /id="applyLiveContextButton"/);
   assert.match(javascript, /parseNoTranslationLanguages/);
+  assert.match(javascript, /invoke\("update_live_context"/);
   assert.match(javascript, /invoke\("list_translation_languages"\)/);
+  assert.match(rustMain, /struct MeetingSttContext/);
+  assert.match(rustDb, /language_hints_json/);
+  assert.match(rustDb, /expected_speakers/);
+  assert.match(rustSoniox, /RECONFIGURE_SILENCE_MS/);
+  assert.match(rustSoniox, /LiveAudioMessage::Reconfigure/);
+  assert.match(rustSoniox, /"context": meeting_context/);
+  assert.match(rustSoniox, /language_hints_strict/);
   assert.match(rustRecap, /target_language/);
   assert.match(rustRecap, /translated_text/);
   assert.match(rustOpenAI, /preferred_language/);

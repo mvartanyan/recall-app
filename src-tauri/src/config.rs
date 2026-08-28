@@ -35,6 +35,10 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn load(path: &PathBuf) -> Self {
         if let Ok(content) = fs::read_to_string(path) {
+            let had_legacy_expected_speakers = serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|value| value.get("expected_speakers").cloned())
+                .is_some();
             if let Ok(mut cfg) = serde_json::from_str::<AppConfig>(&content) {
                 let previous_preferred = cfg.preferred_language.clone();
                 let previous_exclusions = cfg.no_translation_languages.clone();
@@ -50,6 +54,7 @@ impl AppConfig {
                 cfg.no_translation_languages.dedup();
                 if cfg.preferred_language != previous_preferred
                     || cfg.no_translation_languages != previous_exclusions
+                    || had_legacy_expected_speakers
                 {
                     let _ = cfg.save(path);
                 }
@@ -86,6 +91,7 @@ mod tests {
             &path,
             r#"{
                 "language_hints": ["de"],
+                "expected_speakers": 4,
                 "no_translation_languages": ["EN-us", "de-DE", "de"]
             }"#,
         )
@@ -95,6 +101,7 @@ mod tests {
         assert_eq!(config.no_translation_languages, vec!["de"]);
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("\"preferred_language\": \"en\""));
+        assert!(!saved.contains("expected_speakers"));
         fs::remove_file(path).unwrap();
     }
 }

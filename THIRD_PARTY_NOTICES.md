@@ -21,6 +21,17 @@ weights are unchanged. Recall adds sherpa-onnx compatibility metadata and uses
 the model locally to generate speaker embeddings. Provenance and checksums are
 recorded in `models/README.md` in the Recall source repository.
 
+## Silero voice activity detector
+
+Recall includes the sherpa-onnx export of Silero VAD as `silero_vad.onnx` and
+uses it locally to reject silence, keyboard noise, and other non-speech audio
+before generating speaker embeddings. Silero VAD is published under the MIT
+License:
+
+https://github.com/snakers4/silero-vad/blob/master/LICENSE
+
+The exact artifact URL and SHA-256 are recorded in `models/README.md`.
+
 ## Application dependencies
 
 Recall links open-source npm and Rust crates under their respective declared

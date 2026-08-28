@@ -1,6 +1,6 @@
 [package]
 name = "recall"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -11,7 +11,7 @@ serde_json = "1"
 cpal = { version = "0.15", features = ["jack"] }
 hound = "3.5"
 reqwest = { version = "0.11", features = ["json", "multipart", "blocking"] }
-tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "time", "rt-multi-thread", "macros"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"

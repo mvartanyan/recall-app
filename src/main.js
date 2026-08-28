@@ -10,9 +10,16 @@ import {
   indexTranslations,
   invalidateConversationCache,
   isNearScrollBottom,
+  isNewerLiveCaptionRevision,
   isProvisionalLabel,
   isSessionProcessing,
   nextRenderedSegmentCount,
+  buildLiveCaptionDisplayRuns,
+  liveCaptionLanguageStyle,
+  normalizeLiveCaptionPassages,
+  normalizeLiveCaptionRevision,
+  normalizeLiveCaptionTurns,
+  liveCaptionTurnsFromPassages,
   normalizePreferredLanguage,
   parseLanguageHints,
   parseNoTranslationLanguages,
@@ -29,6 +36,7 @@ const { listen } = window.__TAURI__.event;
 const JAMIE_IMPORT_UI_ENABLED = window.__RECALL_ENABLE_JAMIE_IMPORT__ === true;
 const CONVERSATION_CACHE_LIMIT = 5;
 const SEGMENT_RENDER_BATCH = 100;
+const RECORDING_STATUS_POLL_MS = 2_000;
 
 const elements = {
   recordButton: document.getElementById("recordButton"),
@@ -40,11 +48,12 @@ const elements = {
   livePanel: document.getElementById("livePanel"),
   liveStatus: document.getElementById("liveStatus"),
   liveTranscript: document.getElementById("liveTranscript"),
-  liveTranslationSection: document.getElementById("liveTranslationSection"),
-  liveTranslationLabel: document.getElementById("liveTranslationLabel"),
-  liveTranslatedTranscript: document.getElementById("liveTranslatedTranscript"),
   liveTranslationWarning: document.getElementById("liveTranslationWarning"),
   jumpToLiveButton: document.getElementById("jumpToLiveButton"),
+  liveExpectedSpeakers: document.getElementById("liveExpectedSpeakers"),
+  liveLanguageHints: document.getElementById("liveLanguageHints"),
+  applyLiveContextButton: document.getElementById("applyLiveContextButton"),
+  liveContextStatus: document.getElementById("liveContextStatus"),
   sessionsList: document.getElementById("sessionsList"),
   conversationSearch: document.getElementById("conversationSearch"),
   conversationSpeakerFilter: document.getElementById("conversationSpeakerFilter"),
@@ -213,6 +222,19 @@ const elements = {
   speakerPickerSearch: document.getElementById("speakerPickerSearch"),
   speakerPickerResults: document.getElementById("speakerPickerResults"),
   speakerPickerUnknown: document.getElementById("speakerPickerUnknown"),
+  voiceSplitDialog: document.getElementById("voiceSplitDialog"),
+  voiceSplitTitle: document.getElementById("voiceSplitTitle"),
+  voiceSplitSummary: document.getElementById("voiceSplitSummary"),
+  voiceSplitList: document.getElementById("voiceSplitList"),
+  voiceSplitFeedback: document.getElementById("voiceSplitFeedback"),
+  dismissVoiceSplitButton: document.getElementById("dismissVoiceSplitButton"),
+  confirmVoiceSplitButton: document.getElementById("confirmVoiceSplitButton"),
+  previewVoiceResetButton: document.getElementById("previewVoiceResetButton"),
+  voiceResetDialog: document.getElementById("voiceResetDialog"),
+  voiceResetStats: document.getElementById("voiceResetStats"),
+  voiceResetBlockers: document.getElementById("voiceResetBlockers"),
+  voiceResetFeedback: document.getElementById("voiceResetFeedback"),
+  confirmVoiceResetButton: document.getElementById("confirmVoiceResetButton"),
   unlockDialog: document.getElementById("unlockDialog"),
   unlockForm: document.getElementById("unlockForm"),
   databasePassword: document.getElementById("databasePassword"),
@@ -227,10 +249,15 @@ const state = {
   speakers: [],
   selectedSessionId: null,
   selectedSegments: [],
+  selectedVoiceGroups: [],
   recording: false,
   recordingStartedAt: null,
   recordingTimer: null,
   recordingSource: null,
+  recordingStatusTimer: null,
+  recordingStatusCheck: null,
+  recordingStatusPollErrorLogged: false,
+  recordingRevision: 0,
   liveWorkspaceSelected: false,
   navigationRevision: 0,
   openQueuedDraft: false,
@@ -242,16 +269,27 @@ const state = {
   progressEventIds: new Set(),
   pollTimer: null,
   livePollTimer: null,
+  livePollInFlight: false,
   livePollErrorLogged: false,
   activityOpen: false,
   unseenActivity: 0,
   previewAudio: null,
+  voiceSplitGroupId: null,
+  voiceResetRunning: false,
+  voiceResetReadiness: null,
   sessionLoadSequence: 0,
   lastLiveStatus: null,
   lastLiveSignature: null,
+  lastLiveRevision: 0,
   lastLiveTranslationWarning: null,
   liveHasText: false,
+  liveTurnRows: new Map(),
+  liveMarkerRows: new Map(),
+  liveCaptionLanguageSlots: new Map(),
   liveEnabledForRecording: false,
+  liveSttContext: { language_hints: [], expected_speakers: null },
+  liveContextPending: false,
+  liveContextRevision: 0,
   liveFollow: true,
   voiceFilteredSessionIds: null,
   voiceFilterSequence: 0,
@@ -652,7 +690,6 @@ function translationLanguageName(code) {
 function scrollLiveToLatest() {
   window.requestAnimationFrame(() => {
     elements.liveTranscript.scrollTop = elements.liveTranscript.scrollHeight;
-    elements.liveTranslatedTranscript.scrollTop = elements.liveTranslatedTranscript.scrollHeight;
   });
 }
 
@@ -667,9 +704,345 @@ function handleLiveScroll(event) {
   if (following !== state.liveFollow) setLiveFollow(following, false);
 }
 
+function renderLiveCaptionPlaceholder(text) {
+  if (state.liveTurnRows.size) return;
+  const existing = elements.liveTranscript.querySelector(".live-caption-placeholder");
+  if (existing) {
+    existing.textContent = text;
+    return;
+  }
+  const placeholder = document.createElement("p");
+  placeholder.className = "live-caption-placeholder";
+  placeholder.textContent = text;
+  if (state.liveMarkerRows.size) {
+    elements.liveTranscript.append(placeholder);
+  } else {
+    elements.liveTranscript.replaceChildren(placeholder);
+  }
+}
+
+function resetLiveCaptionPassages(placeholder) {
+  state.liveTurnRows.clear();
+  state.liveMarkerRows.clear();
+  state.liveCaptionLanguageSlots.clear();
+  elements.liveTranscript.replaceChildren();
+  renderLiveCaptionPlaceholder(placeholder);
+}
+
+function fallbackLiveCaptionTurns(payload) {
+  const text = String(payload?.text || "").trim();
+  if (!text) return [];
+  return [
+    {
+      id: "live-caption-fallback-turn",
+      sequence: 0,
+      speaker: "",
+      segments: [{
+        id: "live-caption-fallback-segment",
+        source_text: text,
+        source_language: null,
+        source_final: Boolean(payload?.final_text),
+        translation: null,
+      }],
+    },
+  ];
+}
+
+function createLiveCaptionRow(turn) {
+  const root = document.createElement("article");
+  root.className = "live-caption-passage";
+  root.dataset.liveCaptionId = turn.id;
+  return {
+    root,
+    speaker: "",
+    segments: new Map(),
+    sequence: turn.sequence,
+    order: turn.order,
+  };
+}
+
+function reconcileLiveCaptionMarkers(markers) {
+  const incomingIds = new Set();
+  for (const [index, marker] of (Array.isArray(markers) ? markers : []).entries()) {
+    const id = String(marker?.id || "live-marker-" + index);
+    incomingIds.add(id);
+    const afterSequence =
+      marker?.after_sequence !== null &&
+      marker?.after_sequence !== undefined &&
+      Number.isFinite(Number(marker.after_sequence))
+      ? Number(marker.after_sequence)
+      : null;
+    let row = state.liveMarkerRows.get(id);
+    if (!row) {
+      const root = document.createElement("div");
+      root.className = "live-caption-system-event";
+      root.dataset.liveCaptionMarkerId = id;
+      row = { root, afterSequence, order: index };
+      state.liveMarkerRows.set(id, row);
+    }
+    row.afterSequence = afterSequence;
+    row.order = index;
+    row.root.textContent = String(marker?.text || "Live captions restarted");
+  }
+  for (const [id, row] of state.liveMarkerRows) {
+    if (incomingIds.has(id)) continue;
+    row.root.remove();
+    state.liveMarkerRows.delete(id);
+  }
+}
+
+function liveCaptionStyleForLanguage(language) {
+  if (!language) return null;
+  if (!state.liveCaptionLanguageSlots.has(language)) {
+    state.liveCaptionLanguageSlots.set(language, state.liveCaptionLanguageSlots.size);
+  }
+  return liveCaptionLanguageStyle(state.liveCaptionLanguageSlots.get(language));
+}
+
+function applyLiveCaptionLanguageStyle(element, style) {
+  element.classList.toggle("live-caption-language-styled", Boolean(style));
+  for (const [property, value] of Object.entries({
+    "--live-caption-language-bg": style?.background || "",
+    "--live-caption-language-fg": style?.foreground || "",
+    "--live-caption-language-border": style?.border || "",
+  })) {
+    if (value) {
+      element.style.setProperty(property, value);
+    } else {
+      element.style.removeProperty(property);
+    }
+  }
+}
+
+function renderLiveCaptionRun(run, target = false) {
+  const span = document.createElement("span");
+  span.className = "live-caption-language-run";
+  span.dataset.liveCaptionLanguage = run.language || "unknown";
+  span.dataset.liveCaptionRun = target ? "preferred" : "source";
+  applyLiveCaptionLanguageStyle(span, liveCaptionStyleForLanguage(run.language));
+  if (target && run.language) {
+    const marker = document.createElement("span");
+    marker.className = "live-caption-language";
+    marker.textContent = "[" + run.language + "]";
+    span.append(marker, document.createTextNode(" "));
+  }
+  span.append(document.createTextNode(run.text));
+  return span;
+}
+
+function appendLiveCaptionRuns(element, runs, target = false) {
+  runs.forEach((run, index) => {
+    if (index) element.append(document.createTextNode(" "));
+    element.append(renderLiveCaptionRun(run, target));
+  });
+}
+
+function renderLiveCaptionRow(row) {
+  const { sourceRuns, preferredRuns, hasTranslation } = buildLiveCaptionDisplayRuns({
+    segments: Array.from(row.segments.values()).sort((left, right) => left.order - right.order),
+  });
+  const source = document.createElement("p");
+  source.className = "live-caption-source";
+  source.dataset.liveCaptionSource = "true";
+  if (row.speaker) {
+    const speaker = document.createElement("span");
+    speaker.className = "live-caption-speaker";
+    speaker.textContent = row.speaker + ":";
+    source.append(speaker, document.createTextNode(" "));
+  }
+  appendLiveCaptionRuns(source, sourceRuns);
+
+  const children = [source];
+  if (hasTranslation) {
+    const translation = document.createElement("p");
+    translation.className = "live-caption-translation";
+    translation.dataset.liveCaptionTranslation = "true";
+    appendLiveCaptionRuns(translation, preferredRuns, true);
+    children.push(translation);
+  }
+  row.root.replaceChildren(...children);
+}
+
+function reconcileLiveCaptionPassages(payload) {
+  const normalized = normalizeLiveCaptionTurns(payload?.turns);
+  const legacy = normalized.length ? [] : liveCaptionTurnsFromPassages(payload?.passages);
+  const turns = normalized.length ? normalized : legacy.length ? legacy : normalizeLiveCaptionTurns(fallbackLiveCaptionTurns(payload));
+  const incomingIds = new Set();
+
+  for (const turn of turns) {
+    incomingIds.add(turn.id);
+    const existing = state.liveTurnRows.get(turn.id);
+    const row = existing || createLiveCaptionRow(turn);
+    row.speaker = turn.speaker;
+    row.sequence = turn.sequence;
+    row.order = turn.order;
+    const incomingSegmentIds = new Set();
+    for (const segment of turn.segments) {
+      incomingSegmentIds.add(segment.id);
+      const nextTranslation = segment.translation ? { ...segment.translation } : null;
+      const next = {
+        ...segment,
+        translation: nextTranslation,
+        translationFinal: Boolean(nextTranslation?.final),
+      };
+      row.segments.set(segment.id, next);
+    }
+    for (const segmentId of row.segments.keys()) {
+      if (!incomingSegmentIds.has(segmentId)) row.segments.delete(segmentId);
+    }
+    renderLiveCaptionRow(row);
+    state.liveTurnRows.set(turn.id, row);
+  }
+
+  for (const [id, row] of state.liveTurnRows) {
+    if (incomingIds.has(id)) continue;
+    row.root.remove();
+    state.liveTurnRows.delete(id);
+  }
+
+  reconcileLiveCaptionMarkers(payload?.markers);
+
+  if (!state.liveTurnRows.size && !state.liveMarkerRows.size) {
+    renderLiveCaptionPlaceholder("Listening for speech…");
+    return false;
+  }
+
+  elements.liveTranscript.querySelector(".live-caption-placeholder")?.remove();
+  const orderedRows = [
+    ...Array.from(state.liveTurnRows.values()).map((row) => ({
+      root: row.root,
+      position: row.sequence,
+      kind: 0,
+      order: row.order,
+    })),
+    ...Array.from(state.liveMarkerRows.values()).map((row) => ({
+      root: row.root,
+      position: row.afterSequence === null ? -0.5 : row.afterSequence + 0.5,
+      kind: 1,
+      order: row.order,
+    })),
+  ].sort(
+    (left, right) =>
+      left.position - right.position || left.kind - right.kind || left.order - right.order,
+  );
+  for (const row of orderedRows) elements.liveTranscript.append(row.root);
+  if (!state.liveTurnRows.size) renderLiveCaptionPlaceholder("Listening for speech…");
+  return state.liveTurnRows.size > 0;
+}
+
+function normalizeMeetingSttContext(context) {
+  const expected = Number(context?.expected_speakers);
+  return {
+    language_hints: parseLanguageHints(
+      Array.isArray(context?.language_hints)
+        ? context.language_hints.join(", ")
+        : String(context?.language_hints || ""),
+    ),
+    expected_speakers:
+      context?.expected_speakers !== null &&
+      context?.expected_speakers !== undefined &&
+      Number.isInteger(expected) &&
+      expected >= 1 &&
+      expected <= 15
+        ? expected
+        : null,
+  };
+}
+
+function setLiveSttContext(context, status = "Using the recording defaults.") {
+  state.liveSttContext = normalizeMeetingSttContext(context);
+  elements.liveLanguageHints.value = state.liveSttContext.language_hints.join(", ");
+  elements.liveExpectedSpeakers.value = state.liveSttContext.expected_speakers
+    ? String(state.liveSttContext.expected_speakers)
+    : "";
+  elements.liveContextStatus.textContent = status;
+}
+
+function populateLiveExpectedSpeakers() {
+  elements.liveExpectedSpeakers.replaceChildren();
+  const unknown = document.createElement("option");
+  unknown.value = "";
+  unknown.textContent = "Unknown";
+  elements.liveExpectedSpeakers.append(unknown);
+  for (let count = 1; count <= 15; count += 1) {
+    const option = document.createElement("option");
+    option.value = String(count);
+    option.textContent = String(count);
+    elements.liveExpectedSpeakers.append(option);
+  }
+}
+
+function setLiveContextControlsEnabled(enabled) {
+  elements.liveExpectedSpeakers.disabled = !enabled;
+  elements.liveLanguageHints.disabled = !enabled;
+  elements.applyLiveContextButton.disabled = !enabled;
+}
+
+async function applyLiveContext() {
+  if (!state.recording) return;
+  const expectedText = elements.liveExpectedSpeakers.value;
+  const sttContext = normalizeMeetingSttContext({
+    language_hints: parseLanguageHints(elements.liveLanguageHints.value),
+    expected_speakers: expectedText ? Number(expectedText) : null,
+  });
+  elements.applyLiveContextButton.disabled = true;
+  elements.liveContextStatus.textContent = "Saving this meeting's STT context...";
+  try {
+    const result = await invoke("update_live_context", { sttContext });
+    state.liveSttContext = normalizeMeetingSttContext(result?.stt_context || sttContext);
+    elements.liveLanguageHints.value = state.liveSttContext.language_hints.join(", ");
+    elements.liveExpectedSpeakers.value = state.liveSttContext.expected_speakers
+      ? String(state.liveSttContext.expected_speakers)
+      : "";
+    state.liveContextPending = Boolean(result?.live_restart_pending);
+    state.liveContextRevision = Math.max(
+      state.liveContextRevision,
+      Number(result?.revision) || 0,
+    );
+    const status = !result?.changed
+      ? "No context changes to apply."
+      : state.liveContextPending
+        ? `Pending - waiting for a quiet pause; forced after 5 seconds. Likely languages: ${state.liveSttContext.language_hints.join(", ") || "none"}; expected speakers: ${state.liveSttContext.expected_speakers || "open"}.`
+        : "Saved for this meeting's final transcript; the live STT stream is unavailable.";
+    elements.liveContextStatus.textContent = status;
+    addActivity("Meeting STT context: " + status, result?.changed ? "success" : "");
+  } catch (error) {
+    const message = errorText(error);
+    elements.liveContextStatus.textContent = message;
+    addActivity("Could not update meeting STT context: " + message, "error");
+    showToast(message, "error");
+  } finally {
+    elements.applyLiveContextButton.disabled = !state.recording;
+  }
+}
+
+function handleLiveContextProgress(payload) {
+  const stage = String(payload?.stage || "update");
+  const detail = String(payload?.detail || "Meeting STT context updated");
+  const revision = Number(payload?.revision) || 0;
+  if (revision && revision < state.liveContextRevision) return;
+  state.liveContextRevision = Math.max(state.liveContextRevision, revision);
+  if (Array.isArray(payload?.language_hints)) {
+    state.liveSttContext = normalizeMeetingSttContext({
+      language_hints: payload.language_hints,
+      expected_speakers: payload.expected_speakers,
+    });
+    elements.liveLanguageHints.value = state.liveSttContext.language_hints.join(", ");
+    elements.liveExpectedSpeakers.value = state.liveSttContext.expected_speakers
+      ? String(state.liveSttContext.expected_speakers)
+      : "";
+  }
+  elements.liveContextStatus.textContent = detail;
+  state.liveContextPending = ["pending", "sending"].includes(stage);
+  addActivity("Live STT context " + stage + ": " + detail, stage === "failed" ? "error" : "");
+  if (stage === "sent") showToast("The updated meeting context was sent to STT.");
+}
+
 function setRecordingUi(recording, started) {
   const wasRecording = state.recording;
+  if (recording !== wasRecording) state.recordingRevision += 1;
   state.recording = recording;
+  if (state.status) state.status.recording = recording;
   elements.recordingBanner.hidden = !recording;
   elements.recordButton.classList.toggle("recording", recording);
   elements.recordButtonLabel.textContent = recording ? "Stop recording" : "New recording";
@@ -686,12 +1059,21 @@ function setRecordingUi(recording, started) {
       state.liveHasText = false;
       state.livePollErrorLogged = false;
       setLiveFollow(true);
-      elements.liveTranslationSection.hidden = true;
-      elements.liveTranslatedTranscript.textContent = "";
+      resetLiveCaptionPassages("Listening for speech…");
       elements.liveTranslationWarning.hidden = true;
       elements.liveTranslationWarning.textContent = "";
+      state.liveContextPending = false;
+      state.liveContextRevision = 0;
+      setLiveSttContext(
+        started?.stt_context || {
+          language_hints: state.preferences?.language_hints || [],
+          expected_speakers: null,
+        },
+      );
       stopVoicePreview();
     }
+    setLiveContextControlsEnabled(true);
+    startRecordingStatusPolling();
     if (!state.recordingStartedAt) state.recordingStartedAt = Date.now();
     if (!state.recordingTimer) {
       state.recordingTimer = window.setInterval(updateRecordingTimer, 250);
@@ -699,9 +1081,13 @@ function setRecordingUi(recording, started) {
     const liveEnabled = Boolean(started && started.live_started);
     state.liveEnabledForRecording = liveEnabled;
     elements.liveStatus.textContent = liveEnabled ? "Connecting…" : "Live captions disabled";
-    elements.liveTranscript.textContent = liveEnabled
-      ? "Listening for speech…"
-      : "Live captions are disabled for this recording. Audio is still being captured for the final transcript.";
+    if (!wasRecording) {
+      resetLiveCaptionPassages(
+        liveEnabled
+          ? "Listening for speech…"
+          : "Live captions are disabled for this recording. Audio is still being captured for the final transcript.",
+      );
+    }
     if (started && started.device_name) {
       state.recordingSource =
         "Recording from " + started.device_name + " at " + started.sample_rate + " Hz";
@@ -714,13 +1100,18 @@ function setRecordingUi(recording, started) {
       state.liveWorkspaceSelected = false;
       state.selectedSessionId = null;
       state.selectedSegments = [];
+      state.selectedVoiceGroups = [];
       state.recapState = null;
     }
     if (state.recordingTimer) window.clearInterval(state.recordingTimer);
     state.recordingTimer = null;
     state.recordingStartedAt = null;
     state.recordingSource = null;
+    state.liveContextPending = false;
     state.liveEnabledForRecording = false;
+    state.liveContextPending = false;
+    setLiveContextControlsEnabled(false);
+    stopRecordingStatusPolling();
     stopLivePolling();
     elements.recordingTimer.textContent = "00:00";
     elements.levelBar.style.width = "2%";
@@ -745,19 +1136,20 @@ function updateRecordingTimer() {
 
 function handleLiveTranscript(payload) {
   if (!payload) return;
+  const revision = normalizeLiveCaptionRevision(payload.revision);
+  if (!isNewerLiveCaptionRevision(state.lastLiveRevision, revision)) return;
+  if (revision) state.lastLiveRevision = revision;
   const status = String(payload.status || "Live");
   const text = String(payload.text || "").trim();
-  const translatedText = String(payload.translated_text || "").trim();
-  const targetLanguage = String(
-    payload.target_language || state.preferences?.preferred_language || "en",
-  );
   const translationWarning = String(payload.translation_warning || "").trim();
   const error = payload.error ? String(payload.error) : "";
   const signature = JSON.stringify([
     status,
     text,
-    translatedText,
-    targetLanguage,
+    String(payload.final_text || "").trim(),
+    payload.turns || [],
+    payload.passages || [],
+    payload.markers || [],
     translationWarning,
     Boolean(payload.finished),
     error,
@@ -770,9 +1162,9 @@ function handleLiveTranscript(payload) {
     addActivity("Live captions: " + status, error ? "error" : "");
     state.lastLiveStatus = status;
   }
-  if (text) {
+  const hasPassages = reconcileLiveCaptionPassages(payload);
+  if (hasPassages) {
     const previousScrollTop = elements.liveTranscript.scrollTop;
-    elements.liveTranscript.textContent = text;
     if (state.liveFollow) {
       scrollLiveToLatest();
     } else {
@@ -783,20 +1175,8 @@ function handleLiveTranscript(payload) {
       addActivity("Live captions are receiving speech", "success");
     }
   } else if (status === "Live captions connected" || status === "Live") {
-    elements.liveTranscript.textContent = "Listening for speech…";
+    renderLiveCaptionPlaceholder("Listening for speech…");
     if (state.liveFollow) scrollLiveToLatest();
-  }
-  if (translatedText) {
-    const previousTranslationScrollTop = elements.liveTranslatedTranscript.scrollTop;
-    elements.liveTranslationLabel.textContent =
-      "Translation · " + translationLanguageName(targetLanguage);
-    elements.liveTranslatedTranscript.textContent = translatedText;
-    elements.liveTranslationSection.hidden = false;
-    if (state.liveFollow) {
-      scrollLiveToLatest();
-    } else {
-      elements.liveTranslatedTranscript.scrollTop = previousTranslationScrollTop;
-    }
   }
   elements.liveTranslationWarning.hidden = !translationWarning;
   elements.liveTranslationWarning.textContent = translationWarning;
@@ -818,9 +1198,12 @@ function handleLiveTranscript(payload) {
 }
 
 async function pollLiveTranscript() {
-  if (!state.recording || !state.liveEnabledForRecording) return;
+  if (!state.recording || !state.liveEnabledForRecording || state.livePollInFlight) return;
+  const recordingRevision = state.recordingRevision;
+  state.livePollInFlight = true;
   try {
     const payload = await invoke("get_live_transcription");
+    if (recordingRevision !== state.recordingRevision || !state.recording) return;
     state.livePollErrorLogged = false;
     handleLiveTranscript(payload);
   } catch (error) {
@@ -828,6 +1211,8 @@ async function pollLiveTranscript() {
       state.livePollErrorLogged = true;
       addActivity("Live-caption status check failed: " + errorText(error), "error");
     }
+  } finally {
+    state.livePollInFlight = false;
   }
 }
 
@@ -841,6 +1226,82 @@ function stopLivePolling() {
   if (!state.livePollTimer) return;
   window.clearInterval(state.livePollTimer);
   state.livePollTimer = null;
+}
+
+function recordingStartedFromStatus(status) {
+  const preferences = state.preferences || {};
+  return {
+    device_name:
+      status?.selected_input_device || preferences.selected_input_device || "selected input",
+    sample_rate: 0,
+    live_started: Boolean(
+      status?.live_recording_active ?? preferences.live_transcription ?? status?.live_transcription,
+    ),
+    stt_context: status?.current_stt_context || {
+      language_hints: preferences.language_hints || [],
+      expected_speakers: null,
+    },
+  };
+}
+
+function applyNativeRecordingStatus(status, announce = false) {
+  const nativeRecording = Boolean(status?.recording);
+  state.status = Object.assign({}, state.status || {}, status || {});
+  if (nativeRecording === state.recording) return false;
+
+  if (nativeRecording) {
+    setRecordingUi(true, recordingStartedFromStatus(status));
+    if (announce) addActivity("Recording state restored from the native recorder", "success");
+  } else {
+    state.queueingProcessing = false;
+    setRecordingUi(false);
+    if (announce) {
+      addActivity("Recording had already stopped; the interface was refreshed", "success");
+    }
+  }
+  return true;
+}
+
+async function reconcileRecordingStatus({ announce = false, refreshArchive = false } = {}) {
+  if (state.recordingStatusCheck) return state.recordingStatusCheck;
+  const check = (async () => {
+    const revision = state.recordingRevision;
+    try {
+      const status = await invoke("app_status");
+      state.recordingStatusPollErrorLogged = false;
+      if (revision !== state.recordingRevision) {
+        return { changed: false, recording: state.recording, stale: true };
+      }
+      const changed = applyNativeRecordingStatus(status, announce);
+      if (changed && !status.recording && refreshArchive) await loadSessions();
+      return { changed, recording: Boolean(status.recording) };
+    } catch (error) {
+      if (!state.recordingStatusPollErrorLogged) {
+        state.recordingStatusPollErrorLogged = true;
+        addActivity("Recorder status check failed: " + errorText(error), "error");
+      }
+      return null;
+    }
+  })();
+  state.recordingStatusCheck = check;
+  try {
+    return await check;
+  } finally {
+    if (state.recordingStatusCheck === check) state.recordingStatusCheck = null;
+  }
+}
+
+function startRecordingStatusPolling() {
+  if (state.recordingStatusTimer) return;
+  state.recordingStatusTimer = window.setInterval(() => {
+    void reconcileRecordingStatus({ announce: true, refreshArchive: true });
+  }, RECORDING_STATUS_POLL_MS);
+}
+
+function stopRecordingStatusPolling() {
+  if (state.recordingStatusTimer) window.clearInterval(state.recordingStatusTimer);
+  state.recordingStatusTimer = null;
+  state.recordingStatusPollErrorLogged = false;
 }
 
 async function startRecording() {
@@ -889,11 +1350,15 @@ async function stopRecording() {
   setProcessingDetail("Finalizing the recording…");
   addActivity("Stopping recording");
   try {
-    const path = await invoke("stop_recording");
+    const stopped = await invoke("stop_recording");
+    const path = typeof stopped === "string" ? stopped : stopped.path;
+    const sttContext = normalizeMeetingSttContext(
+      typeof stopped === "string" ? state.liveSttContext : stopped.stt_context,
+    );
     setRecordingUi(false);
     elements.recordButton.disabled = false;
     addActivity("Recording stopped; queueing final transcription");
-    const queued = await invoke("transcribe_file_async", { path });
+    const queued = await invoke("transcribe_file_async", { path, sttContext });
     const runId = queued.run_id;
     const sessionId = queued.session_id;
     state.queueingProcessing = false;
@@ -924,6 +1389,16 @@ async function stopRecording() {
   } catch (error) {
     state.queueingProcessing = false;
     const message = errorText(error);
+    const alreadyStopped = message.includes("There is no active recording");
+    const reconciled = await reconcileRecordingStatus({
+      announce: alreadyStopped,
+      refreshArchive: alreadyStopped,
+    });
+    if (alreadyStopped && reconciled && !reconciled.recording) {
+      addActivity("Stop request reconciled with the native recorder", "success");
+      showToast("Recording had already stopped. Recall refreshed the archive.");
+      return;
+    }
     addActivity("Could not stop or queue recording: " + message, "error");
     showToast(message, "error");
     renderSpeakers();
@@ -1154,6 +1629,7 @@ async function loadSessions({ invalidateCache = false } = {}) {
     ) {
       state.selectedSessionId = null;
       state.selectedSegments = [];
+      state.selectedVoiceGroups = [];
       state.recapState = null;
       state.importedArtifact = null;
       state.translationIndex = new Map();
@@ -1282,6 +1758,7 @@ async function selectSession(sessionId, { userInitiated = true } = {}) {
   const sequence = ++state.sessionLoadSequence;
   state.selectedSessionId = sessionId;
   state.selectedSegments = [];
+  state.selectedVoiceGroups = [];
   state.recapState = null;
   state.importedArtifact = null;
   state.translationIndex = new Map();
@@ -1320,6 +1797,7 @@ async function selectSession(sessionId, { userInitiated = true } = {}) {
 function applyConversationPayload(session, payload) {
   if (payload?.session) Object.assign(session, payload.session);
   state.selectedSegments = payload?.segments || [];
+  state.selectedVoiceGroups = payload?.voice_groups || [];
   state.recapState = payload?.recap_state || null;
   state.importedArtifact = payload?.imported_artifact || null;
   state.translationIndex = indexTranslations(
@@ -2074,6 +2552,7 @@ async function deleteSelectedSession() {
     );
     state.selectedSessionId = null;
     state.selectedSegments = [];
+    state.selectedVoiceGroups = [];
     state.recapState = null;
     state.translationIndex = new Map();
     state.renderedSegmentCount = 0;
@@ -2225,9 +2704,23 @@ function renderSpeakers() {
   const selectedSpeakerIds = new Set(
     state.selectedSegments.map((segment) => segment.speaker_id).filter(Boolean),
   );
-  const unknownSegments = state.selectedSegments.filter((segment) => !segment.speaker_id);
+  const segmentsByVoiceGroup = new Map();
+  for (const segment of state.selectedSegments) {
+    if (!segment.voice_group_id) continue;
+    const grouped = segmentsByVoiceGroup.get(segment.voice_group_id) || [];
+    grouped.push(segment);
+    segmentsByVoiceGroup.set(segment.voice_group_id, grouped);
+  }
+  const meetingLocalGroups = state.selectedVoiceGroups.filter(
+    (group) =>
+      !group.resulting_speaker_id &&
+      (segmentsByVoiceGroup.get(group.id) || []).some((segment) => !segment.speaker_id),
+  );
+  const unknownSegments = state.selectedSegments.filter(
+    (segment) => !segment.speaker_id && !segment.voice_group_id,
+  );
   const currentSpeakers = state.speakers.filter((speaker) => selectedSpeakerIds.has(speaker.id));
-  if (!currentSpeakers.length && !unknownSegments.length) {
+  if (!currentSpeakers.length && !meetingLocalGroups.length && !unknownSegments.length) {
     const empty = document.createElement("div");
     empty.className = "people-empty";
     empty.textContent = "No manageable voice profiles are attributed in this conversation.";
@@ -2237,8 +2730,16 @@ function renderSpeakers() {
   if (unknownSegments.length) {
     elements.speakersList.append(buildUnknownSpeakerCard(unknownSegments));
   }
+  for (const group of meetingLocalGroups) {
+    elements.speakersList.append(
+      buildMeetingLocalVoiceGroupCard(group, segmentsByVoiceGroup.get(group.id) || []),
+    );
+  }
   for (const speaker of currentSpeakers) {
-    elements.speakersList.append(buildSpeakerCard(speaker, true, false));
+    const voiceGroups = state.selectedVoiceGroups.filter(
+      (group) => group.resulting_speaker_id === speaker.id,
+    );
+    elements.speakersList.append(buildSpeakerCard(speaker, true, false, voiceGroups));
   }
 }
 
@@ -2602,6 +3103,81 @@ async function loadIdentityManagerPage() {
   }
 }
 
+function buildMeetingLocalVoiceGroupCard(group, segments) {
+  const card = document.createElement("article");
+  card.className = "speaker-card meeting-local-voice";
+  const header = document.createElement("div");
+  header.className = "speaker-header";
+  const identity = document.createElement("div");
+  identity.className = "speaker-identity";
+  const avatar = document.createElement("div");
+  avatar.className = "speaker-avatar";
+  avatar.textContent = "?";
+  const copy = document.createElement("div");
+  copy.className = "speaker-copy";
+  const name = document.createElement("div");
+  name.className = "speaker-name";
+  name.textContent = group.provider_speaker_label || "Provider speaker";
+  const duration = segments.reduce(
+    (total, segment) => total + Math.max(0, Number(segment.end_ms) - Number(segment.start_ms)),
+    0,
+  );
+  const meta = document.createElement("div");
+  meta.className = "speaker-meta";
+  meta.textContent =
+    segments.length.toLocaleString() +
+    (segments.length === 1 ? " intervention" : " interventions") +
+    " · " +
+    formatDuration(duration);
+  copy.append(name, meta);
+  identity.append(avatar, copy);
+  header.append(identity);
+  card.append(header);
+
+  const tags = document.createElement("div");
+  tags.className = "speaker-tags";
+  const localTag = document.createElement("span");
+  localTag.className = "meeting-local-voice-tag";
+  localTag.textContent = "This conversation only";
+  const noProfileTag = document.createElement("span");
+  noProfileTag.className = "legacy-voice-tag";
+  noProfileTag.textContent = "No safe voiceprint";
+  tags.append(localTag, noProfileTag);
+  if (group.split_status === "suggested") {
+    const splitTag = document.createElement("span");
+    splitTag.className = "split-review-tag";
+    splitTag.textContent = "Possible mixed voice";
+    tags.append(splitTag);
+  }
+  card.append(tags);
+
+  const explanation = document.createElement("p");
+  explanation.className = "speaker-card-explanation";
+  explanation.textContent =
+    group.split_status === "suggested"
+      ? "Recall found two internally consistent local voice clusters inside this provider label. Review the interventions before deciding whether to split them; no global profile is created automatically."
+      : "The STT provider separated these turns, but Recall did not find enough clean speech to create a reusable VOICE profile or preview. Assign the turns from the transcript if you know the person.";
+  card.append(explanation);
+
+  const actions = document.createElement("div");
+  actions.className = "speaker-actions";
+  actions.append(actionButton("Review turns", () => reviewInterventions(segments)));
+  if (
+    Number(group.intervention_count || 0) >= 2 &&
+    Number(group.voice_observation_count || 0) >= 2
+  ) {
+    actions.append(
+      actionButton(
+        group.split_status === "suggested" ? "Review split…" : "Split turns…",
+        () => openVoiceSplitDialog(group),
+        group.split_status === "suggested" ? "primary-mini" : undefined,
+      ),
+    );
+  }
+  card.append(actions);
+  return card;
+}
+
 function buildUnknownSpeakerCard(segments) {
   const card = document.createElement("article");
   card.className = "speaker-card unresolved";
@@ -2651,15 +3227,21 @@ function buildUnknownSpeakerCard(segments) {
   actions.className = "speaker-actions";
   actions.append(
     actionButton("Group as one voice…", createProfileForUnknownSegments, "primary-mini"),
-    actionButton("Review turns", reviewUnknownInterventions),
+    actionButton("Review turns", () => reviewInterventions(segments)),
   );
   card.append(actions);
   return card;
 }
 
 function reviewUnknownInterventions() {
-  const index = state.selectedSegments.findIndex((candidate) => !candidate.speaker_id);
-  const segment = index >= 0 ? state.selectedSegments[index] : null;
+  reviewInterventions(state.selectedSegments.filter((candidate) => !candidate.speaker_id));
+}
+
+function reviewInterventions(segments) {
+  const segment = segments[0] || null;
+  const index = segment
+    ? state.selectedSegments.findIndex((candidate) => candidate.id === segment.id)
+    : -1;
   if (index >= 0) ensureSegmentRendered(index);
   const row = segment
     ? Array.from(elements.segmentsList.children).find(
@@ -2674,6 +3256,171 @@ function reviewUnknownInterventions() {
       speakerButton.focus();
       openSpeakerPicker(segment);
     }, 250);
+  }
+}
+
+function currentVoiceSplitGroup() {
+  return state.selectedVoiceGroups.find(
+    (group) => group.id === state.voiceSplitGroupId,
+  );
+}
+
+function selectedVoiceSplitSegmentIds() {
+  return Array.from(
+    elements.voiceSplitList.querySelectorAll("input[type='checkbox']:checked"),
+  ).map((input) => input.value);
+}
+
+function updateVoiceSplitConfirmation() {
+  const total = elements.voiceSplitList.querySelectorAll(
+    "input[type='checkbox']",
+  ).length;
+  const selected = selectedVoiceSplitSegmentIds().length;
+  elements.confirmVoiceSplitButton.disabled =
+    state.identityOperationRunning || selected === 0 || selected >= total;
+  elements.voiceSplitFeedback.textContent =
+    selected > 0 && selected < total
+      ? selected.toLocaleString() +
+        " intervention" +
+        (selected === 1 ? "" : "s") +
+        " will move to a separate voice."
+      : "Select some, but not all, interventions.";
+}
+
+function openVoiceSplitDialog(group) {
+  if (!group || recapIsRunning(group.session_id)) return;
+  const segments = state.selectedSegments
+    .filter((segment) => segment.voice_group_id === group.id)
+    .sort((left, right) => Number(left.start_ms) - Number(right.start_ms));
+  if (segments.length < 2) {
+    showToast("This voice group no longer has enough interventions to split.", "error");
+    return;
+  }
+  state.voiceSplitGroupId = group.id;
+  const suggestedClusters = Array.isArray(group.split_clusters)
+    ? group.split_clusters.filter((cluster) => Array.isArray(cluster) && cluster.length)
+    : [];
+  let suggestedSelection = new Set();
+  if (group.split_status === "suggested" && suggestedClusters.length >= 2) {
+    const candidate = [...suggestedClusters].sort(
+      (left, right) => left.length - right.length,
+    )[0];
+    suggestedSelection = new Set(candidate);
+  }
+  elements.voiceSplitTitle.textContent =
+    group.split_status === "suggested"
+      ? "Review a possible mixed voice"
+      : "Split speaker turns";
+  elements.voiceSplitSummary.textContent =
+    (group.provider_speaker_label || "The provider speaker") +
+    (group.resulting_speaker_label
+      ? " is currently attributed to " + group.resulting_speaker_label + ". "
+      : ". ") +
+    (group.split_status === "suggested"
+      ? "Recall preselected the smaller locally detected voice cluster. Check the text and adjust the selection before applying it."
+      : "Choose the interventions that belong to a different person.");
+  elements.voiceSplitList.replaceChildren();
+  for (const segment of segments) {
+    const row = document.createElement("label");
+    row.className = "voice-split-row";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = segment.id;
+    checkbox.checked = suggestedSelection.has(segment.id);
+    checkbox.addEventListener("change", updateVoiceSplitConfirmation);
+    const copy = document.createElement("span");
+    copy.className = "voice-split-row-copy";
+    const meta = document.createElement("strong");
+    meta.textContent =
+      formatTimestamp(Number(segment.start_ms || 0)) +
+      " · " +
+      (segment.speaker_label || group.resulting_speaker_label || "Unknown speaker");
+    const text = document.createElement("span");
+    text.textContent = segment.text || "(empty intervention)";
+    copy.append(meta, text);
+    row.append(checkbox, copy);
+    elements.voiceSplitList.append(row);
+  }
+  elements.dismissVoiceSplitButton.hidden = group.split_status !== "suggested";
+  elements.voiceSplitFeedback.textContent = "";
+  updateVoiceSplitConfirmation();
+  if (!elements.voiceSplitDialog.open) elements.voiceSplitDialog.showModal();
+}
+
+async function confirmVoiceSplit() {
+  const group = currentVoiceSplitGroup();
+  const selectedSegmentIds = selectedVoiceSplitSegmentIds();
+  if (!group || !selectedSegmentIds.length) return;
+  elements.confirmVoiceSplitButton.disabled = true;
+  elements.dismissVoiceSplitButton.disabled = true;
+  elements.voiceSplitFeedback.textContent = "Creating a verified backup and applying split…";
+  state.identityOperationRunning = true;
+  elements.identityOperationBadge.hidden = false;
+  try {
+    const result = await invoke("split_voice_group", {
+      voiceGroupId: group.id,
+      selectedSegmentIds,
+    });
+    invalidateConversationCache(state.conversationCache, result.session_id);
+    if (elements.voiceSplitDialog.open) elements.voiceSplitDialog.close();
+    state.voiceSplitGroupId = null;
+    addActivity(
+      result.new_speaker_label +
+        " created from " +
+        Number(result.moved_interventions || 0).toLocaleString() +
+        " reviewed intervention" +
+        (Number(result.moved_interventions) === 1 ? "" : "s") +
+        "; verified backup " +
+        result.backup_path,
+      "success",
+    );
+    showToast(result.new_speaker_label + " created. Name or assign it when ready.");
+    await loadSpeakers();
+    if (state.selectedSessionId === result.session_id) {
+      await selectSession(result.session_id, { userInitiated: false });
+    }
+  } catch (error) {
+    const message = errorText(error);
+    elements.voiceSplitFeedback.textContent = message;
+    addActivity("Could not split the voice group: " + message, "error");
+    showToast(message, "error");
+  } finally {
+    state.identityOperationRunning = false;
+    elements.identityOperationBadge.hidden = true;
+    elements.dismissVoiceSplitButton.disabled = false;
+    updateVoiceSplitConfirmation();
+  }
+}
+
+async function dismissVoiceSplit() {
+  const group = currentVoiceSplitGroup();
+  if (!group) return;
+  elements.dismissVoiceSplitButton.disabled = true;
+  elements.confirmVoiceSplitButton.disabled = true;
+  try {
+    await invoke("dismiss_voice_group_split", { voiceGroupId: group.id });
+    group.split_status = "dismissed";
+    group.split_clusters = [];
+    const cached = state.conversationCache.get(group.session_id);
+    const cachedGroup = cached?.voice_groups?.find(
+      (candidate) => candidate.id === group.id,
+    );
+    if (cachedGroup) {
+      cachedGroup.split_status = "dismissed";
+      cachedGroup.split_clusters = [];
+    }
+    if (elements.voiceSplitDialog.open) elements.voiceSplitDialog.close();
+    state.voiceSplitGroupId = null;
+    renderSpeakers();
+    addActivity("Voice split suggestion dismissed", "success");
+  } catch (error) {
+    const message = errorText(error);
+    elements.voiceSplitFeedback.textContent = message;
+    addActivity("Could not dismiss the voice split suggestion: " + message, "error");
+    showToast(message, "error");
+  } finally {
+    elements.dismissVoiceSplitButton.disabled = false;
+    updateVoiceSplitConfirmation();
   }
 }
 
@@ -2703,7 +3450,7 @@ async function createProfileForUnknownSegments() {
   }
 }
 
-function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
+function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary, voiceGroups = []) {
   const label = speaker.label || "Unnamed voice";
   const provisional = isProvisionalLabel(label);
   const likelyMatch = provisional ? speaker.likely_match : null;
@@ -2787,6 +3534,15 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
     legacyTag.textContent = "No current voiceprint";
     tags.append(legacyTag);
   }
+  const splitSuggestions = voiceGroups.filter(
+    (group) => group.split_status === "suggested",
+  );
+  if (splitSuggestions.length) {
+    const splitTag = document.createElement("span");
+    splitTag.className = "split-review-tag";
+    splitTag.textContent = "Possible mixed voice";
+    tags.append(splitTag);
+  }
   if (tags.childElementCount) card.append(tags);
 
   if (likelyMatch) {
@@ -2817,6 +3573,13 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
     explanation.className = "speaker-card-explanation duplicate-match-explanation";
     explanation.textContent =
       "More than one person profile uses this name. Automatic matching ignores all of them until you merge the duplicates or rename one.";
+    card.append(explanation);
+  }
+  if (splitSuggestions.length) {
+    const explanation = document.createElement("p");
+    explanation.className = "speaker-card-explanation split-review-explanation";
+    explanation.textContent =
+      "Clean local voiceprints inside one provider speaker label disagree. Review the turns before deciding whether they belong to different people.";
     card.append(explanation);
   }
 
@@ -2871,6 +3634,29 @@ function buildSpeakerCard(speaker, inSelectedConversation, inVoiceLibrary) {
         "This named person is used in conversation history. Reassign or delete those conversations first.";
     }
     actions.append(deleteButton);
+  }
+  const splittableGroups = voiceGroups.filter(
+    (group) =>
+      Number(group.intervention_count || 0) >= 2 &&
+      Number(group.voice_observation_count || 0) >= 2,
+  );
+  for (const group of splittableGroups) {
+    const suggested = group.split_status === "suggested";
+    const needsProviderLabel = splittableGroups.length > 1;
+    const actionLabel = suggested
+      ? needsProviderLabel
+        ? "Review " + group.provider_speaker_label + " split…"
+        : "Review split…"
+      : needsProviderLabel
+        ? "Split " + group.provider_speaker_label + " turns…"
+        : "Split turns…";
+    actions.append(
+      actionButton(
+        actionLabel,
+        () => openVoiceSplitDialog(group),
+        suggested ? "primary-mini" : undefined,
+      ),
+    );
   }
   card.append(actions);
   return card;
@@ -4606,13 +5392,7 @@ async function loadSettingsDataInner() {
   renderJamieImportHistory();
   setServiceStatus(status.soniox_key_configured);
   setOpenAIStatus(status.openai_key_configured);
-  if (status.recording && !state.recording) {
-    setRecordingUi(true, {
-      device_name: preferences.selected_input_device || "selected input",
-      sample_rate: 0,
-      live_started: preferences.live_transcription,
-    });
-  }
+  applyNativeRecordingStatus(status);
   elements.languageHints.value = (preferences.language_hints || []).join(", ");
   elements.preferredLanguage.replaceChildren();
   const preferredLanguage = normalizePreferredLanguage(preferences.preferred_language);
@@ -4676,6 +5456,117 @@ async function openSettings() {
     elements.settingsFeedback.textContent = message;
     addActivity("Could not load settings: " + message, "error");
     if (!elements.settingsDialog.open) elements.settingsDialog.showModal();
+  }
+}
+
+function voiceResetStat(value, label) {
+  const item = document.createElement("div");
+  item.className = "voice-reset-stat";
+  const count = document.createElement("strong");
+  count.textContent = Number(value || 0).toLocaleString();
+  const copy = document.createElement("span");
+  copy.textContent = label;
+  item.append(count, copy);
+  return item;
+}
+
+function renderVoiceResetReadiness(readiness) {
+  state.voiceResetReadiness = readiness;
+  const preview = readiness?.preview || {};
+  elements.voiceResetStats.replaceChildren(
+    voiceResetStat(preview.voiceprints, "voiceprints removed"),
+    voiceResetStat(preview.temporary_samples, "temporary samples removed"),
+    voiceResetStat(preview.provisional_profiles, "global VOICE profiles removed"),
+    voiceResetStat(
+      preview.provisional_attributions_demoted,
+      "historical VOICE attributions kept as labels",
+    ),
+    voiceResetStat(preview.named_profiles_preserved, "named people preserved"),
+    voiceResetStat(preview.meeting_voice_groups, "recognition decisions cleared"),
+  );
+  const blockers = readiness?.blockers || [];
+  elements.voiceResetBlockers.replaceChildren();
+  elements.voiceResetBlockers.hidden = blockers.length === 0;
+  if (blockers.length) {
+    const title = document.createElement("strong");
+    title.textContent = "Finish this work before resetting:";
+    const list = document.createElement("ul");
+    for (const blocker of blockers) {
+      const item = document.createElement("li");
+      item.textContent = blocker;
+      list.append(item);
+    }
+    elements.voiceResetBlockers.append(title, list);
+  }
+  elements.confirmVoiceResetButton.disabled =
+    state.voiceResetRunning || !readiness?.can_reset;
+}
+
+async function openVoiceResetDialog() {
+  if (state.voiceResetRunning) return;
+  if (elements.settingsDialog.open) elements.settingsDialog.close();
+  elements.voiceResetStats.replaceChildren();
+  elements.voiceResetBlockers.hidden = true;
+  elements.voiceResetFeedback.textContent = "Inspecting local voice data…";
+  elements.confirmVoiceResetButton.disabled = true;
+  if (!elements.voiceResetDialog.open) elements.voiceResetDialog.showModal();
+  try {
+    const readiness = await invoke("preview_voice_recognition_reset");
+    renderVoiceResetReadiness(readiness);
+    elements.voiceResetFeedback.textContent = readiness.can_reset
+      ? "Review the exact counts before continuing."
+      : "Reset is currently unavailable.";
+  } catch (error) {
+    const message = errorText(error);
+    elements.voiceResetFeedback.textContent = message;
+    addActivity("Could not inspect voice recognition data: " + message, "error");
+  }
+}
+
+async function confirmVoiceReset() {
+  if (state.voiceResetRunning) return;
+  state.voiceResetRunning = true;
+  elements.confirmVoiceResetButton.disabled = true;
+  elements.voiceResetFeedback.textContent = "Creating and verifying backup…";
+  addActivity("Voice recognition reset started");
+  try {
+    const result = await invoke("reset_voice_recognition");
+    state.conversationCache.clear();
+    state.selectedVoiceGroups = [];
+    state.selectedIdentityProfiles.clear();
+    state.selectedUnassignedGroups.clear();
+    const selectedSessionId = state.selectedSessionId;
+    await Promise.all([loadSpeakers(), loadSessions({ invalidateCache: true })]);
+    if (
+      selectedSessionId &&
+      state.sessions.some((session) => session.id === selectedSessionId)
+    ) {
+      await selectSession(selectedSessionId, { userInitiated: false });
+    }
+    if (elements.voiceResetDialog.open) elements.voiceResetDialog.close();
+    addActivity(
+      "Voice recognition reset finished; database integrity " +
+        result.integrity_check +
+        "; verified backup " +
+        result.backup_path,
+      "success",
+    );
+    showToast("Voice recognition data reset. Names and conversation history were preserved.");
+  } catch (error) {
+    const message = errorText(error);
+    elements.voiceResetFeedback.textContent = message;
+    addActivity("Voice recognition reset failed: " + message, "error");
+    showToast(message, "error");
+    try {
+      renderVoiceResetReadiness(await invoke("preview_voice_recognition_reset"));
+    } catch {
+      // Keep the original reset failure visible.
+    }
+  } finally {
+    state.voiceResetRunning = false;
+    if (elements.voiceResetDialog.open && state.voiceResetReadiness) {
+      renderVoiceResetReadiness(state.voiceResetReadiness);
+    }
   }
 }
 
@@ -4784,12 +5675,14 @@ async function saveSettings(event) {
   elements.settingsFeedback.textContent = "Saving…";
   try {
     await invoke("save_preferences", {
-      selectedInputDevice,
-      languageHints,
-      liveTranscription,
-      openaiModel,
-      preferredLanguage,
-      noTranslationLanguages,
+      preferences: {
+        selectedInputDevice,
+        languageHints,
+        liveTranscription,
+        openaiModel,
+        preferredLanguage,
+        noTranslationLanguages,
+      },
     });
     state.preferences = {
       encryption_enabled: state.preferences ? state.preferences.encryption_enabled : false,
@@ -4937,9 +5830,14 @@ async function registerListeners() {
   await listen("live-transcription", (event) => {
     handleLiveTranscript(event.payload || {});
   });
+  await listen("live-context:progress", (event) => {
+    handleLiveContextProgress(event.payload || {});
+  });
 }
 
 function bindInterface() {
+  populateLiveExpectedSpeakers();
+  setLiveContextControlsEnabled(false);
   elements.jamieImportSettingsSection.hidden = !JAMIE_IMPORT_UI_ENABLED;
   elements.jamieImportDialog.hidden = !JAMIE_IMPORT_UI_ENABLED;
   if (JAMIE_IMPORT_UI_ENABLED) {
@@ -4959,11 +5857,11 @@ function bindInterface() {
   elements.speakerPickerUnknown.addEventListener("click", () =>
     chooseSpeakerFromPicker(null),
   );
+  elements.confirmVoiceSplitButton.addEventListener("click", confirmVoiceSplit);
+  elements.dismissVoiceSplitButton.addEventListener("click", dismissVoiceSplit);
   elements.liveTranscript.addEventListener("scroll", handleLiveScroll, { passive: true });
-  elements.liveTranslatedTranscript.addEventListener("scroll", handleLiveScroll, {
-    passive: true,
-  });
   elements.jumpToLiveButton.addEventListener("click", () => setLiveFollow(true));
+  elements.applyLiveContextButton.addEventListener("click", applyLiveContext);
   elements.voiceLibraryButton.addEventListener("click", openVoiceLibrary);
   elements.peopleVoicesButton.addEventListener("click", openVoiceLibrary);
   elements.identityProfilesTab.addEventListener("click", () =>
@@ -5051,6 +5949,8 @@ function bindInterface() {
   });
   elements.deleteSessionButton.addEventListener("click", deleteSelectedSession);
   elements.settingsButton.addEventListener("click", openSettings);
+  elements.previewVoiceResetButton.addEventListener("click", openVoiceResetDialog);
+  elements.confirmVoiceResetButton.addEventListener("click", confirmVoiceReset);
   if (JAMIE_IMPORT_UI_ENABLED) {
     elements.chooseJamieExportButton.addEventListener("click", () => {
       void openJamieImport("choose_jamie_export");

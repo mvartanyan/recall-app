@@ -19,12 +19,18 @@ async function installTauriMock(page) {
     let releaseJamieChoice = null;
     let jamieInspectionGate = null;
     let releaseJamieInspection = null;
+    let nextAppStatusGate = null;
+    let releaseAppStatus = null;
     const conversationLoadGates = new Map();
     const releaseConversationLoads = new Map();
     const commandCounts = {};
     const native = {
       recording: false,
+      sttContext: { language_hints: ["en", "de"], expected_speakers: null },
+      sttContextRevision: 0,
+      queuedSttContext: null,
       sessions: [session],
+      voiceGroups: { [session.id]: [] },
       importBatches: [],
       importedArtifacts: {},
       segments: {
@@ -250,8 +256,8 @@ async function installTauriMock(page) {
         commandCounts[scopedKey] = (commandCounts[scopedKey] || 0) + 1;
       }
       switch (command) {
-        case "app_status":
-          return {
+        case "app_status": {
+          const status = {
             encryption_enabled: false,
             db_open: true,
             needs_password: false,
@@ -262,7 +268,18 @@ async function installTauriMock(page) {
             selected_input_device: null,
             language_hints: preferences.language_hints,
             live_transcription: true,
+            current_stt_context: native.recording
+              ? structuredClone(native.sttContext)
+              : null,
+            live_recording_active: native.recording,
           };
+          if (nextAppStatusGate) {
+            const gate = nextAppStatusGate;
+            nextAppStatusGate = null;
+            await gate;
+          }
+          return status;
+        }
         case "get_preferences":
           return structuredClone(preferences);
         case "list_input_devices":
@@ -297,6 +314,7 @@ async function installTauriMock(page) {
           return structuredClone({
             session: selected,
             segments: native.segments[args.sessionId] || [],
+            voice_groups: native.voiceGroups[args.sessionId] || [],
             recap_state: recapState,
             imported_artifact: native.importedArtifacts[args.sessionId] || null,
           });
@@ -485,16 +503,39 @@ async function installTauriMock(page) {
         }
         case "start_recording":
           native.recording = true;
+          native.sttContext = {
+            language_hints: [...preferences.language_hints],
+            expected_speakers: null,
+          };
           return {
             path: "/tmp/recall-test.wav",
             device_name: "Test microphone",
             sample_rate: 48_000,
             live_started: true,
+            stt_context: structuredClone(native.sttContext),
           };
+        case "update_live_context": {
+          const next = structuredClone(args.sttContext);
+          const changed = JSON.stringify(next) !== JSON.stringify(native.sttContext);
+          native.sttContext = next;
+          if (changed) native.sttContextRevision += 1;
+          return {
+            stt_context: structuredClone(next),
+            changed,
+            live_restart_pending: changed,
+            revision: native.sttContextRevision,
+            delivery_status: changed ? "pending" : "unchanged",
+          };
+        }
         case "stop_recording":
+          if (!native.recording) throw new Error("There is no active recording");
           native.recording = false;
-          return "/tmp/recall-test.wav";
+          return {
+            path: "/tmp/recall-test.wav",
+            stt_context: structuredClone(native.sttContext),
+          };
         case "transcribe_file_async": {
+          native.queuedSttContext = structuredClone(args.sttContext);
           const draft = {
             id: "session-draft",
             created_at: "2026-07-23T09:00:00Z",
@@ -639,13 +680,142 @@ async function installTauriMock(page) {
             quarantined_voiceprints: 0,
           };
         }
+        case "split_voice_group": {
+          let sourceGroup = null;
+          for (const groups of Object.values(native.voiceGroups)) {
+            sourceGroup = groups.find((group) => group.id === args.voiceGroupId);
+            if (sourceGroup) break;
+          }
+          if (!sourceGroup) throw new Error("Voice group not found");
+          const selectedIds = new Set(args.selectedSegmentIds || []);
+          const sessionSegments = native.segments[sourceGroup.session_id] || [];
+          const moved = sessionSegments.filter((segment) => selectedIds.has(segment.id));
+          if (!moved.length || moved.length >= sourceGroup.intervention_count) {
+            throw new Error("Select some, but not all, interventions");
+          }
+          const newSpeaker = {
+            id: "speaker-split",
+            label: "VOICE13",
+            created_at: "2026-07-23T12:00:00Z",
+            last_seen_at: "2026-07-23T12:00:00Z",
+            sample_count: 1,
+            embedding_count: 1,
+            conversation_count: 1,
+          };
+          speakers.push(newSpeaker);
+          for (const segment of moved) {
+            segment.speaker_id = newSpeaker.id;
+            segment.speaker_label = newSpeaker.label;
+            segment.voice_group_id = "voice-group-split";
+          }
+          sourceGroup.intervention_count -= moved.length;
+          sourceGroup.voice_observation_count = Math.max(
+            0,
+            sourceGroup.voice_observation_count - moved.length,
+          );
+          sourceGroup.split_status = "reviewed";
+          sourceGroup.split_clusters = [];
+          native.voiceGroups[sourceGroup.session_id].push({
+            ...sourceGroup,
+            id: "voice-group-split",
+            cluster_index: 1,
+            resulting_speaker_id: newSpeaker.id,
+            resulting_speaker_label: newSpeaker.label,
+            split_status: "reviewed",
+            split_clusters: [],
+            intervention_count: moved.length,
+            voice_observation_count: moved.length,
+          });
+          return {
+            session_id: sourceGroup.session_id,
+            original_group_id: sourceGroup.id,
+            new_group_id: "voice-group-split",
+            new_speaker_id: newSpeaker.id,
+            new_speaker_label: newSpeaker.label,
+            moved_interventions: moved.length,
+            remaining_interventions: sourceGroup.intervention_count,
+            backup_path: "/tmp/recall.pre-voice-split.db",
+          };
+        }
+        case "dismiss_voice_group_split": {
+          for (const groups of Object.values(native.voiceGroups)) {
+            const group = groups.find((candidate) => candidate.id === args.voiceGroupId);
+            if (!group) continue;
+            group.split_status = "dismissed";
+            group.split_clusters = [];
+            return null;
+          }
+          throw new Error("Voice group not found");
+        }
+        case "preview_voice_recognition_reset":
+          return {
+            can_reset: true,
+            blockers: [],
+            preview: {
+              voiceprints: speakers.reduce(
+                (total, speaker) => total + Number(speaker.embedding_count || 0),
+                0,
+              ),
+              temporary_samples: speakers.reduce(
+                (total, speaker) => total + Number(speaker.sample_count || 0),
+                0,
+              ),
+              match_decisions: 1,
+              meeting_voice_groups: Object.values(native.voiceGroups).flat().length,
+              voice_observations: Object.values(native.voiceGroups)
+                .flat()
+                .reduce(
+                  (total, group) => total + Number(group.voice_observation_count || 0),
+                  0,
+                ),
+              provisional_profiles: speakers.filter((speaker) =>
+                /^VOICE\d+$/i.test(speaker.label || ""),
+              ).length,
+              provisional_attributions_demoted: Object.values(native.segments)
+                .flat()
+                .filter((segment) => /^VOICE\d+$/i.test(segment.speaker_label || ""))
+                .length,
+              named_profiles_preserved: speakers.filter(
+                (speaker) => !/^VOICE\d+$/i.test(speaker.label || ""),
+              ).length,
+            },
+          };
+        case "reset_voice_recognition": {
+          const preview = await invoke("preview_voice_recognition_reset");
+          const provisionalIds = new Set(
+            speakers
+              .filter((speaker) => /^VOICE\d+$/i.test(speaker.label || ""))
+              .map((speaker) => speaker.id),
+          );
+          for (const segment of Object.values(native.segments).flat()) {
+            if (provisionalIds.has(segment.speaker_id)) segment.speaker_id = null;
+            delete segment.voice_group_id;
+          }
+          for (let index = speakers.length - 1; index >= 0; index -= 1) {
+            if (provisionalIds.has(speakers[index].id)) {
+              speakers.splice(index, 1);
+            } else {
+              speakers[index].embedding_count = 0;
+              speakers[index].sample_count = 0;
+              speakers[index].likely_match = null;
+            }
+          }
+          for (const sessionId of Object.keys(native.voiceGroups)) {
+            native.voiceGroups[sessionId] = [];
+          }
+          return {
+            preview: preview.preview,
+            backup_path: "/tmp/recall.pre-voice-reset-v4.db",
+            integrity_check: "ok",
+          };
+        }
         case "save_preferences":
-          preferences.selected_input_device = args.selectedInputDevice;
-          preferences.language_hints = args.languageHints;
-          preferences.live_transcription = args.liveTranscription;
-          preferences.openai_model = args.openaiModel;
-          preferences.preferred_language = args.preferredLanguage;
-          preferences.no_translation_languages = args.noTranslationLanguages;
+          preferences.selected_input_device = args.preferences.selectedInputDevice;
+          preferences.language_hints = args.preferences.languageHints;
+          preferences.live_transcription = args.preferences.liveTranscription;
+          preferences.openai_model = args.preferences.openaiModel;
+          preferences.preferred_language = args.preferences.preferredLanguage;
+          preferences.no_translation_languages = args.preferences.noTranslationLanguages;
           return null;
         case "generate_recap":
           recapState.recap = {
@@ -693,6 +863,22 @@ async function installTauriMock(page) {
     window.__mockCommandCount = (command) => commandCounts[command] || 0;
     window.__mockConversationLoadCount = (sessionId) =>
       commandCounts["load_conversation:" + sessionId] || 0;
+    window.__mockSessionTranscript = (sessionId) =>
+      native.sessions.find((candidate) => candidate.id === sessionId)?.transcript ?? null;
+    window.__setNativeRecording = (recording) => {
+      native.recording = Boolean(recording);
+    };
+    window.__mockSttContext = () => structuredClone(native.sttContext);
+    window.__mockQueuedSttContext = () => structuredClone(native.queuedSttContext);
+    window.__deferNextAppStatus = () => {
+      nextAppStatusGate = new Promise((resolve) => {
+        releaseAppStatus = resolve;
+      });
+    };
+    window.__releaseAppStatus = () => {
+      releaseAppStatus?.();
+      releaseAppStatus = null;
+    };
     window.__setMockSpeakerLabel = (speakerId, label) => {
       const speaker = speakers.find((candidate) => candidate.id === speakerId);
       if (!speaker) throw new Error("Mock speaker not found");
@@ -756,6 +942,87 @@ async function installTauriMock(page) {
       }
       return fixtureSession.id;
     };
+    window.__addVoiceSplitFixture = () => {
+      const sessionId = "session-voice-split";
+      const fixtureSession = {
+        id: sessionId,
+        created_at: "2026-07-25T08:00:00Z",
+        title: "Mixed voice review",
+        duration_ms: 30_000,
+        transcript:
+          "Speaker 1: First turn\nSpeaker 1: Second turn\nSpeaker 1: Third turn\nSpeaker 1: Fourth turn",
+        processing_status: null,
+        processing_error: null,
+        processing_run_id: null,
+        recoverable_audio: false,
+      };
+      native.sessions = [fixtureSession, ...native.sessions];
+      native.segments[sessionId] = [
+        {
+          id: "split-segment-1",
+          session_id: sessionId,
+          start_ms: 0,
+          end_ms: 5_000,
+          speaker_id: null,
+          speaker_label: "Speaker 1",
+          voice_group_id: "voice-group-mixed",
+          text: "First turn from the main voice.",
+        },
+        {
+          id: "split-segment-2",
+          session_id: sessionId,
+          start_ms: 7_000,
+          end_ms: 12_000,
+          speaker_id: null,
+          speaker_label: "Speaker 1",
+          voice_group_id: "voice-group-mixed",
+          text: "Second turn from another local cluster.",
+        },
+        {
+          id: "split-segment-3",
+          session_id: sessionId,
+          start_ms: 14_000,
+          end_ms: 20_000,
+          speaker_id: null,
+          speaker_label: "Speaker 1",
+          voice_group_id: "voice-group-mixed",
+          text: "Third turn from the main voice.",
+        },
+        {
+          id: "split-segment-4",
+          session_id: sessionId,
+          start_ms: 22_000,
+          end_ms: 28_000,
+          speaker_id: null,
+          speaker_label: "Speaker 1",
+          voice_group_id: "voice-group-mixed",
+          text: "Fourth turn from the other local cluster.",
+        },
+      ];
+      native.voiceGroups[sessionId] = [
+        {
+          id: "voice-group-mixed",
+          session_id: sessionId,
+          provider_speaker_label: "Speaker 1",
+          cluster_index: 0,
+          resulting_speaker_id: null,
+          resulting_speaker_label: null,
+          status: "meeting_local_no_safe_speech",
+          selected_duration_ms: 20_000,
+          selected_window_count: 4,
+          consistency_score: 0.91,
+          model_version: "wespeaker-ecapa512-lm-v4-vad",
+          split_status: "suggested",
+          split_clusters: [
+            ["split-segment-1", "split-segment-3"],
+            ["split-segment-2", "split-segment-4"],
+          ],
+          intervention_count: 4,
+          voice_observation_count: 4,
+        },
+      ];
+      return sessionId;
+    };
     window.__addLargeConversation = () =>
       window.__addConversationFixture({
         sessionId: "session-large",
@@ -803,7 +1070,247 @@ test.beforeEach(async ({ page }) => {
   await expect(page.getByText("Recall is ready", { exact: false })).toBeAttached();
 });
 
-test("recording is a selectable workspace and does not block conversation history", async ({ page }) => {
+test("live speaker turns keep code switches inline and provide a complete preferred-language line", async ({ page }) => {
+  await page.getByRole("button", { name: "New recording" }).click();
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      status: "Live",
+      text: "Speaker 1: Привет and welcome друзья\nSpeaker 2: Guten Tag",
+      final_text: "",
+      turns: [
+        {
+          id: "speaker-one-turn",
+          sequence: 0,
+          speaker: "Speaker 1",
+          segments: [
+            {
+              id: "speaker-one-ru-1",
+              source_text: "Привет",
+              source_language: "ru-RU",
+              source_final: false,
+              translation: { text: "Hello", source_language: "ru", is_final: false },
+            },
+            {
+              id: "speaker-one-en",
+              source_text: "and welcome",
+              source_language: "en-US",
+              source_final: false,
+              translation: null,
+            },
+            {
+              id: "speaker-one-ru-2",
+              source_text: "друзья",
+              source_language: "ru-RU",
+              source_final: false,
+              translation: { text: "friends", source_language: "ru", is_final: false },
+            },
+          ],
+        },
+        {
+          id: "speaker-two-turn",
+          sequence: 1,
+          speaker: "Speaker 2",
+          segments: [
+            {
+              id: "speaker-two-de",
+              source_text: "Guten Tag",
+              source_language: "de-DE",
+              source_final: false,
+              translation: null,
+            },
+          ],
+        },
+      ],
+      target_language: "en",
+      translation_warning: null,
+      finished: false,
+      error: null,
+    }),
+  );
+  const firstTurn = page.locator('[data-live-caption-id="speaker-one-turn"]');
+  await expect(firstTurn.locator("[data-live-caption-source]")).toHaveCount(1);
+  await expect(firstTurn.locator('[data-live-caption-run="source"]')).toHaveCount(3);
+  await expect(firstTurn.locator("[data-live-caption-translation]")).toHaveText(
+    "[ru] Hello [en] and welcome [ru] friends",
+  );
+  await expect(page.locator('[data-live-caption-id="speaker-two-turn"] [data-live-caption-translation]')).toHaveCount(0);
+  await expect(page.locator(".live-caption-passage")).toHaveCount(2);
+  const styles = await firstTurn.evaluate((turn) => {
+    const sourceParagraph = turn.querySelector("[data-live-caption-source]");
+    const preferredParagraph = turn.querySelector("[data-live-caption-translation]");
+    const firstSource = turn.querySelector('[data-live-caption-run="source"][data-live-caption-language="ru"]');
+    const firstPreferred = turn.querySelector('[data-live-caption-run="preferred"][data-live-caption-language="ru"]');
+    const englishSource = turn.querySelector('[data-live-caption-run="source"][data-live-caption-language="en"]');
+    const values = (element) => [getComputedStyle(element).backgroundColor, getComputedStyle(element).color];
+    return {
+      sourceBackground: getComputedStyle(sourceParagraph).backgroundColor,
+      preferredBackground: getComputedStyle(preferredParagraph).backgroundColor,
+      ruSource: values(firstSource),
+      ruPreferred: values(firstPreferred),
+      enSource: values(englishSource),
+    };
+  });
+  expect(styles.sourceBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(styles.preferredBackground).not.toBe("rgba(0, 0, 0, 0)");
+  expect(styles.sourceBackground).not.toEqual(styles.preferredBackground);
+  expect(styles.ruSource).toEqual(styles.ruPreferred);
+  expect(styles.ruSource).not.toEqual(styles.enSource);
+
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      status: "Live",
+      text: "Speaker 1: Привет and welcome друзья",
+      final_text: "",
+      turns: [
+        {
+          id: "speaker-one-turn",
+          sequence: 0,
+          speaker: "Speaker 1",
+          segments: [
+            {
+              id: "speaker-one-ru-1",
+              source_text: "Привет",
+              source_language: "ru",
+              source_final: false,
+              translation: { text: "Hel", source_language: "ru", is_final: false },
+            },
+            {
+              id: "speaker-one-en",
+              source_text: "and welcome",
+              source_language: "en",
+              source_final: false,
+              translation: null,
+            },
+            {
+              id: "speaker-one-ru-2",
+              source_text: "друзья",
+              source_language: "ru",
+              source_final: false,
+              translation: { text: "friends", source_language: "ru", is_final: false },
+            },
+          ],
+        },
+      ],
+      target_language: "en",
+      translation_warning: null,
+      finished: false,
+      error: null,
+    }),
+  );
+  await expect(firstTurn.locator("[data-live-caption-translation]")).toHaveText(
+    "[ru] Hel [en] and welcome [ru] friends",
+  );
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      status: "Live",
+      text: "Speaker 1: Привет and welcome друзья",
+      final_text: "",
+      turns: [
+        {
+          id: "speaker-one-turn",
+          sequence: 0,
+          speaker: "Speaker 1",
+          segments: [
+            {
+              id: "speaker-one-ru-1",
+              source_text: "Привет",
+              source_language: "ru",
+              source_final: false,
+              translation: { text: "Hello", source_language: "ru", is_final: false },
+            },
+            {
+              id: "speaker-one-en",
+              source_text: "and welcome",
+              source_language: "en",
+              source_final: false,
+              translation: null,
+            },
+            {
+              id: "speaker-one-ru-2",
+              source_text: "друзья",
+              source_language: "ru",
+              source_final: false,
+              translation: { text: "friends", source_language: "ru", is_final: false },
+            },
+          ],
+        },
+      ],
+      target_language: "en",
+      translation_warning: null,
+      finished: false,
+      error: null,
+    }),
+  );
+  await expect(firstTurn.locator("[data-live-caption-translation]")).toHaveText(
+    "[ru] Hello [en] and welcome [ru] friends",
+  );
+  await page.getByRole("button", { name: "Stop recording" }).click();
+});
+
+test("a revised provisional source tail keeps pace with its live translation", async ({ page }) => {
+  await page.getByRole("button", { name: "New recording" }).click();
+  const emitSnapshot = (revision, sourceText, sourceFinal, translationText) =>
+    page.evaluate(
+      ({ revision, sourceText, sourceFinal, translationText }) =>
+        window.__emitTauri("live-transcription", {
+          revision,
+          final_audio_proc_ms: sourceFinal ? 1_000 : 1_500,
+          total_audio_proc_ms: 2_000,
+          status: "Live",
+          text: "Speaker 1: " + sourceText,
+          final_text: sourceFinal ? "Speaker 1: " + sourceText : "Speaker 1: Guten Morgen",
+          turns: [
+            {
+              id: "live-turn-0",
+              sequence: 0,
+              speaker: "Speaker 1",
+              segments: [
+                {
+                  id: "live-turn-0-segment-0",
+                  source_text: sourceText,
+                  source_language: "de",
+                  source_final: sourceFinal,
+                  translation: {
+                    text: translationText,
+                    source_language: "de",
+                    is_final: false,
+                  },
+                },
+              ],
+            },
+          ],
+          target_language: "en",
+          translation_warning: null,
+          finished: false,
+          error: null,
+        }),
+      { revision, sourceText, sourceFinal, translationText },
+    );
+
+  await emitSnapshot(100, "Guten Morgen", true, "Good morning");
+  await emitSnapshot(101, "Guten Morgen, ich denke", false, "Good morning, I think");
+  await emitSnapshot(102, "Guten Morgen, wir denken", false, "Good morning, we think");
+
+  const turn = page.locator('[data-live-caption-id="live-turn-0"]');
+  await expect(turn.locator("[data-live-caption-source]")).toContainText(
+    "Guten Morgen, wir denken",
+  );
+  await expect(turn.locator("[data-live-caption-source]")).not.toContainText("ich denke");
+  await expect(turn.locator("[data-live-caption-translation]")).toContainText(
+    "[de] Good morning, we think",
+  );
+
+  await emitSnapshot(101, "Guten Morgen, ich denke", false, "Good morning, I think");
+  await expect(turn.locator("[data-live-caption-source]")).toContainText(
+    "Guten Morgen, wir denken",
+  );
+  await expect(turn.locator("[data-live-caption-translation]")).toContainText(
+    "[de] Good morning, we think",
+  );
+  await page.getByRole("button", { name: "Stop recording" }).click();
+});
+
+test("live legacy passages remain fluid and available while working in conversation history", async ({ page }) => {
   await page.getByRole("button", { name: "New recording" }).click();
   const currentRecording = page.locator('[data-current-recording="true"]');
   await expect(currentRecording).toBeVisible();
@@ -813,32 +1320,331 @@ test("recording is a selectable workspace and does not block conversation histor
   await page.evaluate(() =>
     window.__emitTauri("live-transcription", {
       status: "Live",
-      text: "Speaker 1: Guten Morgen",
+      text: "Speaker 1: Привет\nSpeaker 1: Hello\nSpeaker 2: Guten Tag",
       final_text: "",
-      translated_text: "Good morning",
-      translated_final_text: "",
+      passages: [
+        {
+          id: "live-passage-0",
+          sequence: 0,
+          speaker: "Speaker 1",
+          source_text: "Привет",
+          source_language: "ru-RU",
+          source_final: false,
+          translation: {
+            text: "Hello",
+            source_language: "ru-RU",
+            is_final: false,
+          },
+        },
+        {
+          id: "live-passage-1",
+          sequence: 1,
+          speaker: "Speaker 1",
+          source_text: "Hello",
+          source_language: "en",
+          source_final: false,
+          translation: null,
+        },
+        {
+          id: "live-provisional-de",
+          sequence: 2,
+          speaker: "Speaker 2",
+          source_text: "Guten Tag",
+          source_language: "de-DE",
+          source_final: false,
+          translation: null,
+        },
+      ],
       target_language: "en",
       translation_warning: null,
       finished: false,
       error: null,
     }),
   );
-  await expect(page.getByText("Good morning", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-live-caption-source]").first()).toContainText("Привет");
+  await expect(page.getByText("[ru] Hello", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-live-caption-translation]")).toHaveCount(1);
+  const firstRecordingStyles = await page.evaluate(() => {
+    const values = (element) =>
+      [
+        element.style.getPropertyValue("--live-caption-language-bg"),
+        element.style.getPropertyValue("--live-caption-language-fg"),
+        element.style.getPropertyValue("--live-caption-language-border"),
+      ];
+    const computedValues = (element) => {
+      const style = getComputedStyle(element);
+      return [style.backgroundColor, style.color, style.borderLeftColor];
+    };
+    const russian = document.querySelector('[data-live-caption-id="live-passage-0"]');
+    const english = document.querySelector('[data-live-caption-id="live-passage-1"]');
+    const russianSource = russian.querySelector('[data-live-caption-run="source"]');
+    const russianTranslation = russian.querySelector('[data-live-caption-run="preferred"]');
+    const englishSource = english.querySelector('[data-live-caption-run="source"]');
+    window.__firstRecordingRuStyle = values(russianSource);
+    return {
+      russianSource: values(russianSource),
+      russianTranslation: values(russianTranslation),
+      russianSourceComputed: computedValues(russianSource),
+      russianTranslationComputed: computedValues(russianTranslation),
+      englishSource: values(englishSource),
+      englishSourceComputed: computedValues(englishSource),
+      englishTranslation: english.querySelector("[data-live-caption-translation]"),
+    };
+  });
+  expect(firstRecordingStyles.russianSource).toEqual(firstRecordingStyles.russianTranslation);
+  expect(firstRecordingStyles.russianSourceComputed).toEqual(
+    firstRecordingStyles.russianTranslationComputed,
+  );
+  expect(firstRecordingStyles.russianSource).toEqual(["#edf7f2", "#2d6957", "#2d6957"]);
+  expect(firstRecordingStyles.englishSource).not.toEqual(firstRecordingStyles.russianSource);
+  expect(firstRecordingStyles.englishSourceComputed[0]).not.toEqual(
+    firstRecordingStyles.russianSourceComputed[0],
+  );
+  expect(firstRecordingStyles.englishTranslation).toBeNull();
+  const provisionalRowWasRetained = await page.evaluate(() => {
+    window.__provisionalLiveRow = document.querySelector('[data-live-caption-id="live-passage-0"]');
+    return Boolean(window.__provisionalLiveRow);
+  });
+  expect(provisionalRowWasRetained).toBe(true);
+
   await page.evaluate(() =>
     window.__emitTauri("live-transcription", {
       status: "Live",
-      text: "Speaker 1: Guten Morgen zusammen",
-      final_text: "Speaker 1: Guten Morgen zusammen",
-      translated_text: "Good morning everyone",
-      translated_final_text: "Good morning everyone",
+      text: "Speaker 1: Привет\nSpeaker 1: Hello\nSpeaker 2: Bonjour\nSpeaker 3: Neutral",
+      final_text: "Speaker 1: Привет\nSpeaker 1: Hello",
+      passages: [
+        {
+          id: "live-passage-0",
+          sequence: 0,
+          speaker: "Speaker 1",
+          source_text: "Привет",
+          source_language: "ru-RU",
+          source_final: true,
+          translation: {
+            text: "Hello",
+            source_language: "ru-RU",
+            is_final: true,
+          },
+        },
+        {
+          id: "live-passage-1",
+          sequence: 1,
+          speaker: "Speaker 1",
+          source_text: "Hello",
+          source_language: "en",
+          source_final: true,
+          translation: null,
+        },
+        {
+          id: "live-passage-2",
+          sequence: 2,
+          speaker: "Speaker 2",
+          source_text: "Bonjour",
+          source_language: "fr-FR",
+          source_final: false,
+          translation: {
+            text: "Good morning",
+            source_language: "fr-FR",
+            is_final: false,
+          },
+        },
+        {
+          id: "live-invalid",
+          sequence: 3,
+          speaker: "Speaker 3",
+          source_text: "Neutral",
+          source_language: "not a language",
+          source_final: false,
+          translation: {
+            text: "Must not render",
+            source_language: "fr-FR",
+            is_final: false,
+          },
+        },
+      ],
       target_language: "en",
       translation_warning: null,
       finished: false,
       error: null,
     }),
   );
-  await expect(page.getByText("Good morning everyone", { exact: true })).toBeVisible();
-  await expect(page.getByText("Good morning", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("[ru] Hello", { exact: true })).toBeVisible();
+  await expect(page.getByText("[fr] Good morning", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-live-caption-translation]")).toHaveCount(2);
+  await expect(page.locator(".live-caption-passage")).toHaveCount(4);
+  const laterStyles = await page.evaluate(() => {
+    const values = (element) =>
+      [
+        element.style.getPropertyValue("--live-caption-language-bg"),
+        element.style.getPropertyValue("--live-caption-language-fg"),
+        element.style.getPropertyValue("--live-caption-language-border"),
+      ];
+    const rowStyle = (id) => values(document.querySelector(`[data-live-caption-id="${id}"] [data-live-caption-run="source"]`));
+    const french = document.querySelector('[data-live-caption-id="live-passage-2"]');
+    const invalid = document.querySelector('[data-live-caption-id="live-invalid"] [data-live-caption-run="source"]');
+    return {
+      russian: rowStyle("live-passage-0"),
+      frenchSource: values(french.querySelector('[data-live-caption-run="source"]')),
+      frenchTranslation: values(french.querySelector('[data-live-caption-run="preferred"]')),
+      invalid: values(invalid),
+      invalidTranslation: document.querySelector('[data-live-caption-id="live-invalid"] [data-live-caption-translation]'),
+    };
+  });
+  expect(laterStyles.russian).toEqual(firstRecordingStyles.russianSource);
+  expect(laterStyles.frenchSource).toEqual(laterStyles.frenchTranslation);
+  expect(laterStyles.frenchSource).not.toEqual(firstRecordingStyles.russianSource);
+  expect(laterStyles.frenchSource).toEqual(["#f5eef7", "#785776", "#785776"]);
+  expect(laterStyles.invalid).toEqual(["", "", ""]);
+  expect(laterStyles.invalidTranslation).toBeNull();
+  expect(
+    await page.evaluate(
+      () => window.__provisionalLiveRow === document.querySelector('[data-live-caption-id="live-passage-0"]'),
+    ),
+  ).toBe(true);
+
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      revision: 10,
+      status: "Live",
+      text: "Speaker 1: Привет всем\nSpeaker 1: Hello\nSpeaker 2: Bonjour\nSpeaker 3: Ciao",
+      final_text: "Speaker 1: Привет всем\nSpeaker 1: Hello",
+      passages: [
+        {
+          id: "live-passage-0",
+          sequence: 0,
+          speaker: "Speaker 1",
+          source_text: "Привет всем",
+          source_language: "ru",
+          source_final: true,
+          translation: {
+            text: "Hello everyone",
+            source_language: "ru",
+            is_final: true,
+          },
+        },
+        {
+          id: "live-passage-1",
+          sequence: 1,
+          speaker: "Speaker 1",
+          source_text: "Hello",
+          source_language: "en",
+          source_final: true,
+          translation: null,
+        },
+        {
+          id: "live-passage-2",
+          sequence: 2,
+          speaker: "Speaker 2",
+          source_text: "Bonjour",
+          source_language: "fr-FR",
+          source_final: false,
+          translation: {
+            text: "Good morning",
+            source_language: "fr-FR",
+            is_final: false,
+          },
+        },
+        {
+          id: "live-mismatched",
+          sequence: 3,
+          speaker: "Speaker 3",
+          source_text: "Ciao",
+          source_language: "it-IT",
+          source_final: false,
+          translation: {
+            text: "Wrong language pair",
+            source_language: "fr-FR",
+            is_final: false,
+          },
+        },
+      ],
+      target_language: "en",
+      translation_warning: null,
+      finished: false,
+      error: null,
+    }),
+  );
+  await expect(page.getByText("[ru] Hello everyone", { exact: true })).toBeVisible();
+  await expect(page.getByText("[it] Wrong language pair", { exact: true })).toHaveCount(0);
+  await expect(page.locator('[data-live-caption-id="live-passage-1"]')).toHaveClass(
+    /live-caption-passage/,
+  );
+  const reusedRuStyle = await page.evaluate(() => {
+    const row = document.querySelector('[data-live-caption-id="live-passage-0"]');
+    const source = row.querySelector('[data-live-caption-run="source"]');
+    const translation = row.querySelector('[data-live-caption-run="preferred"]');
+    const values = (element) =>
+      [
+        element.style.getPropertyValue("--live-caption-language-bg"),
+        element.style.getPropertyValue("--live-caption-language-fg"),
+        element.style.getPropertyValue("--live-caption-language-border"),
+      ];
+    return { source: values(source), translation: values(translation) };
+  });
+  expect(reusedRuStyle.source).toEqual(firstRecordingStyles.russianSource);
+  expect(reusedRuStyle.translation).toEqual(firstRecordingStyles.russianSource);
+
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      revision: 9,
+      status: "Live",
+      text: "Speaker 1: Tampered",
+      final_text: "Speaker 1: Tampered",
+      passages: [
+        {
+          id: "live-passage-0",
+          sequence: 0,
+          speaker: "Speaker 1",
+          source_text: "Привет",
+          source_language: "ru",
+          source_final: true,
+          translation: {
+            text: "Hello",
+            source_language: "ru",
+            is_final: true,
+          },
+        },
+        {
+          id: "live-passage-1",
+          sequence: 1,
+          speaker: "Speaker 1",
+          source_text: "Hello",
+          source_language: "en",
+          source_final: true,
+          translation: null,
+        },
+        {
+          id: "live-passage-2",
+          sequence: 2,
+          speaker: "Speaker 2",
+          source_text: "Bonjour",
+          source_language: "fr-FR",
+          source_final: false,
+          translation: {
+            text: "Good morning",
+            source_language: "fr-FR",
+            is_final: false,
+          },
+        },
+      ],
+      target_language: "en",
+      translation_warning: null,
+      finished: false,
+      error: null,
+    }),
+  );
+  await expect(page.locator('[data-live-caption-id="live-passage-0"] [data-live-caption-translation]')).toContainText(
+    "[ru] Hello",
+  );
+
+  await page.evaluate(() => {
+    const transcript = document.getElementById("liveTranscript");
+    Object.defineProperty(transcript, "scrollHeight", { configurable: true, value: 1_000 });
+    Object.defineProperty(transcript, "clientHeight", { configurable: true, value: 200 });
+    transcript.scrollTop = 100;
+    transcript.dispatchEvent(new Event("scroll"));
+  });
+  await expect(page.getByRole("button", { name: "Jump to latest ↓" })).toBeVisible();
 
   await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
   await expect(page.getByLabel("Conversation title")).toHaveValue("Earlier planning meeting");
@@ -860,14 +1666,69 @@ test("recording is a selectable workspace and does not block conversation histor
   await page.getByLabel("Filter conversations by voice").selectOption("alice");
   await expect(currentRecording).toBeVisible();
 
-  await page.getByRole("button", { name: "Settings" }).click();
-  await page.getByLabel("Preferred language").selectOption("de");
-  await page.getByRole("button", { name: "Save settings" }).click();
-
   await currentRecording.click();
   await expect(page.getByRole("heading", { name: "Live" })).toBeVisible();
-  await expect(page.getByText("Good morning everyone", { exact: true })).toBeVisible();
-  await expect(page.getByText("Translation · English", { exact: true })).toBeVisible();
+  await expect(page.getByText("[ru] Hello", { exact: true })).toBeVisible();
+  await expect(page.locator("[data-live-caption-translation]")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: "Jump to latest ↓" })).toBeVisible();
+  expect(
+    await page.evaluate(() => {
+      const source = document.querySelector(
+        '[data-live-caption-id="live-passage-0"] [data-live-caption-run="source"]',
+      );
+      return [
+        source.style.getPropertyValue("--live-caption-language-bg"),
+        source.style.getPropertyValue("--live-caption-language-fg"),
+        source.style.getPropertyValue("--live-caption-language-border"),
+      ];
+    }),
+  ).toEqual(firstRecordingStyles.russianSource);
+
+  await page.getByRole("button", { name: "Stop recording" }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.__mockSessionTranscript("session-draft")))
+    .toBe("");
+
+  await page.getByRole("button", { name: "New recording" }).click();
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      status: "Live",
+      text: "Bonjour",
+      final_text: "",
+      passages: [
+        {
+          id: "second-recording-fr",
+          sequence: 0,
+          speaker: "Speaker 1",
+          source_text: "Bonjour",
+          source_language: "fr-FR",
+          source_final: false,
+          translation: {
+            text: "Hello",
+            source_language: "fr-FR",
+            is_final: false,
+          },
+        },
+      ],
+      target_language: "en",
+      translation_warning: null,
+      finished: false,
+      error: null,
+    }),
+  );
+  expect(
+    await page.evaluate(() => {
+      const source = document.querySelector(
+        '[data-live-caption-id="second-recording-fr"] [data-live-caption-run="source"]',
+      );
+      return [
+        source.style.getPropertyValue("--live-caption-language-bg"),
+        source.style.getPropertyValue("--live-caption-language-fg"),
+        source.style.getPropertyValue("--live-caption-language-border"),
+      ];
+    }),
+  ).toEqual(firstRecordingStyles.russianSource);
+  await page.getByRole("button", { name: "Stop recording" }).click();
 });
 
 test("browsing history prevents the completed recording from stealing focus", async ({ page }) => {
@@ -886,6 +1747,63 @@ test("stopping from the live workspace opens the durable processing draft", asyn
 
   await expect(page.getByLabel("Conversation title")).toHaveValue("Processing recording");
   await expect(page.locator('[data-current-recording="true"]')).toHaveCount(0);
+});
+
+test("a stale Stop recording state reconciles when the native recorder already stopped", async ({
+  page,
+}) => {
+  await page.getByRole("button", { name: "New recording" }).click();
+  await page.evaluate(() => {
+    window.__setNativeRecording(false);
+    document.getElementById("recordButton").click();
+  });
+
+  await expect(page.getByRole("button", { name: "New recording" })).toBeVisible();
+  await expect(page.locator('[data-current-recording="true"]')).toHaveCount(0);
+  await expect(
+    page.getByText("Recording had already stopped. Recall refreshed the archive.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+});
+
+test("a missed native stop event self-heals without another user action", async ({ page }) => {
+  await page.getByRole("button", { name: "New recording" }).click();
+  await page.evaluate(() => window.__setNativeRecording(false));
+
+  await expect(page.getByRole("button", { name: "New recording" })).toBeVisible({
+    timeout: 4_000,
+  });
+  await expect(page.locator('[data-current-recording="true"]')).toHaveCount(0);
+  await expect(
+    page.getByText("Recording had already stopped; the interface was refreshed", {
+      exact: true,
+    }),
+  ).toBeAttached();
+});
+
+test("an old status response cannot stop a newly started recording", async ({ page }) => {
+  await page.getByRole("button", { name: "New recording" }).click();
+  const statusCalls = await page.evaluate(() => window.__mockCommandCount("app_status"));
+  await page.evaluate(() => {
+    window.__setNativeRecording(false);
+    window.__deferNextAppStatus();
+  });
+  await page.waitForFunction(
+    (previous) => window.__mockCommandCount("app_status") > previous,
+    statusCalls,
+  );
+
+  await page.evaluate(async () => {
+    await window.__emitTauri("recording:stopped", "/tmp/old-recording.wav");
+  });
+  await page.getByRole("button", { name: "New recording" }).click();
+  await expect(page.getByRole("button", { name: "Stop recording" })).toBeVisible();
+
+  await page.evaluate(() => window.__releaseAppStatus());
+  await page.waitForTimeout(250);
+  await expect(page.getByRole("button", { name: "Stop recording" })).toBeVisible();
+  await expect(page.locator('[data-current-recording="true"]')).toBeVisible();
 });
 
 test("large conversations render in bounded batches with one searchable speaker picker and cache", async ({
@@ -1124,6 +2042,63 @@ test("an ambiguous voice suggestion survives review and can be accepted once", a
     .toEqual(["Alice", "Alice"]);
 });
 
+test("a suggested mixed voice stays review-only until selected turns are split", async ({ page }) => {
+  await page.evaluate(() => window.__addVoiceSplitFixture());
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Mixed voice review/ }).click();
+
+  await expect(page.getByText("Possible mixed voice", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Review split…" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Review a possible mixed voice" });
+  await expect(dialog).toBeVisible();
+  const choices = dialog.locator("input[type='checkbox']");
+  await expect(choices).toHaveCount(4);
+  await expect(choices.nth(0)).toBeChecked();
+  await expect(choices.nth(1)).not.toBeChecked();
+  await expect(choices.nth(2)).toBeChecked();
+  await expect(choices.nth(3)).not.toBeChecked();
+  await expect(dialog).toContainText(
+    "Recall preselected the smaller locally detected voice cluster",
+  );
+  await expect(dialog).toContainText("Nothing is split automatically");
+
+  await page.getByRole("button", { name: "Create separate voice" }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.locator("#speakersList").getByText("VOICE13", { exact: true })).toBeVisible();
+  await expect(
+    page.locator("#segmentsList").getByText("Second turn from another local cluster."),
+  ).toBeVisible();
+  expect(await page.evaluate(() => window.__mockCommandCount("split_voice_group"))).toBe(1);
+});
+
+test("voice recognition reset previews its scope and preserves conversation history", async ({ page }) => {
+  await expect(page.locator("#speakersList").getByText("VOICE12", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Review reset…" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Reset voice recognition data" });
+  await expect(dialog).toBeVisible();
+  await expect(
+    dialog.locator(".voice-reset-stat").filter({ hasText: "global VOICE profiles removed" }),
+  ).toContainText("1");
+  await expect(dialog).toContainText(
+    "Named people, conversations, transcript text, and historical speaker labels stay in place.",
+  );
+  await expect(page.getByRole("button", { name: "Create backup and reset" })).toBeEnabled();
+
+  await page.getByRole("button", { name: "Create backup and reset" }).click();
+  await expect(dialog).not.toBeVisible();
+  await expect(page.getByText("Earlier discussion", { exact: true })).toBeVisible();
+  await expect(page.locator("#speakersList").getByText("VOICE12", { exact: true })).toHaveCount(0);
+  await expect(
+    page.locator("#speakersList").getByText("Unknown speaker", { exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => window.__mockCommandCount("reset_voice_recognition")),
+  ).toBe(1);
+});
+
 test("preferred language is selected from provider capabilities and removed from exclusions", async ({ page }) => {
   await page.getByRole("button", { name: "Settings" }).click();
   const preferred = page.getByLabel("Preferred language");
@@ -1142,6 +2117,84 @@ test("preferred language is selected from provider capabilities and removed from
   await expect(page.getByLabel("No translation for languages")).toHaveValue("en, fr");
 });
 
+test("meeting STT context waits for a pause, marks the handoff, and follows the recording into final processing", async ({ page }) => {
+  await page.getByRole("button", { name: "New recording" }).click();
+  const livePanel = page.locator("#livePanel");
+  await expect(livePanel.getByLabel("Expected speakers")).toHaveValue("");
+  await expect(livePanel.getByLabel("Likely languages")).toHaveValue("en, de");
+
+  await livePanel.getByLabel("Expected speakers").selectOption("4");
+  await livePanel.getByLabel("Likely languages").fill("en, bn, tr");
+  await livePanel.getByRole("button", { name: "Apply to this meeting" }).click();
+  await expect(page.locator("#liveContextStatus")).toContainText("Pending - waiting for a quiet pause");
+  await expect
+    .poll(() => page.evaluate(() => window.__mockSttContext()))
+    .toEqual({ language_hints: ["en", "bn", "tr"], expected_speakers: 4 });
+
+  await page.evaluate(() =>
+    window.__emitTauri("live-transcription", {
+      revision: 40,
+      status: "Live",
+      text: "Speaker 1: Before.\n\nSpeaker 1: After.",
+      final_text: "Speaker 1: Before.\n\nSpeaker 1: After.",
+      turns: [
+        {
+          id: "before-restart",
+          sequence: 0,
+          speaker: "Speaker 1",
+          segments: [{
+            id: "before-segment",
+            source_text: "Before.",
+            source_language: "en",
+            source_final: true,
+            translation: null,
+          }],
+        },
+        {
+          id: "after-restart",
+          sequence: 1,
+          speaker: "Speaker 1",
+          segments: [{
+            id: "after-segment",
+            source_text: "After.",
+            source_language: "en",
+            source_final: true,
+            translation: null,
+          }],
+        },
+      ],
+      markers: [{
+        id: "restart-1",
+        after_sequence: 0,
+        text: "Live captions restarted after a pause · 4 expected speakers · likely languages: en, bn, tr",
+      }],
+      finished: false,
+    }),
+  );
+  const liveItems = page.locator("#liveTranscript > *");
+  await expect(liveItems).toHaveCount(3);
+  await expect(liveItems.nth(0)).toContainText("Before.");
+  await expect(liveItems.nth(1)).toContainText("restarted after a pause");
+  await expect(liveItems.nth(2)).toContainText("After.");
+
+  await page.evaluate(() =>
+    window.__emitTauri("live-context:progress", {
+      stage: "sent",
+      detail: "Sent to STT; live captions resumed",
+      revision: 1,
+      language_hints: ["en", "bn", "tr"],
+      expected_speakers: 4,
+    }),
+  );
+  await expect(page.locator("#liveContextStatus")).toContainText("resumed");
+  await expect(page.locator("#activityLog")).toContainText("Live STT context sent");
+
+  await page.getByRole("button", { name: "Stop recording" }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.__mockQueuedSttContext()))
+    .toEqual({ language_hints: ["en", "bn", "tr"], expected_speakers: 4 });
+});
+
 test("an unavailable saved target stays visible for correction", async ({ page }) => {
   await page.evaluate(() => window.__setMockPreferredLanguage("xx"));
   await page.getByRole("button", { name: "Settings" }).click();
@@ -1158,8 +2211,17 @@ test("an unavailable live target keeps original captions and reports the warning
       status: "Live",
       text: "Speaker 1: Original speech continues",
       final_text: "",
-      translated_text: "",
-      translated_final_text: "",
+      passages: [
+        {
+          id: "live-passage-0",
+          sequence: 0,
+          speaker: "Speaker 1",
+          source_text: "Original speech continues",
+          source_language: "en",
+          source_final: false,
+          translation: null,
+        },
+      ],
       target_language: null,
       translation_warning:
         "Preferred language XX is unavailable for live STT translation. Original live captions will continue.",
@@ -1169,7 +2231,7 @@ test("an unavailable live target keeps original captions and reports the warning
   );
 
   await expect(page.getByText("Speaker 1: Original speech continues", { exact: true })).toBeVisible();
-  await expect(page.locator("#liveTranslationSection")).toBeHidden();
+  await expect(page.locator("[data-live-caption-translation]")).toHaveCount(0);
   await expect(page.locator("#activityLog")).toContainText("Original live captions will continue");
 });
 

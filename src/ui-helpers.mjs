@@ -52,6 +52,200 @@ export function normalizePreferredLanguage(value, fallback = "en") {
   return parseLanguageHints(value)[0] || fallback;
 }
 
+export function normalizeLiveCaptionLanguage(value) {
+  const language = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replaceAll("_", "-")
+    .split("-")[0];
+  return /^[a-z]{2,3}$/.test(language) ? language : "";
+}
+
+export function normalizeLiveCaptionRevision(value) {
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision > 0 ? revision : 0;
+}
+
+export function isNewerLiveCaptionRevision(lastRevision, incomingRevision) {
+  const incoming = normalizeLiveCaptionRevision(incomingRevision);
+  return incoming === 0 || incoming > normalizeLiveCaptionRevision(lastRevision);
+}
+
+export const LIVE_CAPTION_LANGUAGE_PALETTE = [
+  { background: "#edf7f2", foreground: "#2d6957" },
+  { background: "#edf4f8", foreground: "#37677f" },
+  { background: "#f8f2e9", foreground: "#86622d" },
+  { background: "#f5eef7", foreground: "#785776" },
+  { background: "#faefed", foreground: "#8a5148" },
+  { background: "#eaf7f6", foreground: "#2f6f6b" },
+  { background: "#eef0fa", foreground: "#4d5f8c" },
+  { background: "#f4f6e9", foreground: "#66713d" },
+];
+
+export function liveCaptionLanguageStyle(slot) {
+  const normalizedSlot = Math.max(0, Math.trunc(Number(slot) || 0));
+  const paletteStyle = LIVE_CAPTION_LANGUAGE_PALETTE[normalizedSlot];
+  if (paletteStyle) {
+    return {
+      background: paletteStyle.background,
+      foreground: paletteStyle.foreground,
+      border: paletteStyle.foreground,
+    };
+  }
+  const hue = (normalizedSlot * 137.508 + 150) % 360;
+  const hueText = Number(hue.toFixed(3));
+  return {
+    background: `hsl(${hueText} 38% 95%)`,
+    foreground: `hsl(${hueText} 35% 33%)`,
+    border: `hsl(${hueText} 35% 33%)`,
+  };
+}
+
+export function normalizeLiveCaptionPassages(passages) {
+  const seen = new Set();
+  return (passages || [])
+    .map((passage, index) => {
+      const id = String(passage?.id || "live-passage-" + index).trim();
+      const sourceText = String(passage?.source_text || "").trim();
+      const translationText = String(passage?.translation?.text || "").trim();
+      const sourceLanguage = normalizeLiveCaptionLanguage(passage?.source_language);
+      const translationSourceLanguage = normalizeLiveCaptionLanguage(
+        passage?.translation?.source_language,
+      );
+      return {
+        id,
+        sequence: Number.isFinite(Number(passage?.sequence))
+          ? Number(passage.sequence)
+          : index,
+        order: index,
+        speaker: String(passage?.speaker || "").trim(),
+        sourceText,
+        sourceLanguage,
+        sourceFinal: Boolean(passage?.source_final),
+        translation:
+          translationText && sourceLanguage && translationSourceLanguage === sourceLanguage
+            ? {
+                text: translationText,
+                sourceLanguage,
+                final: Boolean(passage.translation?.is_final),
+              }
+            : null,
+      };
+    })
+    .filter((passage) => passage.id && passage.sourceText && !seen.has(passage.id) && seen.add(passage.id))
+    .sort((left, right) => left.sequence - right.sequence || left.order - right.order);
+}
+
+function joinLiveCaptionText(left, right) {
+  const first = String(left || "").trim();
+  const second = String(right || "").trim();
+  if (!first) return second;
+  if (!second) return first;
+  return first + " " + second;
+}
+
+function normalizeLiveCaptionSegment(segment, index) {
+  const id = String(segment?.id || "live-segment-" + index).trim();
+  const sourceText = String(segment?.source_text || "").trim();
+  const sourceLanguage = normalizeLiveCaptionLanguage(segment?.source_language);
+  const translationText = String(segment?.translation?.text || "").trim();
+  const translationSourceLanguage = normalizeLiveCaptionLanguage(
+    segment?.translation?.source_language,
+  );
+  return {
+    id,
+    order: index,
+    sourceText,
+    sourceLanguage,
+    sourceFinal: Boolean(segment?.source_final),
+    translation:
+      translationText && sourceLanguage && translationSourceLanguage === sourceLanguage
+        ? {
+            text: translationText,
+            sourceLanguage,
+            final: Boolean(segment.translation?.is_final),
+          }
+        : null,
+  };
+}
+
+export function normalizeLiveCaptionTurns(turns) {
+  const seen = new Set();
+  return (turns || [])
+    .map((turn, index) => {
+      const id = String(turn?.id || "live-turn-" + index).trim();
+      const segments = (turn?.segments || [])
+        .map(normalizeLiveCaptionSegment)
+        .filter((segment) => segment.id && segment.sourceText);
+      return {
+        id,
+        sequence: Number.isFinite(Number(turn?.sequence)) ? Number(turn.sequence) : index,
+        order: index,
+        speaker: String(turn?.speaker || "").trim(),
+        segments,
+      };
+    })
+    .filter((turn) => turn.id && turn.segments.length && !seen.has(turn.id) && seen.add(turn.id))
+    .sort((left, right) => left.sequence - right.sequence || left.order - right.order);
+}
+
+export function liveCaptionTurnsFromPassages(passages) {
+  return normalizeLiveCaptionPassages(passages).map((passage) => ({
+    id: passage.id,
+    sequence: passage.sequence,
+    speaker: passage.speaker,
+    segments: [
+      {
+        id: passage.id + "-segment",
+        source_text: passage.sourceText,
+        source_language: passage.sourceLanguage,
+        source_final: passage.sourceFinal,
+        translation: passage.translation
+          ? {
+              text: passage.translation.text,
+              source_language: passage.translation.sourceLanguage,
+              is_final: passage.translation.final,
+            }
+          : null,
+      },
+    ],
+  }));
+}
+
+export function buildLiveCaptionDisplayRuns(turn) {
+  const appendRun = (runs, language, text, translated) => {
+    const last = runs.at(-1);
+    if (last && last.language === language) {
+      last.text = joinLiveCaptionText(last.text, text);
+      last.translated = last.translated || translated;
+      return;
+    }
+    runs.push({ language, text: String(text || "").trim(), translated: Boolean(translated) });
+  };
+  const sourceRuns = [];
+  const preferredRuns = [];
+  let hasTranslation = false;
+  for (const segment of turn?.segments || []) {
+    const language = normalizeLiveCaptionLanguage(segment?.sourceLanguage || segment?.source_language);
+    const sourceText = String(segment?.sourceText || segment?.source_text || "").trim();
+    if (!sourceText) continue;
+    const translation = segment?.translation;
+    const translationText = String(translation?.text || "").trim();
+    const translationLanguage = normalizeLiveCaptionLanguage(
+      translation?.sourceLanguage || translation?.source_language,
+    );
+    const safelyTranslated = Boolean(translationText && language && translationLanguage === language);
+    appendRun(sourceRuns, language, sourceText, false);
+    appendRun(preferredRuns, language, safelyTranslated ? translationText : sourceText, safelyTranslated);
+    hasTranslation = hasTranslation || safelyTranslated;
+  }
+  return {
+    sourceRuns,
+    preferredRuns: hasTranslation ? preferredRuns : [],
+    hasTranslation,
+  };
+}
+
 export function parseNoTranslationLanguages(value, preferredLanguage = "en") {
   const preferred = normalizePreferredLanguage(preferredLanguage);
   return parseLanguageHints(value).filter((language) => language !== preferred);

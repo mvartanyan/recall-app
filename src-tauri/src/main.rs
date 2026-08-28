@@ -1,10 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::Duration,
@@ -18,7 +19,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, SampleFormat, StreamConfig,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     image::Image,
     menu::{MenuBuilder, MenuId, MenuItem},
@@ -38,11 +39,14 @@ mod openai;
 mod recap;
 mod soniox;
 mod state;
+mod vad;
 
 use config::AppConfig;
 use db::{
     AgendaMetadata, AgendaRecord, Crypto, Db, ImportedSessionArtifact, RecapRecord, RecapSave,
-    SegmentRecord, Session, SessionSummary, Speaker, StoredEmbedding, VoiceMatchDecisionSave,
+    SegmentRecord, Session, SessionSummary, SessionVoiceGroup, SessionVoiceGroupSave, Speaker,
+    StoredEmbedding, VoiceGroupSplitResult, VoiceMatchDecisionSave, VoiceObservationSave,
+    VoiceRecognitionResetPreview, VoiceRecognitionResetResult,
 };
 use embedding::EMBEDDING_VERSION;
 use jamie_import::{JamieImportDraft, JamieImportPreview};
@@ -56,9 +60,15 @@ const SAMPLE_EDGE_TRIM_MS: u64 = 350;
 const SAMPLE_WINDOW_MS: u64 = 4_000;
 const SAMPLE_OVERLAP_TOLERANCE_MS: u64 = 200;
 const MAX_SAMPLE_WINDOWS_PER_SPEAKER: usize = 8;
-const MIN_SAMPLE_RMS: f32 = 0.002;
 const SAMPLE_CONSISTENCY_THRESHOLD: f32 = 0.90;
-const SAME_VOICE_SPLIT_THRESHOLD: f32 = 0.97;
+const SAME_VOICE_SPLIT_THRESHOLD: f32 = 0.995;
+const MIN_COALESCE_WINDOWS_PER_LABEL: usize = 2;
+const MIN_COALESCE_DURATION_MS_PER_LABEL: u64 = 6_000;
+const MIN_COALESCE_CONSISTENCY: f32 = 0.95;
+const SPLIT_WITHIN_CLUSTER_THRESHOLD: f32 = 0.94;
+const SPLIT_BETWEEN_CLUSTER_MAX: f32 = 0.90;
+const MIN_SPLIT_INTERVENTIONS_PER_CLUSTER: usize = 2;
+const MIN_SPLIT_SPEECH_MS_PER_CLUSTER: u64 = 6_000;
 const MATCH_THRESHOLD: f32 = 0.94;
 const STRONG_MATCH_THRESHOLD: f32 = 0.97;
 const STRONG_MATCH_MARGIN: f32 = 0.03;
@@ -118,11 +128,20 @@ struct VoiceObservation {
 }
 
 #[derive(Debug, Clone)]
-struct SampleWindow {
-    #[cfg(test)]
+struct InterventionVoiceObservation {
+    segment_index: usize,
     start_ms: u64,
-    #[cfg(test)]
     end_ms: u64,
+    embedding: Vec<f32>,
+    selected_duration_ms: u64,
+    consistency_score: f32,
+}
+
+#[derive(Debug, Clone)]
+struct SampleWindow {
+    start_ms: u64,
+    end_ms: u64,
+    segment_index: usize,
     pcm: Vec<f32>,
 }
 
@@ -130,6 +149,13 @@ struct SampleWindow {
 struct VoiceObservationGroup {
     observation_indices: Vec<usize>,
     embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct VoiceGroupAssignment {
+    speaker_id: Option<String>,
+    display_label: String,
+    group_id: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -164,6 +190,66 @@ struct RecordingStarted {
     device_name: String,
     sample_rate: u32,
     live_started: bool,
+    stt_context: MeetingSttContext,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RecordingStopped {
+    path: String,
+    stt_context: MeetingSttContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MeetingSttContext {
+    language_hints: Vec<String>,
+    expected_speakers: Option<u8>,
+}
+
+impl MeetingSttContext {
+    fn normalized(self) -> Result<Self, String> {
+        if self
+            .expected_speakers
+            .is_some_and(|count| !(1..=15).contains(&count))
+        {
+            return Err("Expected speakers must be between 1 and 15".into());
+        }
+        let mut seen = HashSet::new();
+        let mut language_hints = Vec::new();
+        let mut unsupported = Vec::new();
+        for raw in self.language_hints {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Some(normalized) = soniox::normalize_language_hint(trimmed) else {
+                unsupported.push(trimmed.to_string());
+                continue;
+            };
+            if seen.insert(normalized.clone()) {
+                language_hints.push(normalized);
+            }
+        }
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "Unsupported language hint{}: {}",
+                if unsupported.len() == 1 { "" } else { "s" },
+                unsupported.join(", ")
+            ));
+        }
+        Ok(Self {
+            language_hints,
+            expected_speakers: self.expected_speakers,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LiveContextUpdate {
+    stt_context: MeetingSttContext,
+    changed: bool,
+    live_restart_pending: bool,
+    revision: u64,
+    delivery_status: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -184,6 +270,19 @@ struct AppStatus {
     selected_input_device: Option<String>,
     language_hints: Vec<String>,
     live_transcription: bool,
+    current_stt_context: Option<MeetingSttContext>,
+    live_recording_active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreferenceUpdate {
+    selected_input_device: Option<String>,
+    language_hints: Vec<String>,
+    live_transcription: bool,
+    openai_model: String,
+    preferred_language: String,
+    no_translation_languages: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,8 +299,16 @@ struct RecapStateView {
 struct ConversationPayload {
     session: Session,
     segments: Vec<SegmentRecord>,
+    voice_groups: Vec<SessionVoiceGroup>,
     recap_state: RecapStateView,
     imported_artifact: Option<ImportedSessionArtifact>,
+}
+
+#[derive(Debug, Serialize)]
+struct VoiceRecognitionResetReadiness {
+    preview: VoiceRecognitionResetPreview,
+    can_reset: bool,
+    blockers: Vec<String>,
 }
 
 struct RecapSnapshot {
@@ -231,6 +338,15 @@ impl AudioClip {
 struct Recorder {
     stop_tx: Option<mpsc::Sender<()>>,
     handle: Option<JoinHandle<Result<PathBuf, String>>>,
+    live_tx: Option<tokio_mpsc::UnboundedSender<LiveAudioMessage>>,
+    stt_context: Arc<Mutex<MeetingSttContext>>,
+    stt_context_revision: AtomicU64,
+}
+
+#[derive(Debug)]
+struct LiveRecordingConfig {
+    api_key: String,
+    options: soniox::RealtimeOptions,
 }
 
 #[derive(Default)]
@@ -242,7 +358,8 @@ impl RecordingManager {
     fn start(
         &self,
         requested_device: Option<&str>,
-        live: Option<(String, Vec<String>, String, Vec<String>)>,
+        stt_context: MeetingSttContext,
+        live: Option<LiveRecordingConfig>,
         app_handle: tauri::AppHandle,
     ) -> Result<RecordingStarted, String> {
         let mut guard = self.current.lock().map_err(|_| "Recording lock poisoned")?;
@@ -269,29 +386,27 @@ impl RecordingManager {
         let output_for_result = output.clone();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-        let live_tx = live.map(
-            |(api_key, language_hints, preferred_language, no_translation_languages)| {
-                let (tx, rx) = tokio_mpsc::unbounded_channel();
-                let handle = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = soniox::run_realtime(
-                        api_key,
-                        language_hints,
-                        preferred_language,
-                        no_translation_languages,
-                        sample_rate,
-                        rx,
-                        handle.clone(),
-                    )
-                    .await
-                    {
-                        soniox::emit_realtime_error(&handle, error);
-                    }
-                });
-                tx
-            },
-        );
+        let stt_context_state = Arc::new(Mutex::new(stt_context.clone()));
+        let live_tx = live.map(|live| {
+            let (tx, rx) = tokio_mpsc::unbounded_channel();
+            let handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = soniox::run_realtime(
+                    live.api_key,
+                    live.options,
+                    sample_rate,
+                    rx,
+                    handle.clone(),
+                )
+                .await
+                {
+                    soniox::emit_realtime_error(&handle, error);
+                }
+            });
+            tx
+        });
         let live_started = live_tx.is_some();
+        let thread_live_tx = live_tx.clone();
 
         let output_for_thread = output.clone();
         let callback_handle = app_handle.clone();
@@ -313,7 +428,7 @@ impl RecordingManager {
             let stream = match sample_format {
                 SampleFormat::F32 => {
                     let writer_tx = data_tx.clone();
-                    let live_tx = live_tx.clone();
+                    let live_tx = thread_live_tx.clone();
                     let handle = callback_handle.clone();
                     let counter = meter_counter.clone();
                     device
@@ -335,7 +450,7 @@ impl RecordingManager {
                 }
                 SampleFormat::I16 => {
                     let writer_tx = data_tx.clone();
-                    let live_tx = live_tx.clone();
+                    let live_tx = thread_live_tx.clone();
                     let handle = callback_handle.clone();
                     let counter = meter_counter.clone();
                     device
@@ -357,7 +472,7 @@ impl RecordingManager {
                 }
                 SampleFormat::U16 => {
                     let writer_tx = data_tx.clone();
-                    let live_tx = live_tx.clone();
+                    let live_tx = thread_live_tx.clone();
                     let handle = callback_handle.clone();
                     let counter = meter_counter.clone();
                     device
@@ -403,7 +518,7 @@ impl RecordingManager {
             drop(stream);
             thread::sleep(Duration::from_millis(30));
             drop(data_tx);
-            if let Some(live_tx) = live_tx {
+            if let Some(live_tx) = thread_live_tx {
                 let _ = live_tx.send(LiveAudioMessage::Finish);
             }
             writer
@@ -415,29 +530,92 @@ impl RecordingManager {
         *guard = Some(Recorder {
             stop_tx: Some(stop_tx),
             handle: Some(handle),
+            live_tx,
+            stt_context: stt_context_state,
+            stt_context_revision: AtomicU64::new(0),
         });
         Ok(RecordingStarted {
             path: output_for_result.to_string_lossy().to_string(),
             device_name,
             sample_rate,
             live_started,
+            stt_context,
         })
     }
 
-    fn stop(&self) -> Result<PathBuf, String> {
+    fn stop(&self) -> Result<RecordingStopped, String> {
         let mut guard = self.current.lock().map_err(|_| "Recording lock poisoned")?;
         let mut recorder = guard
             .take()
             .ok_or_else(|| "There is no active recording".to_string())?;
+        let stt_context = recorder
+            .stt_context
+            .lock()
+            .map_err(|_| "Recording context lock poisoned")?
+            .clone();
         if let Some(tx) = recorder.stop_tx.take() {
             let _ = tx.send(());
         }
-        recorder
+        let path = recorder
             .handle
             .take()
             .ok_or_else(|| "Recording worker is missing".to_string())?
             .join()
-            .map_err(|_| "Recording worker stopped unexpectedly".to_string())?
+            .map_err(|_| "Recording worker stopped unexpectedly".to_string())??;
+        Ok(RecordingStopped {
+            path: path.to_string_lossy().to_string(),
+            stt_context,
+        })
+    }
+
+    fn update_stt_context(
+        &self,
+        stt_context: MeetingSttContext,
+    ) -> Result<LiveContextUpdate, String> {
+        let guard = self.current.lock().map_err(|_| "Recording lock poisoned")?;
+        let recorder = guard
+            .as_ref()
+            .ok_or_else(|| "There is no active recording".to_string())?;
+        let mut current = recorder
+            .stt_context
+            .lock()
+            .map_err(|_| "Recording context lock poisoned")?;
+        let changed = *current != stt_context;
+        if changed {
+            *current = stt_context.clone();
+        }
+        let revision = if changed {
+            recorder
+                .stt_context_revision
+                .fetch_add(1, AtomicOrdering::Relaxed)
+                + 1
+        } else {
+            recorder.stt_context_revision.load(AtomicOrdering::Relaxed)
+        };
+        let live_restart_pending = changed
+            && recorder.live_tx.as_ref().is_some_and(|live_tx| {
+                live_tx
+                    .send(LiveAudioMessage::Reconfigure {
+                        revision,
+                        language_hints: stt_context.language_hints.clone(),
+                        expected_speakers: stt_context.expected_speakers,
+                    })
+                    .is_ok()
+            });
+        let delivery_status = if !changed {
+            "unchanged"
+        } else if live_restart_pending {
+            "pending"
+        } else {
+            "saved_for_final"
+        };
+        Ok(LiveContextUpdate {
+            stt_context,
+            changed,
+            live_restart_pending,
+            revision,
+            delivery_status: delivery_status.into(),
+        })
     }
 
     fn is_recording(&self) -> bool {
@@ -445,6 +623,13 @@ impl RecordingManager {
             .lock()
             .map(|guard| guard.is_some())
             .unwrap_or(false)
+    }
+
+    fn current_stt_context(&self) -> Option<(MeetingSttContext, bool)> {
+        let guard = self.current.lock().ok()?;
+        let recorder = guard.as_ref()?;
+        let context = recorder.stt_context.lock().ok()?.clone();
+        Some((context, recorder.live_tx.is_some()))
     }
 }
 
@@ -589,6 +774,15 @@ fn start_recording_impl(
     app_handle: tauri::AppHandle,
     input_device: Option<String>,
 ) -> Result<RecordingStarted, String> {
+    let maintenance = app_state
+        .maintenance_in_flight
+        .lock()
+        .map_err(|_| "Maintenance lock poisoned".to_string())?;
+    if *maintenance {
+        return Err(
+            "Voice recognition maintenance is running. Start recording when it finishes.".into(),
+        );
+    }
     let api_key = app_state.load_soniox_key()?;
     let config = app_state
         .config
@@ -596,14 +790,23 @@ fn start_recording_impl(
         .map_err(|_| "Configuration lock poisoned")?
         .clone();
     let requested = input_device.or(config.selected_input_device.clone());
+    let stt_context = MeetingSttContext {
+        language_hints: config.language_hints.clone(),
+        expected_speakers: None,
+    }
+    .normalized()?;
     app_state.reset_live_transcript(config.live_transcription)?;
-    let live = config.live_transcription.then_some((
+    let live = config.live_transcription.then_some(LiveRecordingConfig {
         api_key,
-        config.language_hints.clone(),
-        config.preferred_language.clone(),
-        config.no_translation_languages.clone(),
-    ));
-    let started = manager.start(requested.as_deref(), live, app_handle.clone())?;
+        options: soniox::RealtimeOptions {
+            language_hints: stt_context.language_hints.clone(),
+            expected_speakers: stt_context.expected_speakers,
+            preferred_language: config.preferred_language.clone(),
+            no_translation_languages: config.no_translation_languages.clone(),
+        },
+    });
+    let started = manager.start(requested.as_deref(), stt_context, live, app_handle.clone())?;
+    drop(maintenance);
     let _ = app_handle.emit("recording:started", started.clone());
     Ok(started)
 }
@@ -622,11 +825,18 @@ fn start_recording(
 fn stop_recording(
     manager: State<RecordingManager>,
     app_handle: tauri::AppHandle,
-) -> Result<String, String> {
-    let path = manager.stop()?;
-    let path_string = path.to_string_lossy().to_string();
-    let _ = app_handle.emit("recording:stopped", path_string.clone());
-    Ok(path_string)
+) -> Result<RecordingStopped, String> {
+    let stopped = manager.stop()?;
+    let _ = app_handle.emit("recording:stopped", stopped.clone());
+    Ok(stopped)
+}
+
+#[tauri::command]
+fn update_live_context(
+    stt_context: MeetingSttContext,
+    manager: State<RecordingManager>,
+) -> Result<LiveContextUpdate, String> {
+    manager.update_stt_context(stt_context.normalized()?)
 }
 
 fn live_transcript_fallback(app_state: &AppState) -> String {
@@ -767,6 +977,7 @@ fn transcribe_file_inner(
     path: &str,
     session_id: &str,
     draft_transcript: &str,
+    stt_context: &MeetingSttContext,
     app_state: &AppState,
     app_handle: &tauri::AppHandle,
     run_id: &str,
@@ -778,16 +989,11 @@ fn transcribe_file_inner(
         Some(run_id),
     );
     let api_key = app_state.load_soniox_key()?;
-    let language_hints = app_state
-        .config
-        .lock()
-        .map_err(|_| "Configuration lock poisoned")?
-        .language_hints
-        .clone();
     let result = soniox::transcribe_file(
         Path::new(path),
         &api_key,
-        &language_hints,
+        &stt_context.language_hints,
+        stt_context.expected_speakers,
         |stage, detail| emit_progress(app_handle, stage, Some(detail), Some(run_id)),
     )?;
     emit_progress(
@@ -812,6 +1018,66 @@ fn transcribe_file_inner(
         &audio,
     ));
     let db = app_state.db_handle()?;
+
+    emit_progress(
+        app_handle,
+        "vad:start",
+        Some("Detecting speech locally before speaker fingerprinting".into()),
+        Some(run_id),
+    );
+    let speech_intervals = {
+        let loaded = app_state
+            .vad
+            .lock()
+            .map_err(|_| "VAD model lock poisoned")?
+            .is_some();
+        if !loaded {
+            if let Err(error) = app_state.load_vad() {
+                emit_progress(
+                    app_handle,
+                    "vad:warning",
+                    Some(format!(
+                        "Speech detection unavailable: {error}. Speaker labels will remain meeting-local."
+                    )),
+                    Some(run_id),
+                );
+            }
+        }
+        let detector = app_state
+            .vad
+            .lock()
+            .map_err(|_| "VAD model lock poisoned")?;
+        match detector.as_ref() {
+            Some(detector) => match detector.speech_intervals(&audio.samples, audio.sample_rate) {
+                Ok(intervals) => {
+                    emit_progress(
+                        app_handle,
+                        "vad:done",
+                        Some(format!(
+                            "Detected {:.1} seconds of speech in {} interval{}",
+                            vad::total_duration(&intervals) as f64 / 1_000.0,
+                            intervals.len(),
+                            if intervals.len() == 1 { "" } else { "s" }
+                        )),
+                        Some(run_id),
+                    );
+                    Some(intervals)
+                }
+                Err(error) => {
+                    emit_progress(
+                        app_handle,
+                        "vad:warning",
+                        Some(format!(
+                            "Speech detection failed: {error}. Speaker labels will remain meeting-local."
+                        )),
+                        Some(run_id),
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    };
 
     emit_progress(
         app_handle,
@@ -855,11 +1121,21 @@ fn transcribe_file_inner(
             session_id,
             &db,
             embedder.as_ref(),
+            speech_intervals.as_deref(),
             app_handle,
             run_id,
         )?;
     } else {
-        process_segments(&audio, &segments, session_id, &db, None, app_handle, run_id)?;
+        process_segments(
+            &audio,
+            &segments,
+            session_id,
+            &db,
+            None,
+            speech_intervals.as_deref(),
+            app_handle,
+            run_id,
+        )?;
     }
     emit_progress(
         app_handle,
@@ -894,6 +1170,7 @@ fn spawn_transcription_worker(
     path: String,
     session_id: String,
     draft_transcript: String,
+    stt_context: MeetingSttContext,
     state: AppState,
     app_handle: tauri::AppHandle,
     run_id: String,
@@ -903,6 +1180,7 @@ fn spawn_transcription_worker(
             &path,
             &session_id,
             &draft_transcript,
+            &stt_context,
             &state,
             &app_handle,
             &run_id,
@@ -971,9 +1249,21 @@ fn spawn_transcription_worker(
 
 fn queue_transcription(
     path: String,
+    stt_context: MeetingSttContext,
     state: AppState,
     app_handle: tauri::AppHandle,
 ) -> Result<QueuedTranscription, String> {
+    let maintenance = state
+        .maintenance_in_flight
+        .lock()
+        .map_err(|_| "Maintenance lock poisoned".to_string())?;
+    if *maintenance {
+        return Err(
+            "Voice recognition maintenance is running. Final processing can start when it finishes."
+                .into(),
+        );
+    }
+    let stt_context = stt_context.normalized()?;
     let source = Path::new(&path);
     if !source.is_file() {
         return Err("Recording file does not exist".into());
@@ -1002,13 +1292,15 @@ fn queue_transcription(
             let durable_error = format!(
                 "The recording reached recovery storage but local verification failed: {error}"
             );
-            if let Err(database_error) = db.create_processing_session(
+            if let Err(database_error) = db.create_processing_session_with_context(
                 &session_id,
                 &run_id,
                 &title,
                 &draft_transcript,
                 0,
                 &expected_path.to_string_lossy(),
+                &stt_context.language_hints,
+                stt_context.expected_speakers,
             ) {
                 let combined = format!(
                     "{durable_error}. The recording remains at {}, but its conversation row could not be created: {database_error}",
@@ -1040,13 +1332,15 @@ fn queue_transcription(
     };
     let duration_result = wav_duration_ms(&retained_path);
     let duration_ms = duration_result.as_ref().copied().unwrap_or(0);
-    if let Err(error) = db.create_processing_session(
+    if let Err(error) = db.create_processing_session_with_context(
         &session_id,
         &run_id,
         &title,
         &draft_transcript,
         duration_ms,
         &retained_path.to_string_lossy(),
+        &stt_context.language_hints,
+        stt_context.expected_speakers,
     ) {
         let message = format!(
             "The recording is safe at {}, but Recall could not create its conversation record: {error}",
@@ -1084,10 +1378,12 @@ fn queue_transcription(
         Some("Final transcription queued".into()),
         Some(&run_id),
     );
+    drop(maintenance);
     spawn_transcription_worker(
         retained_path.to_string_lossy().to_string(),
         session_id.clone(),
         draft_transcript,
+        stt_context,
         state,
         app_handle,
         run_id.clone(),
@@ -1098,10 +1394,11 @@ fn queue_transcription(
 #[tauri::command]
 fn transcribe_file_async(
     path: String,
+    stt_context: MeetingSttContext,
     app_state: State<AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QueuedTranscription, String> {
-    queue_transcription(path, app_state.inner().clone(), app_handle)
+    queue_transcription(path, stt_context, app_state.inner().clone(), app_handle)
 }
 
 #[tauri::command]
@@ -1110,6 +1407,13 @@ fn retry_processing(
     app_state: State<AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<QueuedTranscription, String> {
+    let maintenance = app_state
+        .maintenance_in_flight
+        .lock()
+        .map_err(|_| "Maintenance lock poisoned".to_string())?;
+    if *maintenance {
+        return Err("Voice recognition maintenance is running. Retry when it finishes.".into());
+    }
     let db = app_state.db_handle()?;
     let job = db
         .processing_job(&session_id)?
@@ -1133,10 +1437,15 @@ fn retry_processing(
         Some("Retrying final transcription from the retained recording".into()),
         Some(&run_id),
     );
+    drop(maintenance);
     spawn_transcription_worker(
         job.audio_path,
         session_id.clone(),
         session.transcript,
+        MeetingSttContext {
+            language_hints: job.language_hints,
+            expected_speakers: job.expected_speakers,
+        },
         app_state.inner().clone(),
         app_handle,
         run_id.clone(),
@@ -1300,6 +1609,7 @@ fn ensure_sessions_not_recapping(
     app_state: &AppState,
     session_ids: &[String],
 ) -> Result<(), String> {
+    ensure_maintenance_not_running(app_state)?;
     let in_flight = app_state
         .recap_in_flight
         .lock()
@@ -1316,11 +1626,29 @@ fn ensure_sessions_not_recapping(
     Ok(())
 }
 
+fn ensure_maintenance_not_running(app_state: &AppState) -> Result<(), String> {
+    if *app_state
+        .maintenance_in_flight
+        .lock()
+        .map_err(|_| "Maintenance lock poisoned".to_string())?
+    {
+        return Err("Voice recognition maintenance is running. Try again when it finishes.".into());
+    }
+    Ok(())
+}
+
 fn ensure_session_not_recapping(app_state: &AppState, session_id: &str) -> Result<(), String> {
     ensure_sessions_not_recapping(app_state, &[session_id.to_string()])
 }
 
 fn claim_identity_sessions(app_state: &AppState, session_ids: &[String]) -> Result<(), String> {
+    let maintenance = app_state
+        .maintenance_in_flight
+        .lock()
+        .map_err(|_| "Maintenance lock poisoned".to_string())?;
+    if *maintenance {
+        return Err("Voice recognition maintenance is running. Try again when it finishes.".into());
+    }
     let recap_in_flight = app_state
         .recap_in_flight
         .lock()
@@ -1348,6 +1676,7 @@ fn claim_identity_sessions(app_state: &AppState, session_ids: &[String]) -> Resu
         );
     }
     identity_in_flight.extend(session_ids.iter().cloned());
+    drop(maintenance);
     Ok(())
 }
 
@@ -1380,14 +1709,8 @@ struct SampleWindowSet {
     windows: Vec<SampleWindow>,
     overlapping_segments: usize,
     short_segments: usize,
-    silent_windows: usize,
-}
-
-fn pcm_rms(pcm: &[f32]) -> f32 {
-    if pcm.is_empty() {
-        return 0.0;
-    }
-    (pcm.iter().map(|sample| sample * sample).sum::<f32>() / pcm.len() as f32).sqrt()
+    no_speech_segments: usize,
+    short_speech_intervals: usize,
 }
 
 fn overlaps_other_speaker(segment: &TranscriptSegment, segments: &[TranscriptSegment]) -> bool {
@@ -1416,16 +1739,21 @@ fn clean_sample_windows(
     audio: &AudioClip,
     segments: &[TranscriptSegment],
     diarized_speaker: &str,
+    speech_intervals: &[vad::SpeechInterval],
 ) -> SampleWindowSet {
     let mut speaker_segments = segments
         .iter()
-        .filter(|segment| segment.speaker == diarized_speaker && segment.end_ms > segment.start_ms)
+        .enumerate()
+        .filter(|(_, segment)| {
+            segment.speaker == diarized_speaker && segment.end_ms > segment.start_ms
+        })
         .collect::<Vec<_>>();
-    speaker_segments
-        .sort_by(|left, right| (right.end_ms - right.start_ms).cmp(&(left.end_ms - left.start_ms)));
+    speaker_segments.sort_by(|(_, left), (_, right)| {
+        (right.end_ms - right.start_ms).cmp(&(left.end_ms - left.start_ms))
+    });
     let mut result = SampleWindowSet::default();
 
-    for segment in speaker_segments {
+    for (segment_index, segment) in speaker_segments {
         if result.windows.len() >= MAX_SAMPLE_WINDOWS_PER_SPEAKER {
             break;
         }
@@ -1445,20 +1773,30 @@ fn clean_sample_windows(
             result.short_segments += 1;
             continue;
         }
-
-        let full_windows = safe_duration / SAMPLE_WINDOW_MS;
-        let mut ranges = if full_windows == 0 {
-            vec![(safe_start, safe_end)]
-        } else {
-            let used = full_windows * SAMPLE_WINDOW_MS;
-            let offset = (safe_duration - used) / 2;
-            (0..full_windows)
-                .map(|index| {
-                    let start = safe_start + offset + (index * SAMPLE_WINDOW_MS);
+        let speech = vad::intersections(speech_intervals, safe_start, safe_end);
+        if speech.is_empty() {
+            result.no_speech_segments += 1;
+            continue;
+        }
+        let mut ranges = Vec::new();
+        for interval in speech {
+            let speech_duration = interval.duration_ms();
+            if speech_duration < MIN_SPEAKER_MS {
+                result.short_speech_intervals += 1;
+                continue;
+            }
+            let full_windows = speech_duration / SAMPLE_WINDOW_MS;
+            if full_windows == 0 {
+                ranges.push((interval.start_ms, interval.end_ms));
+            } else {
+                let used = full_windows * SAMPLE_WINDOW_MS;
+                let offset = (speech_duration - used) / 2;
+                ranges.extend((0..full_windows).map(|index| {
+                    let start = interval.start_ms + offset + (index * SAMPLE_WINDOW_MS);
                     (start, start + SAMPLE_WINDOW_MS)
-                })
-                .collect::<Vec<_>>()
-        };
+                }));
+            }
+        }
         let segment_midpoint = segment.start_ms + (duration_ms / 2);
         ranges.sort_by_key(|(start, end)| (start + ((end - start) / 2)).abs_diff(segment_midpoint));
 
@@ -1469,15 +1807,10 @@ fn clean_sample_windows(
             let Some(pcm) = sample_range(audio, start_ms, end_ms) else {
                 continue;
             };
-            if pcm_rms(&pcm) < MIN_SAMPLE_RMS {
-                result.silent_windows += 1;
-                continue;
-            }
             result.windows.push(SampleWindow {
-                #[cfg(test)]
                 start_ms,
-                #[cfg(test)]
                 end_ms,
+                segment_index,
                 pcm,
             });
         }
@@ -1579,10 +1912,15 @@ fn group_voice_observations(observations: &[VoiceObservation]) -> Vec<VoiceObser
     for (index, observation) in observations.iter().enumerate() {
         let compatible_group = groups.iter().position(|group| {
             group.observation_indices.iter().all(|member| {
-                embedding::cosine_similarity(
-                    &observation.embedding,
-                    &observations[*member].embedding,
-                ) >= SAME_VOICE_SPLIT_THRESHOLD
+                let existing = &observations[*member];
+                observation.clean_window_count >= MIN_COALESCE_WINDOWS_PER_LABEL
+                    && existing.clean_window_count >= MIN_COALESCE_WINDOWS_PER_LABEL
+                    && observation.selected_duration_ms >= MIN_COALESCE_DURATION_MS_PER_LABEL
+                    && existing.selected_duration_ms >= MIN_COALESCE_DURATION_MS_PER_LABEL
+                    && observation.consistency_score >= MIN_COALESCE_CONSISTENCY
+                    && existing.consistency_score >= MIN_COALESCE_CONSISTENCY
+                    && embedding::cosine_similarity(&observation.embedding, &existing.embedding)
+                        >= SAME_VOICE_SPLIT_THRESHOLD
             })
         });
         if let Some(group_index) = compatible_group {
@@ -1603,12 +1941,163 @@ fn group_voice_observations(observations: &[VoiceObservation]) -> Vec<VoiceObser
     groups
 }
 
+fn intervention_observations(
+    embedded_windows: &[(SampleWindow, Vec<f32>)],
+    selected_indices: &[usize],
+) -> Vec<InterventionVoiceObservation> {
+    let mut grouped: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for index in selected_indices {
+        grouped
+            .entry(embedded_windows[*index].0.segment_index)
+            .or_default()
+            .push(*index);
+    }
+    grouped
+        .into_iter()
+        .filter_map(|(segment_index, indices)| {
+            let vectors = indices
+                .iter()
+                .map(|index| embedded_windows[*index].1.clone())
+                .collect::<Vec<_>>();
+            let embedding = average_embeddings(vectors.iter().cloned());
+            if embedding.is_empty() {
+                return None;
+            }
+            let start_ms = indices
+                .iter()
+                .map(|index| embedded_windows[*index].0.start_ms)
+                .min()?;
+            let end_ms = indices
+                .iter()
+                .map(|index| embedded_windows[*index].0.end_ms)
+                .max()?;
+            let selected_duration_ms = indices
+                .iter()
+                .map(|index| {
+                    embedded_windows[*index]
+                        .0
+                        .end_ms
+                        .saturating_sub(embedded_windows[*index].0.start_ms)
+                })
+                .sum();
+            Some(InterventionVoiceObservation {
+                segment_index,
+                start_ms,
+                end_ms,
+                embedding,
+                selected_duration_ms,
+                consistency_score: mean_pairwise_similarity(&vectors),
+            })
+        })
+        .collect()
+}
+
+fn suggested_split_clusters(
+    observations: &[InterventionVoiceObservation],
+) -> Option<Vec<Vec<usize>>> {
+    if observations.len() < MIN_SPLIT_INTERVENTIONS_PER_CLUSTER * 2 {
+        return None;
+    }
+    let mut farthest = None;
+    for left in 0..observations.len() {
+        for right in (left + 1)..observations.len() {
+            let score = embedding::cosine_similarity(
+                &observations[left].embedding,
+                &observations[right].embedding,
+            );
+            if farthest
+                .as_ref()
+                .map(|(_, _, current)| score < *current)
+                .unwrap_or(true)
+            {
+                farthest = Some((left, right, score));
+            }
+        }
+    }
+    let (left_seed, right_seed, seed_similarity) = farthest?;
+    if seed_similarity > SPLIT_BETWEEN_CLUSTER_MAX {
+        return None;
+    }
+    let mut left_centroid = observations[left_seed].embedding.clone();
+    let mut right_centroid = observations[right_seed].embedding.clone();
+    let mut assignments = vec![0usize; observations.len()];
+    for _ in 0..4 {
+        for (index, observation) in observations.iter().enumerate() {
+            let left = embedding::cosine_similarity(&observation.embedding, &left_centroid);
+            let right = embedding::cosine_similarity(&observation.embedding, &right_centroid);
+            assignments[index] = usize::from(right > left);
+        }
+        let left_vectors = observations
+            .iter()
+            .zip(&assignments)
+            .filter(|(_, assignment)| **assignment == 0)
+            .map(|(observation, _)| observation.embedding.clone());
+        let right_vectors = observations
+            .iter()
+            .zip(&assignments)
+            .filter(|(_, assignment)| **assignment == 1)
+            .map(|(observation, _)| observation.embedding.clone());
+        let next_left = average_embeddings(left_vectors);
+        let next_right = average_embeddings(right_vectors);
+        if next_left.is_empty() || next_right.is_empty() {
+            return None;
+        }
+        left_centroid = next_left;
+        right_centroid = next_right;
+    }
+    let clusters = [0usize, 1usize]
+        .into_iter()
+        .map(|cluster| {
+            observations
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| assignments[*index] == cluster)
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for cluster in &clusters {
+        if cluster.len() < MIN_SPLIT_INTERVENTIONS_PER_CLUSTER {
+            return None;
+        }
+        let duration = cluster
+            .iter()
+            .map(|index| observations[*index].selected_duration_ms)
+            .sum::<u64>();
+        if duration < MIN_SPLIT_SPEECH_MS_PER_CLUSTER {
+            return None;
+        }
+        let vectors = cluster
+            .iter()
+            .map(|index| observations[*index].embedding.clone())
+            .collect::<Vec<_>>();
+        if mean_pairwise_similarity(&vectors) < SPLIT_WITHIN_CLUSTER_THRESHOLD {
+            return None;
+        }
+    }
+    if embedding::cosine_similarity(&left_centroid, &right_centroid) > SPLIT_BETWEEN_CLUSTER_MAX {
+        return None;
+    }
+    Some(
+        clusters
+            .into_iter()
+            .map(|cluster| {
+                cluster
+                    .into_iter()
+                    .map(|index| observations[index].segment_index)
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
 fn process_segments(
     audio: &AudioClip,
     segments: &[TranscriptSegment],
     session_id: &str,
     db: &Db,
     embedder: Option<&embedding::Embedder>,
+    speech_intervals: Option<&[vad::SpeechInterval]>,
     app_handle: &tauri::AppHandle,
     run_id: &str,
 ) -> Result<(), String> {
@@ -1621,7 +2110,86 @@ fn process_segments(
         }
     }
     let mut observations = Vec::new();
-    let mut fallback_previews: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut intervention_observations_by_speaker: HashMap<
+        String,
+        Vec<InterventionVoiceObservation>,
+    > = HashMap::new();
+    let mut skipped_reasons: HashMap<String, String> = HashMap::new();
+
+    if embedder.is_none() || speech_intervals.is_none() {
+        let reason = if speech_intervals.is_none() {
+            "the local VAD model was unavailable, so Recall did not create a global voice profile"
+        } else {
+            "the local ECAPA model was unavailable, so Recall did not create a global voice profile"
+        };
+        let mut assignments = HashMap::new();
+        for diarized_speaker in ordered_speakers
+            .iter()
+            .filter(|label| label.as_str() != "unknown")
+        {
+            let group_id = db.insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id,
+                provider_speaker_label: diarized_speaker,
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_model_unavailable",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: None,
+            })?;
+            let provider_speakers = vec![diarized_speaker.clone()];
+            db.insert_voice_match_decision(&VoiceMatchDecisionSave {
+                session_id,
+                provider_speakers: &provider_speakers,
+                resulting_speaker_id: None,
+                best_speaker_id: None,
+                runner_up_speaker_id: None,
+                best_score: None,
+                runner_up_score: None,
+                support_count: 0,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: EMBEDDING_VERSION,
+                decision: VoiceMatchKind::Skipped.as_str(),
+                reason,
+            })?;
+            assignments.insert(
+                diarized_speaker.clone(),
+                VoiceGroupAssignment {
+                    speaker_id: None,
+                    display_label: diarized_speaker.clone(),
+                    group_id,
+                },
+            );
+        }
+        for segment in segments {
+            let assignment = assignments.get(&segment.speaker);
+            db.insert_segment_with_provenance(
+                session_id,
+                segment.start_ms as i64,
+                segment.end_ms as i64,
+                None,
+                assignment
+                    .map(|value| value.display_label.as_str())
+                    .or(Some("Unknown speaker")),
+                (segment.speaker != "unknown").then_some(segment.speaker.as_str()),
+                assignment.map(|value| value.group_id.as_str()),
+                segment.text.trim(),
+            )?;
+        }
+        emit_progress(
+            app_handle,
+            "voiceprint:skipped",
+            Some(reason.into()),
+            Some(run_id),
+        );
+        return Ok(());
+    }
+    let embedder = embedder.expect("checked above");
+    let speech_intervals = speech_intervals.expect("checked above");
 
     for diarized_speaker in &ordered_speakers {
         if diarized_speaker == "unknown" {
@@ -1633,36 +2201,25 @@ fn process_segments(
             );
             continue;
         }
-        let window_set = clean_sample_windows(audio, segments, diarized_speaker);
+        let window_set = clean_sample_windows(audio, segments, diarized_speaker, speech_intervals);
         if window_set.windows.is_empty() {
+            let reason = format!(
+                "no VAD-confirmed speech excerpt of at least {:.1} seconds ({} overlapping interventions, {} short interventions, {} without speech, {} short speech runs)",
+                MIN_SPEAKER_MS as f64 / 1_000.0,
+                window_set.overlapping_segments,
+                window_set.short_segments,
+                window_set.no_speech_segments,
+                window_set.short_speech_intervals,
+            );
+            skipped_reasons.insert(diarized_speaker.clone(), reason.clone());
             emit_progress(
                 app_handle,
                 "voiceprint:skipped",
-                Some(format!(
-                    "{diarized_speaker}: no clean central excerpt of at least {:.1} seconds; keeping the provider voice for manual review ({} overlapping, {} short, {} silent candidates)",
-                    MIN_SPEAKER_MS as f64 / 1_000.0,
-                    window_set.overlapping_segments,
-                    window_set.short_segments,
-                    window_set.silent_windows,
-                )),
+                Some(format!("{diarized_speaker}: {reason}; kept meeting-local")),
                 Some(run_id),
             );
             continue;
         }
-        if let Some(window) = window_set.windows.first() {
-            fallback_previews.insert(diarized_speaker.clone(), window.pcm.clone());
-        }
-        let Some(embedder) = embedder else {
-            emit_progress(
-                app_handle,
-                "voiceprint:warning",
-                Some(format!(
-                    "{diarized_speaker}: local ECAPA model is unavailable; keeping the provider voice for manual review"
-                )),
-                Some(run_id),
-            );
-            continue;
-        };
 
         let mut embedded_windows = Vec::new();
         for window in window_set.windows {
@@ -1682,33 +2239,44 @@ fn process_segments(
             .iter()
             .map(|(_, embedding)| embedding.clone())
             .collect::<Vec<_>>();
+        let all_window_indices = (0..embedded_windows.len()).collect::<Vec<_>>();
+        let intervention_observations =
+            intervention_observations(&embedded_windows, &all_window_indices);
+        if !intervention_observations.is_empty() {
+            intervention_observations_by_speaker
+                .insert(diarized_speaker.clone(), intervention_observations.clone());
+        }
         let consistent_indices = dominant_consistent_indices(&vectors);
         if consistent_indices.is_empty() {
+            let reason =
+                "VAD-confirmed excerpts were not internally consistent enough for a trusted voiceprint"
+                    .to_string();
+            skipped_reasons.insert(diarized_speaker.clone(), reason.clone());
             emit_progress(
                 app_handle,
                 "voiceprint:skipped",
-                Some(format!(
-                    "{diarized_speaker}: candidate excerpts were not acoustically consistent; keeping the provider voice for manual review without a trusted voiceprint"
-                )),
+                Some(format!("{diarized_speaker}: {reason}; kept meeting-local")),
                 Some(run_id),
             );
             continue;
         }
 
         let target_samples = ((audio.sample_rate as u64 * TARGET_SPEAKER_MS) / 1_000) as usize;
-        let mut pcm = Vec::with_capacity(target_samples);
+        let mut selected_samples_total = 0usize;
         let mut selected_windows = 0usize;
         let mut selected_ms = 0u64;
         let mut selected_vectors = Vec::new();
+        let mut selected_indices = Vec::new();
         for index in consistent_indices.iter().copied() {
             let window = &embedded_windows[index].0;
-            let remaining = target_samples.saturating_sub(pcm.len());
+            let remaining = target_samples.saturating_sub(selected_samples_total);
             if remaining == 0 {
                 break;
             }
             let selected_samples = remaining.min(window.pcm.len());
-            pcm.extend_from_slice(&window.pcm[..selected_samples]);
+            selected_samples_total += selected_samples;
             selected_vectors.push(embedded_windows[index].1.clone());
+            selected_indices.push(index);
             selected_windows += 1;
             selected_ms += if audio.sample_rate == 0 {
                 0
@@ -1719,7 +2287,7 @@ fn process_segments(
         let sample_duration_ms = if audio.sample_rate == 0 {
             0
         } else {
-            (pcm.len() as u64 * 1_000) / audio.sample_rate as u64
+            (selected_samples_total as u64 * 1_000) / audio.sample_rate as u64
         };
         if sample_duration_ms < MIN_SPEAKER_MS {
             emit_progress(
@@ -1746,6 +2314,12 @@ fn process_segments(
             continue;
         }
         let consistency_score = mean_pairwise_similarity(&selected_vectors);
+        let preview_pcm = selected_indices
+            .iter()
+            .map(|index| &embedded_windows[*index].0)
+            .max_by_key(|window| window.end_ms.saturating_sub(window.start_ms))
+            .map(|window| window.pcm.clone())
+            .unwrap_or_default();
         let consistency_rejections = embedded_windows.len() - consistent_indices.len();
         emit_progress(
             app_handle,
@@ -1757,11 +2331,12 @@ fn process_segments(
                 consistency_rejections,
                 window_set.overlapping_segments,
                 window_set.short_segments,
-                window_set.silent_windows,
+                window_set.no_speech_segments + window_set.short_speech_intervals,
                 if consistency_rejections
                     + window_set.overlapping_segments
                     + window_set.short_segments
-                    + window_set.silent_windows
+                    + window_set.no_speech_segments
+                    + window_set.short_speech_intervals
                     == 1
                 {
                     ""
@@ -1774,7 +2349,7 @@ fn process_segments(
 
         observations.push(VoiceObservation {
             diarized_speaker: diarized_speaker.clone(),
-            pcm,
+            pcm: preview_pcm,
             embedding,
             clean_window_count: selected_windows,
             selected_duration_ms: sample_duration_ms.min(selected_ms),
@@ -1788,7 +2363,7 @@ fn process_segments(
         .map(|group| classify_speaker_match(&group.embedding, &known))
         .collect::<Vec<_>>();
     resolve_unique_profile_matches(&mut candidates);
-    let mut mapping: HashMap<String, (String, String)> = HashMap::new();
+    let mut mapping: HashMap<String, VoiceGroupAssignment> = HashMap::new();
 
     for (group, candidate) in groups.into_iter().zip(candidates) {
         let representative_index = group
@@ -1931,8 +2506,34 @@ fn process_segments(
                 Some(run_id),
             );
         }
-        for diarized_speaker in diarized_speakers {
-            mapping.insert(diarized_speaker, (speaker_id.clone(), label.clone()));
+        let group_status = match candidate.kind {
+            VoiceMatchKind::Automatic => "automatic",
+            VoiceMatchKind::Suggested => "provisional_suggested",
+            VoiceMatchKind::New => "provisional_new",
+            VoiceMatchKind::Skipped => "meeting_local",
+        };
+        for observation_index in &group.observation_indices {
+            let observation = &observations[*observation_index];
+            let voice_group_id = db.insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id,
+                provider_speaker_label: &observation.diarized_speaker,
+                cluster_index: 0,
+                resulting_speaker_id: Some(&speaker_id),
+                status: group_status,
+                centroid: Some(&observation.embedding),
+                selected_duration_ms: observation.selected_duration_ms,
+                selected_window_count: observation.clean_window_count,
+                consistency_score: Some(observation.consistency_score),
+                model_version: Some(EMBEDDING_VERSION),
+            })?;
+            mapping.insert(
+                observation.diarized_speaker.clone(),
+                VoiceGroupAssignment {
+                    speaker_id: Some(speaker_id.clone()),
+                    display_label: label.clone(),
+                    group_id: voice_group_id,
+                },
+            );
         }
     }
 
@@ -1940,35 +2541,35 @@ fn process_segments(
         if diarized_speaker == "unknown" || mapping.contains_key(&diarized_speaker) {
             continue;
         }
-        let label = db.next_voice_label()?;
-        let speaker_id = db.insert_speaker(Some(&label))?;
-        if let Some(pcm) = fallback_previews.get(&diarized_speaker) {
-            let sample = encode_wav_base64(pcm, audio.sample_rate)?;
-            db.insert_sample(&speaker_id, &sample, audio.sample_rate)?;
-            emit_progress(
-                app_handle,
-                "voiceprint:sample:stored",
-                Some(format!(
-                    "Stored a temporary preview for {label}; no trusted voiceprint was created"
-                )),
-                Some(run_id),
-            );
-        }
+        let reason = skipped_reasons
+            .get(&diarized_speaker)
+            .cloned()
+            .unwrap_or_else(|| "no safe VAD-confirmed ECAPA observation was available".into());
+        let group_id = db.insert_session_voice_group(&SessionVoiceGroupSave {
+            session_id,
+            provider_speaker_label: &diarized_speaker,
+            cluster_index: 0,
+            resulting_speaker_id: None,
+            status: "meeting_local_no_safe_speech",
+            centroid: None,
+            selected_duration_ms: 0,
+            selected_window_count: 0,
+            consistency_score: None,
+            model_version: Some(EMBEDDING_VERSION),
+        })?;
         emit_progress(
             app_handle,
-            "voiceprint:new",
+            "voiceprint:meeting-local",
             Some(format!(
-                "{diarized_speaker} → {label} for manual review; no safe automatic match was available"
+                "{diarized_speaker}: no global VOICE profile or preview was created; {reason}"
             )),
             Some(run_id),
         );
         let provider_speakers = vec![diarized_speaker.clone()];
-        let reason =
-            "no safe ECAPA observation could be built from the available clean speech windows";
         db.insert_voice_match_decision(&VoiceMatchDecisionSave {
             session_id,
             provider_speakers: &provider_speakers,
-            resulting_speaker_id: Some(&speaker_id),
+            resulting_speaker_id: None,
             best_speaker_id: None,
             runner_up_speaker_id: None,
             best_score: None,
@@ -1979,23 +2580,77 @@ fn process_segments(
             consistency_score: None,
             model_version: EMBEDDING_VERSION,
             decision: VoiceMatchKind::Skipped.as_str(),
-            reason,
+            reason: &reason,
         })?;
-        mapping.insert(diarized_speaker, (speaker_id, label));
+        mapping.insert(
+            diarized_speaker.clone(),
+            VoiceGroupAssignment {
+                speaker_id: None,
+                display_label: diarized_speaker,
+                group_id,
+            },
+        );
     }
 
-    for segment in segments {
+    let mut segment_ids = HashMap::new();
+    for (segment_index, segment) in segments.iter().enumerate() {
         let mapped = mapping.get(&segment.speaker);
-        db.insert_segment(
+        let segment_id = db.insert_segment_with_provenance(
             session_id,
             segment.start_ms as i64,
             segment.end_ms as i64,
-            mapped.map(|value| value.0.as_str()),
+            mapped.and_then(|value| value.speaker_id.as_deref()),
             mapped
-                .map(|value| value.1.as_str())
+                .map(|value| value.display_label.as_str())
                 .or(Some("Unknown speaker")),
+            (segment.speaker != "unknown").then_some(segment.speaker.as_str()),
+            mapped.map(|value| value.group_id.as_str()),
             segment.text.trim(),
         )?;
+        segment_ids.insert(segment_index, segment_id);
+    }
+
+    for (diarized_speaker, interventions) in &intervention_observations_by_speaker {
+        let Some(assignment) = mapping.get(diarized_speaker) else {
+            continue;
+        };
+        for intervention in interventions {
+            let Some(segment_id) = segment_ids.get(&intervention.segment_index) else {
+                continue;
+            };
+            db.insert_voice_observation(&VoiceObservationSave {
+                voice_group_id: &assignment.group_id,
+                session_id,
+                segment_id,
+                start_ms: intervention.start_ms,
+                end_ms: intervention.end_ms,
+                vector: &intervention.embedding,
+                model_version: EMBEDDING_VERSION,
+                speech_duration_ms: intervention.selected_duration_ms,
+                consistency_score: intervention.consistency_score,
+            })?;
+        }
+        if let Some(clusters) = suggested_split_clusters(interventions) {
+            let persisted_clusters = clusters
+                .into_iter()
+                .map(|cluster| {
+                    cluster
+                        .into_iter()
+                        .filter_map(|segment_index| segment_ids.get(&segment_index).cloned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            db.set_voice_group_split_suggestion(&assignment.group_id, &persisted_clusters)?;
+            emit_progress(
+                app_handle,
+                "voiceprint:split:suggested",
+                Some(format!(
+                    "{} may contain multiple people; review the suggested intervention split",
+                    diarized_speaker
+                )),
+                Some(run_id),
+            );
+        }
     }
     Ok(())
 }
@@ -2261,14 +2916,17 @@ fn list_translation_languages() -> Vec<soniox::TranslationLanguage> {
 
 #[tauri::command]
 fn save_preferences(
-    selected_input_device: Option<String>,
-    language_hints: Vec<String>,
-    live_transcription: bool,
-    openai_model: String,
-    preferred_language: String,
-    no_translation_languages: Vec<String>,
+    preferences: PreferenceUpdate,
     app_state: State<AppState>,
 ) -> Result<(), String> {
+    let PreferenceUpdate {
+        selected_input_device,
+        language_hints,
+        live_transcription,
+        openai_model,
+        preferred_language,
+        no_translation_languages,
+    } = preferences;
     let openai_model = openai_model.trim();
     if openai_model.is_empty() {
         return Err("LLM model cannot be empty".into());
@@ -2365,6 +3023,7 @@ fn app_status(
         .lock()
         .map_err(|_| "Database lock poisoned")?
         .is_some();
+    let current_recording = manager.current_stt_context();
     Ok(AppStatus {
         encryption_enabled: config.encryption_enabled,
         db_open,
@@ -2376,6 +3035,12 @@ fn app_status(
         selected_input_device: config.selected_input_device,
         language_hints: config.language_hints,
         live_transcription: config.live_transcription,
+        current_stt_context: current_recording
+            .as_ref()
+            .map(|(context, _)| context.clone()),
+        live_recording_active: current_recording
+            .as_ref()
+            .is_some_and(|(_, live_active)| *live_active),
     })
 }
 
@@ -2441,10 +3106,14 @@ fn assign_segment_speaker(
     speaker_id: Option<String>,
     app_state: State<AppState>,
 ) -> Result<(), String> {
-    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     let db = app_state.db_handle()?;
-    db.assign_segment_speaker(&segment_id, speaker_id.as_deref())?;
-    refresh_session_transcript(&db, &session_id)
+    let sessions = vec![session_id.clone()];
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db
+        .assign_segment_speaker(&segment_id, speaker_id.as_deref())
+        .and_then(|_| refresh_session_transcript(&db, &session_id));
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
 }
 
 #[tauri::command]
@@ -2605,11 +3274,13 @@ fn load_conversation(
         .get_session(&session_id)?
         .ok_or_else(|| "Conversation not found".to_string())?;
     let segments = db.list_segments(&session_id)?;
+    let voice_groups = db.list_session_voice_groups(&session_id)?;
     let recap_state = recap_state_view_from(app_state.inner(), &db, &session, &segments)?;
     let imported_artifact = db.load_imported_session_artifact(&session_id)?;
     Ok(ConversationPayload {
         session,
         segments,
+        voice_groups,
         recap_state,
         imported_artifact,
     })
@@ -3027,6 +3698,16 @@ async fn generate_recap(
 ) -> Result<RecapStateView, String> {
     let app_state = app_state.inner().clone();
     {
+        let maintenance = app_state
+            .maintenance_in_flight
+            .lock()
+            .map_err(|_| "Maintenance lock poisoned".to_string())?;
+        if *maintenance {
+            return Err(
+                "Voice recognition maintenance is running. Start the recap when it finishes."
+                    .into(),
+            );
+        }
         let mut in_flight = app_state
             .recap_in_flight
             .lock()
@@ -3044,6 +3725,7 @@ async fn generate_recap(
         if !in_flight.insert(session_id.clone()) {
             return Err("A recap is already being generated for this conversation".into());
         }
+        drop(maintenance);
     }
     let result = generate_recap_inner(&session_id, allow_unresolved, &app_state, &app_handle).await;
     if let Ok(mut in_flight) = app_state.recap_in_flight.lock() {
@@ -3157,15 +3839,172 @@ fn list_session_ids_for_speakers(
 }
 
 #[tauri::command]
+async fn split_voice_group(
+    voice_group_id: String,
+    selected_segment_ids: Vec<String>,
+    app_state: State<'_, AppState>,
+) -> Result<VoiceGroupSplitResult, String> {
+    let state = app_state.inner().clone();
+    let db = state.db_handle()?;
+    let session_id = db
+        .voice_group_session_id(&voice_group_id)?
+        .ok_or_else(|| "Meeting voice group not found".to_string())?;
+    let sessions = vec![session_id];
+    claim_identity_sessions(&state, &sessions)?;
+    let result = match tauri::async_runtime::spawn_blocking(move || {
+        db.split_voice_group(&voice_group_id, &selected_segment_ids)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => Err(format!("Voice split stopped unexpectedly: {error}")),
+    };
+    release_identity_sessions(&state, &sessions);
+    result
+}
+
+#[tauri::command]
+fn dismiss_voice_group_split(
+    voice_group_id: String,
+    app_state: State<AppState>,
+) -> Result<(), String> {
+    let db = app_state.db_handle()?;
+    let session_id = db
+        .voice_group_session_id(&voice_group_id)?
+        .ok_or_else(|| "Meeting voice group not found".to_string())?;
+    let sessions = vec![session_id];
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db.dismiss_voice_group_split(&voice_group_id);
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
+}
+
+fn voice_recognition_reset_blockers(
+    manager: &RecordingManager,
+    app_state: &AppState,
+    db: &Db,
+    include_maintenance: bool,
+) -> Result<Vec<String>, String> {
+    let mut blockers = Vec::new();
+    if include_maintenance
+        && *app_state
+            .maintenance_in_flight
+            .lock()
+            .map_err(|_| "Maintenance lock poisoned".to_string())?
+    {
+        blockers.push("Another voice-recognition maintenance operation is running".into());
+    }
+    if manager.is_recording() {
+        blockers.push("A recording is active".into());
+    }
+    let processing = db.active_processing_job_count()?;
+    if processing > 0 {
+        blockers.push(format!(
+            "{processing} conversation{} still being processed",
+            if processing == 1 { " is" } else { "s are" }
+        ));
+    }
+    let recap_count = app_state
+        .recap_in_flight
+        .lock()
+        .map_err(|_| "Recap lock poisoned".to_string())?
+        .len();
+    if recap_count > 0 {
+        blockers.push(format!(
+            "{recap_count} recap{} running",
+            if recap_count == 1 { " is" } else { "s are" }
+        ));
+    }
+    let identity_count = app_state
+        .identity_in_flight
+        .lock()
+        .map_err(|_| "Identity lock poisoned".to_string())?
+        .len();
+    if identity_count > 0 {
+        blockers.push(format!(
+            "People or voices are being changed in {identity_count} conversation{}",
+            if identity_count == 1 { "" } else { "s" }
+        ));
+    }
+    Ok(blockers)
+}
+
+#[tauri::command]
+fn preview_voice_recognition_reset(
+    manager: State<RecordingManager>,
+    app_state: State<AppState>,
+) -> Result<VoiceRecognitionResetReadiness, String> {
+    let db = app_state.db_handle()?;
+    let preview = db.preview_voice_recognition_reset()?;
+    let blockers = voice_recognition_reset_blockers(&manager, app_state.inner(), &db, true)?;
+    Ok(VoiceRecognitionResetReadiness {
+        preview,
+        can_reset: blockers.is_empty(),
+        blockers,
+    })
+}
+
+#[tauri::command]
+async fn reset_voice_recognition(
+    manager: State<'_, RecordingManager>,
+    app_state: State<'_, AppState>,
+) -> Result<VoiceRecognitionResetResult, String> {
+    let state = app_state.inner().clone();
+    {
+        let mut maintenance = state
+            .maintenance_in_flight
+            .lock()
+            .map_err(|_| "Maintenance lock poisoned".to_string())?;
+        if *maintenance {
+            return Err("Voice recognition maintenance is already running".into());
+        }
+        *maintenance = true;
+    }
+    let result = match state.db_handle() {
+        Err(error) => Err(error),
+        Ok(db) => match voice_recognition_reset_blockers(&manager, &state, &db, false) {
+            Err(error) => Err(error),
+            Ok(blockers) if !blockers.is_empty() => Err(format!(
+                "Voice recognition cannot be reset yet: {}.",
+                blockers.join("; ")
+            )),
+            Ok(_) => {
+                let reset_state = state.clone();
+                match tauri::async_runtime::spawn_blocking(move || {
+                    reset_state.db_handle()?.reset_voice_recognition_data()
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(format!(
+                        "Voice recognition reset stopped unexpectedly: {error}"
+                    )),
+                }
+            }
+        },
+    };
+    if let Ok(mut maintenance) = state.maintenance_in_flight.lock() {
+        *maintenance = false;
+    }
+    result
+}
+
+#[tauri::command]
 fn create_profile_for_unknown_segments(
     session_id: String,
     app_state: State<AppState>,
 ) -> Result<String, String> {
-    ensure_session_not_recapping(app_state.inner(), &session_id)?;
     let db = app_state.db_handle()?;
-    let (_, label, _) = db.create_speaker_for_unattributed_segments(&session_id)?;
-    refresh_session_transcript(&db, &session_id)?;
-    Ok(label)
+    let sessions = vec![session_id.clone()];
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db
+        .create_speaker_for_unattributed_segments(&session_id)
+        .and_then(|(_, label, _)| {
+            refresh_session_transcript(&db, &session_id)?;
+            Ok(label)
+        });
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
 }
 
 #[tauri::command]
@@ -3176,16 +4015,20 @@ fn rename_speaker(
 ) -> Result<db::RenameSpeakerResult, String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
-    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.rename_speaker(&speaker_id, &new_label)
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db.rename_speaker(&speaker_id, &new_label);
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
 }
 
 #[tauri::command]
 fn delete_speaker(speaker_id: String, app_state: State<AppState>) -> Result<(), String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[speaker_id.as_str()])?;
-    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.delete_speaker(&speaker_id)
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db.delete_speaker(&speaker_id);
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
 }
 
 #[tauri::command]
@@ -3205,8 +4048,10 @@ fn merge_speakers(
 ) -> Result<db::SpeakerMergeResult, String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[source_id.as_str(), target_id.as_str()])?;
-    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.merge_speakers(&source_id, &target_id, replace_embeddings)
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db.merge_speakers(&source_id, &target_id, replace_embeddings);
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
 }
 
 #[tauri::command]
@@ -3217,8 +4062,10 @@ fn accept_voice_match_suggestion(
 ) -> Result<db::SuggestionAcceptance, String> {
     let db = app_state.db_handle()?;
     let sessions = db.session_ids_for_speakers(&[source_id.as_str(), target_id.as_str()])?;
-    ensure_sessions_not_recapping(app_state.inner(), &sessions)?;
-    db.accept_voice_match_suggestion(&source_id, &target_id)
+    claim_identity_sessions(app_state.inner(), &sessions)?;
+    let result = db.accept_voice_match_suggestion(&source_id, &target_id);
+    release_identity_sessions(app_state.inner(), &sessions);
+    result
 }
 
 fn is_allowed_external_url(url: &str) -> bool {
@@ -3292,11 +4139,15 @@ fn build_tray(app: &mut tauri::App) -> tauri::Result<()> {
             "stop" => {
                 let manager = app.state::<RecordingManager>();
                 match manager.stop() {
-                    Ok(path) => {
-                        let path = path.to_string_lossy().to_string();
-                        let _ = app.emit("recording:stopped", path.clone());
+                    Ok(stopped) => {
+                        let _ = app.emit("recording:stopped", stopped.clone());
                         let state = app.state::<AppState>().inner().clone();
-                        match queue_transcription(path, state, app.clone()) {
+                        match queue_transcription(
+                            stopped.path,
+                            stopped.stt_context,
+                            state,
+                            app.clone(),
+                        ) {
                             Ok(queued) => {
                                 let _ = app.emit("transcription:queued", queued);
                             }
@@ -3323,6 +4174,7 @@ fn main() {
             list_input_devices,
             start_recording,
             stop_recording,
+            update_live_context,
             transcribe_file_async,
             retry_processing,
             discard_retained_audio,
@@ -3372,6 +4224,10 @@ fn main() {
             list_voice_match_decisions,
             list_session_ids_for_speaker,
             list_session_ids_for_speakers,
+            split_voice_group,
+            dismiss_voice_group_split,
+            preview_voice_recognition_reset,
+            reset_voice_recognition,
             create_profile_for_unknown_segments,
             rename_speaker,
             delete_speaker,
@@ -3413,6 +4269,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meeting_stt_context_is_normalized_and_validated_per_recording() {
+        let context = MeetingSttContext {
+            language_hints: vec![" EN-us ".into(), "bn".into(), "en-US".into()],
+            expected_speakers: Some(5),
+        }
+        .normalized()
+        .unwrap();
+
+        assert_eq!(context.language_hints, vec!["en", "bn"]);
+        assert_eq!(context.expected_speakers, Some(5));
+        assert!(MeetingSttContext {
+            language_hints: Vec::new(),
+            expected_speakers: Some(16),
+        }
+        .normalized()
+        .is_err());
+        assert_eq!(
+            MeetingSttContext {
+                language_hints: vec!["jp".into(), "ja-JP".into()],
+                expected_speakers: None,
+            }
+            .normalized()
+            .unwrap()
+            .language_hints,
+            vec!["ja"]
+        );
+        assert!(MeetingSttContext {
+            language_hints: vec!["not-a-language".into()],
+            expected_speakers: None,
+        }
+        .normalized()
+        .is_err());
+    }
 
     #[test]
     fn selected_legacy_session_uses_its_cached_transcript_without_segments() {
@@ -3678,7 +4569,15 @@ mod tests {
             text: "A long intervention".into(),
         }];
 
-        let selected = clean_sample_windows(&audio, &segments, "speaker_1");
+        let selected = clean_sample_windows(
+            &audio,
+            &segments,
+            "speaker_1",
+            &[vad::SpeechInterval {
+                start_ms: 0,
+                end_ms: 5_700,
+            }],
+        );
 
         assert_eq!(selected.windows.len(), 1);
         assert_eq!(selected.windows[0].start_ms, 850);
@@ -3707,7 +4606,15 @@ mod tests {
             },
         ];
 
-        let selected = clean_sample_windows(&audio, &segments, "speaker_1");
+        let selected = clean_sample_windows(
+            &audio,
+            &segments,
+            "speaker_1",
+            &[vad::SpeechInterval {
+                start_ms: 0,
+                end_ms: 7_000,
+            }],
+        );
 
         assert!(selected.windows.is_empty());
         assert_eq!(selected.overlapping_segments, 1);
@@ -3721,30 +4628,80 @@ mod tests {
     }
 
     #[test]
+    fn balanced_intervention_clusters_remain_reviewable_when_no_global_majority_exists() {
+        let observations = vec![
+            InterventionVoiceObservation {
+                segment_index: 0,
+                start_ms: 0,
+                end_ms: 3_000,
+                embedding: vec![1.0, 0.0],
+                selected_duration_ms: 3_000,
+                consistency_score: 1.0,
+            },
+            InterventionVoiceObservation {
+                segment_index: 1,
+                start_ms: 4_000,
+                end_ms: 7_000,
+                embedding: vec![0.999, 0.044_710_2],
+                selected_duration_ms: 3_000,
+                consistency_score: 1.0,
+            },
+            InterventionVoiceObservation {
+                segment_index: 2,
+                start_ms: 8_000,
+                end_ms: 11_000,
+                embedding: vec![0.0, 1.0],
+                selected_duration_ms: 3_000,
+                consistency_score: 1.0,
+            },
+            InterventionVoiceObservation {
+                segment_index: 3,
+                start_ms: 12_000,
+                end_ms: 15_000,
+                embedding: vec![0.044_710_2, 0.999],
+                selected_duration_ms: 3_000,
+                consistency_score: 1.0,
+            },
+        ];
+
+        let clusters = suggested_split_clusters(&observations).expect("reviewable split");
+        assert_eq!(clusters.len(), 2);
+        assert!(clusters.contains(&vec![0, 1]));
+        assert!(clusters.contains(&vec![2, 3]));
+        assert!(dominant_consistent_indices(
+            &observations
+                .iter()
+                .map(|observation| observation.embedding.clone())
+                .collect::<Vec<_>>()
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn only_near_identical_clean_voiceprints_coalesce_split_provider_labels() {
         let observations = vec![
             VoiceObservation {
                 diarized_speaker: "speaker_1".into(),
                 pcm: vec![0.1; 10],
                 embedding: vec![1.0, 0.0],
-                clean_window_count: 1,
-                selected_duration_ms: 4_000,
+                clean_window_count: 2,
+                selected_duration_ms: 8_000,
                 consistency_score: 1.0,
             },
             VoiceObservation {
                 diarized_speaker: "speaker_3".into(),
                 pcm: vec![0.1; 10],
-                embedding: vec![0.98, 0.198_997_5],
-                clean_window_count: 1,
-                selected_duration_ms: 4_000,
+                embedding: vec![0.999, 0.044_710_2],
+                clean_window_count: 2,
+                selected_duration_ms: 8_000,
                 consistency_score: 1.0,
             },
             VoiceObservation {
                 diarized_speaker: "speaker_2".into(),
                 pcm: vec![0.1; 10],
                 embedding: vec![0.0, 1.0],
-                clean_window_count: 1,
-                selected_duration_ms: 4_000,
+                clean_window_count: 2,
+                selected_duration_ms: 8_000,
                 consistency_score: 1.0,
             },
         ];

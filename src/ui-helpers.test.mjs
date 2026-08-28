@@ -13,9 +13,17 @@ import {
   indexTranslations,
   invalidateConversationCache,
   isNearScrollBottom,
+  isNewerLiveCaptionRevision,
   isProvisionalLabel,
   isSessionProcessing,
   nextRenderedSegmentCount,
+  LIVE_CAPTION_LANGUAGE_PALETTE,
+  liveCaptionLanguageStyle,
+  buildLiveCaptionDisplayRuns,
+  normalizeLiveCaptionLanguage,
+  normalizeLiveCaptionPassages,
+  normalizeLiveCaptionRevision,
+  normalizeLiveCaptionTurns,
   normalizePreferredLanguage,
   parseLanguageHints,
   parseNoTranslationLanguages,
@@ -72,10 +80,188 @@ test("language hints are normalized and deduplicated", () => {
   assert.deepEqual(parseLanguageHints("en-US, de-DE, en, ru"), ["en", "de", "ru"]);
 });
 
+test("live caption revisions reject stale event or polling snapshots", () => {
+  assert.equal(normalizeLiveCaptionRevision("12"), 12);
+  assert.equal(normalizeLiveCaptionRevision(0), 0);
+  assert.equal(normalizeLiveCaptionRevision("invalid"), 0);
+  assert.equal(isNewerLiveCaptionRevision(12, 13), true);
+  assert.equal(isNewerLiveCaptionRevision(12, 12), false);
+  assert.equal(isNewerLiveCaptionRevision(12, 11), false);
+  assert.equal(isNewerLiveCaptionRevision(12, undefined), true);
+});
+
 test("translation exclusions normalize codes and omit the preferred language", () => {
   assert.deepEqual(parseNoTranslationLanguages("EN-us, de-DE, fr, de"), ["de", "fr"]);
   assert.deepEqual(parseNoTranslationLanguages("de-DE, fr, en", "de"), ["fr", "en"]);
   assert.equal(normalizePreferredLanguage("DE-de"), "de");
+});
+
+test("live caption passages stay ordered, keyed, and safely tagged", () => {
+  const passages = normalizeLiveCaptionPassages([
+    {
+      id: "late",
+      sequence: 3,
+      speaker: "Speaker 2",
+      source_text: "Bonjour",
+      source_language: "fr-FR",
+      source_final: false,
+      translation: {
+        text: "Good morning",
+        source_language: "fr-FR",
+        is_final: false,
+      },
+    },
+    {
+      id: "first",
+      sequence: 1,
+      speaker: "Speaker 1",
+      source_text: "Guten Morgen",
+      source_language: "de-DE",
+      source_final: true,
+      translation: {
+        text: "Good morning",
+        source_language: "de-DE",
+        is_final: true,
+      },
+    },
+    {
+      id: "source-only",
+      sequence: 2,
+      speaker: "Speaker 1",
+      source_text: "Hello",
+      source_language: "en",
+      source_final: false,
+      translation: null,
+    },
+    {
+      id: "unsafe-translation",
+      sequence: 4,
+      speaker: "Speaker 3",
+      source_text: "Unknown language",
+      source_language: null,
+      source_final: false,
+      translation: { text: "Translation", source_language: "", is_final: false },
+    },
+    {
+      id: "mismatched-translation",
+      sequence: 5,
+      speaker: "Speaker 3",
+      source_text: "Ciao",
+      source_language: "it-IT",
+      source_final: false,
+      translation: { text: "Hello", source_language: "fr-FR", is_final: false },
+    },
+  ]);
+
+  assert.deepEqual(
+    passages.map((passage) => passage.id),
+    ["first", "source-only", "late", "unsafe-translation", "mismatched-translation"],
+  );
+  assert.equal(passages[0].sourceLanguage, "de");
+  assert.equal(passages[0].translation.sourceLanguage, "de");
+  assert.equal(passages[1].sourceLanguage, "en");
+  assert.equal(passages[1].translation, null);
+  assert.equal(passages[3].translation, null);
+  assert.equal(passages[4].sourceLanguage, "it");
+  assert.equal(passages[4].translation, null);
+  assert.equal(normalizeLiveCaptionLanguage("RU_ru"), "ru");
+  assert.equal(normalizeLiveCaptionLanguage("not a language"), "");
+});
+
+test("live caption turns retain inline code switches and build a complete preferred-language turn", () => {
+  const [turn] = normalizeLiveCaptionTurns([
+    {
+      id: "turn-1",
+      sequence: 4,
+      speaker: "Speaker 1",
+      segments: [
+        {
+          id: "ru-1",
+          source_text: "Привет",
+          source_language: "ru-RU",
+          source_final: false,
+          translation: { text: "Hello", source_language: "ru", is_final: false },
+        },
+        {
+          id: "en-1",
+          source_text: "and welcome",
+          source_language: "en-US",
+          source_final: false,
+          translation: null,
+        },
+        {
+          id: "ru-2",
+          source_text: "друзья",
+          source_language: "ru-RU",
+          source_final: false,
+          translation: { text: "friends", source_language: "ru", is_final: false },
+        },
+      ],
+    },
+  ]);
+  assert.equal(turn.speaker, "Speaker 1");
+  assert.equal(turn.segments.length, 3);
+  const display = buildLiveCaptionDisplayRuns(turn);
+  assert.deepEqual(
+    display.sourceRuns.map((run) => [run.language, run.text]),
+    [["ru", "Привет"], ["en", "and welcome"], ["ru", "друзья"]],
+  );
+  assert.deepEqual(
+    display.preferredRuns.map((run) => [run.language, run.text]),
+    [["ru", "Hello"], ["en", "and welcome"], ["ru", "friends"]],
+  );
+  assert.equal(display.hasTranslation, true);
+});
+
+test("live caption preferred-language runs are suppressed without a safely matched translation", () => {
+  const [turn] = normalizeLiveCaptionTurns([
+    {
+      id: "turn-no-translation",
+      speaker: "Speaker 1",
+      segments: [
+        {
+          id: "source-only",
+          source_text: "Hello",
+          source_language: "en",
+          source_final: false,
+          translation: null,
+        },
+        {
+          id: "unsafe",
+          source_text: "Ciao",
+          source_language: "it",
+          source_final: false,
+          translation: { text: "Hello", source_language: "fr", is_final: false },
+        },
+      ],
+    },
+  ]);
+  const display = buildLiveCaptionDisplayRuns(turn);
+  assert.equal(display.hasTranslation, false);
+  assert.deepEqual(display.preferredRuns, []);
+});
+
+test("live caption language styles have a stable curated palette and deterministic fallback", () => {
+  assert.deepEqual(LIVE_CAPTION_LANGUAGE_PALETTE[0], {
+    background: "#edf7f2",
+    foreground: "#2d6957",
+  });
+  assert.deepEqual(liveCaptionLanguageStyle(0), {
+    background: "#edf7f2",
+    foreground: "#2d6957",
+    border: "#2d6957",
+  });
+  assert.deepEqual(liveCaptionLanguageStyle(7), {
+    background: "#f4f6e9",
+    foreground: "#66713d",
+    border: "#66713d",
+  });
+  assert.deepEqual(liveCaptionLanguageStyle(8), {
+    background: "hsl(170.064 38% 95%)",
+    foreground: "hsl(170.064 35% 33%)",
+    border: "hsl(170.064 35% 33%)",
+  });
+  assert.deepEqual(liveCaptionLanguageStyle(8), liveCaptionLanguageStyle(8));
 });
 
 test("a persisted recap always exposes its generated tabs", () => {

@@ -1,6 +1,6 @@
 use sherpa_onnx::{SpeakerEmbeddingExtractor, SpeakerEmbeddingExtractorConfig};
 
-pub const EMBEDDING_VERSION: &str = "wespeaker-ecapa512-lm-v3-clean-window";
+pub const EMBEDDING_VERSION: &str = "wespeaker-ecapa512-lm-v4-vad";
 const MODEL_SAMPLE_RATE: u32 = 16_000;
 
 pub struct Embedder {
@@ -40,7 +40,7 @@ impl Embedder {
     }
 }
 
-fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
+pub(crate) fn resample_linear(input: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
     if source_rate == target_rate {
         return input.to_vec();
     }

@@ -89,6 +89,9 @@ const notices = fs.readFileSync(path.join(root, "THIRD_PARTY_NOTICES.md"), "utf8
 if (!/WeSpeaker ECAPA-TDNN-512/.test(notices) || !/CC BY 4\.0/.test(notices)) {
   fail("the bundled WeSpeaker model and CC BY 4.0 terms are not documented");
 }
+if (!/Silero voice activity detector/.test(notices) || !/MIT\s+License/.test(notices)) {
+  fail("the bundled Silero VAD model and MIT terms are not documented");
+}
 
 if (!process.exitCode) {
   const rustLicenseFamilies = new Set(rustPackages.map((item) => item.license || "license-file"));

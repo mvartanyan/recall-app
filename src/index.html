@@ -96,22 +96,29 @@
                 </div>
                 <span class="live-pill">LIVE</span>
               </div>
+              <div class="live-context-controls" aria-label="Current meeting STT context">
+                <label class="live-context-field live-context-speakers" for="liveExpectedSpeakers">
+                  <span>Expected speakers</span>
+                  <select id="liveExpectedSpeakers"></select>
+                </label>
+                <label class="live-context-field live-context-languages" for="liveLanguageHints">
+                  <span>Likely languages</span>
+                  <input id="liveLanguageHints" type="text" placeholder="en, fr, de" />
+                </label>
+                <button id="applyLiveContextButton" class="secondary-button live-context-apply" type="button">
+                  Apply to this meeting
+                </button>
+                <span id="liveContextStatus" class="live-context-status">Using the recording defaults.</span>
+              </div>
               <div class="live-transcript-frame">
-                <div class="live-caption-streams">
-                  <section class="live-caption-stream">
-                    <span class="live-caption-label">Original</span>
-                    <pre id="liveTranscript" class="live-transcript">Listening…</pre>
-                  </section>
-                  <section id="liveTranslationSection" class="live-caption-stream translated" hidden>
-                    <span id="liveTranslationLabel" class="live-caption-label">Preferred-language translation</span>
-                    <pre id="liveTranslatedTranscript" class="live-transcript translated"></pre>
-                  </section>
-                  <p id="liveTranslationWarning" class="live-translation-warning" hidden></p>
+                <div id="liveTranscript" class="live-transcript" role="log" aria-live="polite" aria-relevant="additions text">
+                  <p class="live-caption-placeholder">Listening for speech…</p>
                 </div>
                 <button id="jumpToLiveButton" class="jump-to-live" type="button" hidden>
                   Jump to latest ↓
                 </button>
               </div>
+              <p id="liveTranslationWarning" class="live-translation-warning" hidden></p>
               <p class="supporting-copy">Live captions are provisional. The final diarized transcript replaces them after processing.</p>
             </section>
 
@@ -494,6 +501,16 @@
             </label>
           </section>
 
+          <section class="settings-section voice-maintenance-section">
+            <div class="setting-title-row">
+              <div>
+                <h3>Voice recognition data</h3>
+                <p>Clear local voiceprints and temporary samples without deleting people, conversations, or historical speaker labels. Recall makes and verifies a database backup first.</p>
+              </div>
+              <button id="previewVoiceResetButton" class="secondary-button" type="button">Review reset…</button>
+            </div>
+          </section>
+
           <section id="jamieImportSettingsSection" class="settings-section" hidden aria-hidden="true">
             <div class="setting-title-row">
               <div>
@@ -619,6 +636,48 @@
       <div class="modal-footer">
         <button id="speakerPickerUnknown" class="text-button" type="button">Set as unknown</button>
         <button class="secondary-button" type="button" data-close-dialog="speakerPickerDialog">Cancel</button>
+      </div>
+    </dialog>
+
+    <dialog id="voiceSplitDialog" class="modal voice-split-modal" aria-labelledby="voiceSplitTitle">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow">Local voice review</span>
+          <h2 id="voiceSplitTitle">Split mixed speaker turns</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog="voiceSplitDialog" aria-label="Close voice split review">×</button>
+      </div>
+      <div class="voice-split-body">
+        <p id="voiceSplitSummary" class="voice-split-summary"></p>
+        <div id="voiceSplitList" class="voice-split-list" aria-label="Interventions to move to a separate voice"></div>
+        <p class="field-help">Checked interventions will become a new VOICE profile. The unchecked interventions stay with their current person. Nothing is split automatically.</p>
+      </div>
+      <div class="modal-footer">
+        <span id="voiceSplitFeedback" class="modal-feedback"></span>
+        <button id="dismissVoiceSplitButton" class="text-button" type="button" hidden>Keep as one person</button>
+        <button class="secondary-button" type="button" data-close-dialog="voiceSplitDialog">Cancel</button>
+        <button id="confirmVoiceSplitButton" class="primary-button" type="button" disabled>Create separate voice</button>
+      </div>
+    </dialog>
+
+    <dialog id="voiceResetDialog" class="modal compact-modal voice-reset-modal" aria-labelledby="voiceResetTitle">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow danger-eyebrow">Voice recognition maintenance</span>
+          <h2 id="voiceResetTitle">Reset voice recognition data</h2>
+        </div>
+        <button class="icon-button" type="button" data-close-dialog="voiceResetDialog" aria-label="Close voice recognition reset">×</button>
+      </div>
+      <div class="voice-reset-body">
+        <p>Recall will remove local voiceprints, temporary voice excerpts, match decisions, and provisional VOICE profiles. Named people, conversations, transcript text, and historical speaker labels stay in place.</p>
+        <div id="voiceResetStats" class="voice-reset-stats" aria-live="polite"></div>
+        <div id="voiceResetBlockers" class="voice-reset-blockers" hidden></div>
+        <p class="field-help">A verified backup is created before the transaction. Only the newest backup from this reset operation is retained.</p>
+      </div>
+      <div class="modal-footer">
+        <span id="voiceResetFeedback" class="modal-feedback"></span>
+        <button class="secondary-button" type="button" data-close-dialog="voiceResetDialog">Cancel</button>
+        <button id="confirmVoiceResetButton" class="danger-button" type="button" disabled>Create backup and reset</button>
       </div>
     </dialog>
 

@@ -134,6 +134,8 @@ pub struct ProcessingJob {
     pub session_id: String,
     pub run_id: String,
     pub audio_path: String,
+    pub language_hints: Vec<String>,
+    pub expected_speakers: Option<u8>,
     pub status: String,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -189,7 +191,84 @@ pub struct SegmentRecord {
     pub end_ms: i64,
     pub speaker_id: Option<String>,
     pub speaker_label: Option<String>,
+    pub provider_speaker_label: Option<String>,
+    pub voice_group_id: Option<String>,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SessionVoiceGroup {
+    pub id: String,
+    pub session_id: String,
+    pub provider_speaker_label: String,
+    pub cluster_index: usize,
+    pub resulting_speaker_id: Option<String>,
+    pub resulting_speaker_label: Option<String>,
+    pub status: String,
+    pub selected_duration_ms: u64,
+    pub selected_window_count: usize,
+    pub consistency_score: Option<f32>,
+    pub model_version: Option<String>,
+    pub split_status: String,
+    pub split_clusters: Vec<Vec<String>>,
+    pub intervention_count: usize,
+    pub voice_observation_count: usize,
+}
+
+pub struct SessionVoiceGroupSave<'a> {
+    pub session_id: &'a str,
+    pub provider_speaker_label: &'a str,
+    pub cluster_index: usize,
+    pub resulting_speaker_id: Option<&'a str>,
+    pub status: &'a str,
+    pub centroid: Option<&'a [f32]>,
+    pub selected_duration_ms: u64,
+    pub selected_window_count: usize,
+    pub consistency_score: Option<f32>,
+    pub model_version: Option<&'a str>,
+}
+
+pub struct VoiceObservationSave<'a> {
+    pub voice_group_id: &'a str,
+    pub session_id: &'a str,
+    pub segment_id: &'a str,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub vector: &'a [f32],
+    pub model_version: &'a str,
+    pub speech_duration_ms: u64,
+    pub consistency_score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VoiceGroupSplitResult {
+    pub session_id: String,
+    pub original_group_id: String,
+    pub new_group_id: String,
+    pub new_speaker_id: String,
+    pub new_speaker_label: String,
+    pub moved_interventions: usize,
+    pub remaining_interventions: usize,
+    pub backup_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VoiceRecognitionResetPreview {
+    pub voiceprints: usize,
+    pub temporary_samples: usize,
+    pub match_decisions: usize,
+    pub meeting_voice_groups: usize,
+    pub voice_observations: usize,
+    pub provisional_profiles: usize,
+    pub provisional_attributions_demoted: usize,
+    pub named_profiles_preserved: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct VoiceRecognitionResetResult {
+    pub preview: VoiceRecognitionResetPreview,
+    pub backup_path: String,
+    pub integrity_check: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -473,6 +552,40 @@ fn is_provisional_label(label: &str) -> bool {
     !number.is_empty() && number.chars().all(|character| character.is_ascii_digit())
 }
 
+fn normalized_vector_centroid(vectors: &[Vec<f32>]) -> Vec<f32> {
+    let Some(first) = vectors.first() else {
+        return Vec::new();
+    };
+    let mut centroid = vec![0.0; first.len()];
+    let mut count = 0usize;
+    for vector in vectors {
+        if vector.len() != centroid.len() {
+            continue;
+        }
+        for (target, value) in centroid.iter_mut().zip(vector) {
+            *target += *value;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return Vec::new();
+    }
+    for value in &mut centroid {
+        *value /= count as f32;
+    }
+    let norm = centroid
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut centroid {
+            *value /= norm;
+        }
+    }
+    centroid
+}
+
 pub(crate) fn normalized_person_name(label: &str) -> String {
     label
         .nfkc()
@@ -608,6 +721,25 @@ impl Db {
                 Self::restrict_file_permissions(&backup)?;
                 eprintln!(
                     "[database] backed up the pre-processing-job database to {}",
+                    backup.display()
+                );
+            }
+        }
+        let processing_context_migration_needed = Self::table_exists(&conn, "processing_jobs")?
+            && (!Self::column_exists(&conn, "processing_jobs", "language_hints_json")?
+                || !Self::column_exists(&conn, "processing_jobs", "expected_speakers")?);
+        if processing_context_migration_needed {
+            let backup = Self::processing_context_migration_backup_path(path);
+            if !backup.exists() {
+                std::fs::copy(path, &backup).map_err(|error| {
+                    format!(
+                        "Could not back up the existing Recall database to {} before adding per-meeting STT context: {error}",
+                        backup.display()
+                    )
+                })?;
+                Self::restrict_file_permissions(&backup)?;
+                eprintln!(
+                    "[database] backed up the pre-STT-context database to {}",
                     backup.display()
                 );
             }
@@ -757,6 +889,14 @@ impl Db {
         path.with_file_name(format!("{stem}.pre-processing-v1.db"))
     }
 
+    fn processing_context_migration_backup_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        path.with_file_name(format!("{stem}.pre-stt-context-v1.db"))
+    }
+
     fn voice_match_migration_backup_path(path: &Path) -> PathBuf {
         let stem = path
             .file_stem()
@@ -865,6 +1005,38 @@ impl Db {
                     text_nonce TEXT,
                     text_ct TEXT NOT NULL
                  );
+                 CREATE TABLE IF NOT EXISTS session_voice_groups (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    provider_speaker_label TEXT NOT NULL,
+                    cluster_index INTEGER NOT NULL DEFAULT 0,
+                    resulting_speaker_id TEXT,
+                    status TEXT NOT NULL,
+                    centroid_nonce TEXT,
+                    centroid_ct TEXT,
+                    selected_duration_ms INTEGER NOT NULL DEFAULT 0,
+                    selected_window_count INTEGER NOT NULL DEFAULT 0,
+                    consistency_score REAL,
+                    model_version TEXT,
+                    split_status TEXT NOT NULL DEFAULT 'none',
+                    split_clusters_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, provider_speaker_label, cluster_index)
+                 );
+                 CREATE TABLE IF NOT EXISTS voice_observations (
+                    id TEXT PRIMARY KEY,
+                    voice_group_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    segment_id TEXT NOT NULL,
+                    start_ms INTEGER NOT NULL,
+                    end_ms INTEGER NOT NULL,
+                    vector_nonce TEXT,
+                    vector_ct TEXT NOT NULL,
+                    model_version TEXT NOT NULL,
+                    speech_duration_ms INTEGER NOT NULL DEFAULT 0,
+                    consistency_score REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                 );
                  CREATE TABLE IF NOT EXISTS session_agendas (
                     session_id TEXT PRIMARY KEY,
                     source_kind TEXT NOT NULL,
@@ -890,6 +1062,8 @@ impl Db {
                     session_id TEXT PRIMARY KEY,
                     run_id TEXT NOT NULL,
                     audio_path TEXT NOT NULL,
+                    language_hints_json TEXT NOT NULL DEFAULT '[]',
+                    expected_speakers INTEGER,
                     status TEXT NOT NULL,
                     error TEXT,
                     created_at TEXT NOT NULL,
@@ -986,9 +1160,23 @@ impl Db {
 
         Self::add_column_if_missing(&conn_guard, "segments", "speaker_id", "TEXT")?;
         Self::add_column_if_missing(&conn_guard, "segments", "speaker_label", "TEXT")?;
+        Self::add_column_if_missing(&conn_guard, "segments", "provider_speaker_label", "TEXT")?;
+        Self::add_column_if_missing(&conn_guard, "segments", "voice_group_id", "TEXT")?;
         Self::add_column_if_missing(&conn_guard, "sessions", "title", "TEXT")?;
         Self::add_column_if_missing(&conn_guard, "sessions", "duration_ms", "INTEGER DEFAULT 0")?;
         Self::add_column_if_missing(&conn_guard, "embeddings", "model_version", "TEXT")?;
+        Self::add_column_if_missing(
+            &conn_guard,
+            "processing_jobs",
+            "language_hints_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        Self::add_column_if_missing(
+            &conn_guard,
+            "processing_jobs",
+            "expected_speakers",
+            "INTEGER",
+        )?;
         Self::add_column_if_missing(
             &conn_guard,
             "import_batches",
@@ -1050,7 +1238,15 @@ impl Db {
                  CREATE INDEX IF NOT EXISTS embeddings_speaker_model_reference_idx
                     ON embeddings(speaker_id, model_version, is_reference);
                  CREATE INDEX IF NOT EXISTS speaker_samples_speaker_idx
-                    ON speaker_samples(speaker_id);",
+                    ON speaker_samples(speaker_id);
+                 CREATE INDEX IF NOT EXISTS session_voice_groups_session_idx
+                    ON session_voice_groups(session_id, provider_speaker_label, cluster_index);
+                 CREATE INDEX IF NOT EXISTS session_voice_groups_speaker_idx
+                    ON session_voice_groups(resulting_speaker_id, session_id);
+                 CREATE INDEX IF NOT EXISTS voice_observations_group_idx
+                    ON voice_observations(voice_group_id, start_ms, id);
+                 CREATE INDEX IF NOT EXISTS voice_observations_session_idx
+                    ON voice_observations(session_id, segment_id);",
             )
             .map_err(|error| error.to_string())?;
         Ok(())
@@ -1096,6 +1292,16 @@ impl Db {
         .map_err(|error| error.to_string())?;
         tx.execute(
             "DELETE FROM voice_match_decisions WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM voice_observations WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_voice_groups WHERE session_id=?1",
             params![session_id],
         )
         .map_err(|error| error.to_string())?;
@@ -1269,8 +1475,34 @@ impl Db {
         duration_ms: i64,
         audio_path: &str,
     ) -> Result<(), String> {
+        self.create_processing_session_with_context(
+            session_id,
+            run_id,
+            title,
+            transcript,
+            duration_ms,
+            audio_path,
+            &[],
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_processing_session_with_context(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        title: &str,
+        transcript: &str,
+        duration_ms: i64,
+        audio_path: &str,
+        language_hints: &[String],
+        expected_speakers: Option<u8>,
+    ) -> Result<(), String> {
         let now: DateTime<Utc> = SystemTime::now().into();
         let (nonce, ct) = self.crypto.encrypt(transcript.as_bytes());
+        let language_hints_json =
+            serde_json::to_string(language_hints).map_err(|error| error.to_string())?;
         let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         tx.execute(
@@ -1287,9 +1519,18 @@ impl Db {
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
-            "INSERT INTO processing_jobs(session_id, run_id, audio_path, status, error, created_at, updated_at)
-             VALUES(?1, ?2, ?3, 'processing', NULL, ?4, ?4)",
-            params![session_id, run_id, audio_path, now.to_rfc3339()],
+            "INSERT INTO processing_jobs(
+                session_id, run_id, audio_path, language_hints_json, expected_speakers,
+                status, error, created_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, 'processing', NULL, ?6, ?6)",
+            params![
+                session_id,
+                run_id,
+                audio_path,
+                language_hints_json,
+                expected_speakers,
+                now.to_rfc3339()
+            ],
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
@@ -1320,7 +1561,8 @@ impl Db {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let row = conn
             .query_row(
-                "SELECT session_id, run_id, audio_path, status, error, created_at, updated_at
+                "SELECT session_id, run_id, audio_path, language_hints_json,
+                        expected_speakers, status, error, created_at, updated_at
                    FROM processing_jobs WHERE session_id=?1",
                 params![session_id],
                 |row| {
@@ -1329,22 +1571,44 @@ impl Db {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(4)?,
                         row.get::<_, String>(5)?,
-                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| error.to_string())?;
-        let Some((session_id, run_id, audio_path, status, error, created_at, updated_at)) = row
+        let Some((
+            session_id,
+            run_id,
+            audio_path,
+            language_hints_json,
+            expected_speakers,
+            status,
+            error,
+            created_at,
+            updated_at,
+        )) = row
         else {
             return Ok(None);
         };
+        let language_hints = serde_json::from_str::<Vec<String>>(&language_hints_json)
+            .map_err(|error| format!("Could not read saved STT language hints: {error}"))?;
+        let expected_speakers = expected_speakers
+            .map(u8::try_from)
+            .transpose()
+            .map_err(|_| {
+                "Saved expected speaker count is outside the supported range".to_string()
+            })?;
         Ok(Some(ProcessingJob {
             session_id,
             run_id,
             audio_path,
+            language_hints,
+            expected_speakers,
             status,
             error,
             created_at: DateTime::parse_from_rfc3339(&created_at)
@@ -1513,6 +1777,16 @@ impl Db {
         .map_err(|error| error.to_string())?;
         tx.execute(
             "DELETE FROM voice_match_decisions WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM voice_observations WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM session_voice_groups WHERE session_id=?1",
             params![session_id],
         )
         .map_err(|error| error.to_string())?;
@@ -2343,6 +2617,8 @@ impl Db {
                 "session_agendas",
                 "processing_jobs",
                 "voice_match_decisions",
+                "voice_observations",
+                "session_voice_groups",
                 "session_import_artifacts",
                 "imported_sessions",
             ] {
@@ -2454,6 +2730,7 @@ impl Db {
         Ok(backup)
     }
 
+    #[cfg(test)]
     pub fn insert_segment(
         &self,
         session_id: &str,
@@ -2463,14 +2740,38 @@ impl Db {
         speaker_label: Option<&str>,
         text: &str,
     ) -> Result<String, String> {
+        self.insert_segment_with_provenance(
+            session_id,
+            start_ms,
+            end_ms,
+            speaker_id,
+            speaker_label,
+            None,
+            None,
+            text,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_segment_with_provenance(
+        &self,
+        session_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        speaker_id: Option<&str>,
+        speaker_label: Option<&str>,
+        provider_speaker_label: Option<&str>,
+        voice_group_id: Option<&str>,
+        text: &str,
+    ) -> Result<String, String> {
         let id = Uuid::new_v4().to_string();
         let (nonce, ct) = self.crypto.encrypt(text.as_bytes());
         self.conn
             .lock()
             .map_err(|_| "lock poisoned".to_string())?
             .execute(
-                "INSERT INTO segments(id, session_id, start_ms, end_ms, speaker_label, speaker_id, text_nonce, text_ct) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![id, session_id, start_ms, end_ms, speaker_label, speaker_id, nonce, ct],
+                "INSERT INTO segments(id, session_id, start_ms, end_ms, speaker_label, speaker_id, provider_speaker_label, voice_group_id, text_nonce, text_ct) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![id, session_id, start_ms, end_ms, speaker_label, speaker_id, provider_speaker_label, voice_group_id, nonce, ct],
             )
             .map_err(|e| e.to_string())?;
         Ok(id)
@@ -2479,7 +2780,7 @@ impl Db {
     pub fn list_segments(&self, session_id: &str) -> Result<Vec<SegmentRecord>, String> {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let mut stmt = conn
-            .prepare("SELECT id, session_id, start_ms, end_ms, speaker_id, speaker_label, text_nonce, text_ct FROM segments WHERE session_id=?1 ORDER BY start_ms ASC")
+            .prepare("SELECT id, session_id, start_ms, end_ms, speaker_id, speaker_label, provider_speaker_label, voice_group_id, text_nonce, text_ct FROM segments WHERE session_id=?1 ORDER BY start_ms ASC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map(params![session_id], |row| {
@@ -2489,8 +2790,10 @@ impl Db {
                 let end_ms: i64 = row.get(3)?;
                 let speaker_id: Option<String> = row.get(4)?;
                 let speaker_label: Option<String> = row.get(5)?;
-                let nonce: String = row.get(6)?;
-                let ct: String = row.get(7)?;
+                let provider_speaker_label: Option<String> = row.get(6)?;
+                let voice_group_id: Option<String> = row.get(7)?;
+                let nonce: String = row.get(8)?;
+                let ct: String = row.get(9)?;
                 Ok((
                     id,
                     session_id,
@@ -2498,6 +2801,8 @@ impl Db {
                     end_ms,
                     speaker_id,
                     speaker_label,
+                    provider_speaker_label,
+                    voice_group_id,
                     nonce,
                     ct,
                 ))
@@ -2506,8 +2811,18 @@ impl Db {
 
         let mut segments = Vec::new();
         for row in rows {
-            let (id, session_id, start_ms, end_ms, speaker_id, speaker_label, nonce, ct) =
-                row.map_err(|e| e.to_string())?;
+            let (
+                id,
+                session_id,
+                start_ms,
+                end_ms,
+                speaker_id,
+                speaker_label,
+                provider_speaker_label,
+                voice_group_id,
+                nonce,
+                ct,
+            ) = row.map_err(|e| e.to_string())?;
             let text_bytes = self.crypto.decrypt(&nonce, &ct)?;
             let text = String::from_utf8(text_bytes).unwrap_or_default();
             segments.push(SegmentRecord {
@@ -2517,6 +2832,8 @@ impl Db {
                 end_ms,
                 speaker_id,
                 speaker_label,
+                provider_speaker_label,
+                voice_group_id,
                 text,
             });
         }
@@ -2848,7 +3165,13 @@ impl Db {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let maximum: Option<i64> = conn
             .query_row(
-                "SELECT MAX(CAST(SUBSTR(label, 6) AS INTEGER)) FROM speakers WHERE label GLOB 'VOICE[0-9]*'",
+                "SELECT MAX(CAST(SUBSTR(label, 6) AS INTEGER))
+                   FROM (
+                        SELECT label FROM speakers
+                        UNION ALL
+                        SELECT speaker_label AS label FROM segments
+                   )
+                  WHERE label GLOB 'VOICE[0-9]*'",
                 [],
                 |row| row.get(0),
             )
@@ -2890,7 +3213,12 @@ impl Db {
         let maximum: Option<i64> = tx
             .query_row(
                 "SELECT MAX(CAST(SUBSTR(label, 6) AS INTEGER))
-                   FROM speakers WHERE label GLOB 'VOICE[0-9]*'",
+                   FROM (
+                        SELECT label FROM speakers
+                        UNION ALL
+                        SELECT speaker_label AS label FROM segments
+                   )
+                  WHERE label GLOB 'VOICE[0-9]*'",
                 [],
                 |row| row.get(0),
             )
@@ -4063,6 +4391,13 @@ impl Db {
             )
             .map_err(|error| error.to_string())?;
             tx.execute(
+                "UPDATE session_voice_groups
+                    SET resulting_speaker_id=?1
+                  WHERE resulting_speaker_id=?2",
+                params![target_speaker_id, source_id],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.execute(
                 "UPDATE voice_match_decisions
                     SET resulting_speaker_id=?1,
                         resolved_at=COALESCE(resolved_at, ?2),
@@ -4175,6 +4510,694 @@ impl Db {
             deleted_samples,
             backup_path: backup.to_string_lossy().to_string(),
         })
+    }
+
+    pub fn insert_session_voice_group(
+        &self,
+        group: &SessionVoiceGroupSave<'_>,
+    ) -> Result<String, String> {
+        let id = Uuid::new_v4().to_string();
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let (centroid_nonce, centroid_ct) = group
+            .centroid
+            .map(|vector| self.crypto.encrypt(bytemuck::cast_slice(vector)))
+            .map(|(nonce, ct)| (Some(nonce), Some(ct)))
+            .unwrap_or((None, None));
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "INSERT INTO session_voice_groups(
+                    id, session_id, provider_speaker_label, cluster_index,
+                    resulting_speaker_id, status, centroid_nonce, centroid_ct,
+                    selected_duration_ms, selected_window_count, consistency_score,
+                    model_version, split_status, split_clusters_json, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'none', '[]', ?13)",
+                params![
+                    id,
+                    group.session_id,
+                    group.provider_speaker_label,
+                    group.cluster_index.min(i64::MAX as usize) as i64,
+                    group.resulting_speaker_id,
+                    group.status,
+                    centroid_nonce,
+                    centroid_ct,
+                    group.selected_duration_ms.min(i64::MAX as u64) as i64,
+                    group.selected_window_count.min(i64::MAX as usize) as i64,
+                    group.consistency_score.map(f64::from),
+                    group.model_version,
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(id)
+    }
+
+    pub fn insert_voice_observation(
+        &self,
+        observation: &VoiceObservationSave<'_>,
+    ) -> Result<String, String> {
+        let id = Uuid::new_v4().to_string();
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let (nonce, ct) = self
+            .crypto
+            .encrypt(bytemuck::cast_slice(observation.vector));
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "INSERT INTO voice_observations(
+                    id, voice_group_id, session_id, segment_id, start_ms, end_ms,
+                    vector_nonce, vector_ct, model_version, speech_duration_ms,
+                    consistency_score, created_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    id,
+                    observation.voice_group_id,
+                    observation.session_id,
+                    observation.segment_id,
+                    observation.start_ms.min(i64::MAX as u64) as i64,
+                    observation.end_ms.min(i64::MAX as u64) as i64,
+                    nonce,
+                    ct,
+                    observation.model_version,
+                    observation.speech_duration_ms.min(i64::MAX as u64) as i64,
+                    f64::from(observation.consistency_score),
+                    now.to_rfc3339(),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(id)
+    }
+
+    pub fn set_voice_group_split_suggestion(
+        &self,
+        voice_group_id: &str,
+        clusters: &[Vec<String>],
+    ) -> Result<(), String> {
+        let clusters_json = serde_json::to_string(clusters).map_err(|error| error.to_string())?;
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE session_voice_groups
+                    SET split_status='suggested', split_clusters_json=?1
+                  WHERE id=?2",
+                params![clusters_json, voice_group_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("Meeting voice group not found".into());
+        }
+        Ok(())
+    }
+
+    pub fn list_session_voice_groups(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionVoiceGroup>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.id, g.session_id, g.provider_speaker_label, g.cluster_index,
+                        g.resulting_speaker_id, s.label, g.status,
+                        g.selected_duration_ms, g.selected_window_count,
+                        g.consistency_score, g.model_version, g.split_status,
+                        g.split_clusters_json,
+                        (SELECT COUNT(*) FROM segments sg WHERE sg.voice_group_id=g.id),
+                        (SELECT COUNT(DISTINCT vo.segment_id)
+                           FROM voice_observations vo WHERE vo.voice_group_id=g.id)
+                   FROM session_voice_groups g
+                   LEFT JOIN speakers s ON s.id=g.resulting_speaker_id
+                  WHERE g.session_id=?1
+                  ORDER BY g.provider_speaker_label COLLATE NOCASE, g.cluster_index, g.id",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (
+                id,
+                session_id,
+                provider_speaker_label,
+                cluster_index,
+                resulting_speaker_id,
+                resulting_speaker_label,
+                status,
+                selected_duration_ms,
+                selected_window_count,
+                consistency_score,
+                model_version,
+                split_status,
+                split_clusters_json,
+                intervention_count,
+                voice_observation_count,
+            ) = row.map_err(|error| error.to_string())?;
+            groups.push(SessionVoiceGroup {
+                id,
+                session_id,
+                provider_speaker_label,
+                cluster_index: cluster_index.max(0) as usize,
+                resulting_speaker_id,
+                resulting_speaker_label,
+                status,
+                selected_duration_ms: selected_duration_ms.max(0) as u64,
+                selected_window_count: selected_window_count.max(0) as usize,
+                consistency_score: consistency_score.map(|value| value as f32),
+                model_version,
+                split_status,
+                split_clusters: serde_json::from_str(&split_clusters_json).unwrap_or_default(),
+                intervention_count: intervention_count.max(0) as usize,
+                voice_observation_count: voice_observation_count.max(0) as usize,
+            });
+        }
+        Ok(groups)
+    }
+
+    pub fn voice_group_session_id(&self, voice_group_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .query_row(
+                "SELECT session_id FROM session_voice_groups WHERE id=?1",
+                params![voice_group_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn dismiss_voice_group_split(&self, voice_group_id: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "UPDATE session_voice_groups
+                    SET split_status='dismissed'
+                  WHERE id=?1 AND split_status='suggested'",
+                params![voice_group_id],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("The split suggestion is no longer current".into());
+        }
+        Ok(())
+    }
+
+    pub fn split_voice_group(
+        &self,
+        voice_group_id: &str,
+        selected_segment_ids: &[String],
+    ) -> Result<VoiceGroupSplitResult, String> {
+        let selected = selected_segment_ids
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
+            .collect::<HashSet<_>>();
+        if selected.is_empty() {
+            return Err("Select at least one intervention to move".into());
+        }
+        let backup = self.verified_runtime_backup("pre-voice-split")?;
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let group = tx
+            .query_row(
+                "SELECT session_id, provider_speaker_label, cluster_index, resulting_speaker_id
+                   FROM session_voice_groups WHERE id=?1",
+                params![voice_group_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Meeting voice group not found".to_string())?;
+        let (session_id, provider_speaker_label, _cluster_index, original_speaker_id) = group;
+        let all_segment_ids = {
+            let mut stmt = tx
+                .prepare("SELECT id FROM segments WHERE voice_group_id=?1 ORDER BY start_ms, id")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![voice_group_id], |row| row.get::<_, String>(0))
+                .map_err(|error| error.to_string())?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row.map_err(|error| error.to_string())?);
+            }
+            values
+        };
+        if selected.iter().any(|id| !all_segment_ids.contains(id)) {
+            return Err(
+                "One of the selected interventions no longer belongs to this voice group".into(),
+            );
+        }
+        if selected.len() >= all_segment_ids.len() {
+            return Err("Leave at least one intervention in the original voice group".into());
+        }
+
+        struct StoredObservation {
+            id: String,
+            segment_id: String,
+            vector: Vec<f32>,
+            speech_duration_ms: u64,
+            consistency_score: f32,
+        }
+        let observations = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id, segment_id, vector_nonce, vector_ct,
+                            speech_duration_ms, consistency_score
+                       FROM voice_observations
+                      WHERE voice_group_id=?1
+                      ORDER BY start_ms, id",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map(params![voice_group_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, f64>(5)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut values = Vec::new();
+            for row in rows {
+                let (id, segment_id, nonce, ct, duration, consistency) =
+                    row.map_err(|error| error.to_string())?;
+                let bytes = self.crypto.decrypt(&nonce, &ct)?;
+                if bytes.len() % std::mem::size_of::<f32>() != 0 {
+                    return Err("A stored voice observation is damaged".into());
+                }
+                values.push(StoredObservation {
+                    id,
+                    segment_id,
+                    vector: bytemuck::cast_slice(&bytes).to_vec(),
+                    speech_duration_ms: duration.max(0) as u64,
+                    consistency_score: consistency as f32,
+                });
+            }
+            values
+        };
+        let selected_observations = observations
+            .iter()
+            .filter(|observation| selected.contains(&observation.segment_id))
+            .collect::<Vec<_>>();
+        let remaining_observations = observations
+            .iter()
+            .filter(|observation| !selected.contains(&observation.segment_id))
+            .collect::<Vec<_>>();
+        if selected_observations.is_empty() || remaining_observations.is_empty() {
+            return Err(
+                "Both sides of a split need at least one VAD-confirmed voice observation".into(),
+            );
+        }
+        let selected_vectors = selected_observations
+            .iter()
+            .map(|observation| observation.vector.clone())
+            .collect::<Vec<_>>();
+        let remaining_vectors = remaining_observations
+            .iter()
+            .map(|observation| observation.vector.clone())
+            .collect::<Vec<_>>();
+        let selected_centroid = normalized_vector_centroid(&selected_vectors);
+        let remaining_centroid = normalized_vector_centroid(&remaining_vectors);
+        if selected_centroid.is_empty() || remaining_centroid.is_empty() {
+            return Err("The selected voice observations could not be combined safely".into());
+        }
+
+        let maximum_voice: Option<i64> = tx
+            .query_row(
+                "SELECT MAX(CAST(SUBSTR(label, 6) AS INTEGER))
+                   FROM (
+                        SELECT label FROM speakers
+                        UNION ALL
+                        SELECT speaker_label AS label FROM segments
+                   )
+                  WHERE label GLOB 'VOICE[0-9]*'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let new_speaker_label = format!("VOICE{}", maximum_voice.unwrap_or(0) + 1);
+        let new_speaker_id = Uuid::new_v4().to_string();
+        let new_group_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let next_cluster: i64 = tx
+            .query_row(
+                "SELECT COALESCE(MAX(cluster_index), -1) + 1
+                   FROM session_voice_groups
+                  WHERE session_id=?1 AND provider_speaker_label=?2",
+                params![session_id, provider_speaker_label],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO speakers(id, label, created_at) VALUES(?1, ?2, ?3)",
+            params![new_speaker_id, new_speaker_label, now],
+        )
+        .map_err(|error| error.to_string())?;
+        let (selected_nonce, selected_ct) = self
+            .crypto
+            .encrypt(bytemuck::cast_slice(&selected_centroid));
+        let selected_duration = selected_observations
+            .iter()
+            .map(|observation| observation.speech_duration_ms)
+            .sum::<u64>();
+        let selected_consistency = selected_observations
+            .iter()
+            .map(|observation| observation.consistency_score)
+            .fold(1.0_f32, f32::min);
+        tx.execute(
+            "INSERT INTO session_voice_groups(
+                id, session_id, provider_speaker_label, cluster_index,
+                resulting_speaker_id, status, centroid_nonce, centroid_ct,
+                selected_duration_ms, selected_window_count, consistency_score,
+                model_version, split_status, split_clusters_json, created_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, 'manual_split', ?6, ?7, ?8, ?9, ?10, ?11, 'applied', '[]', ?12)",
+            params![
+                new_group_id,
+                session_id,
+                provider_speaker_label,
+                next_cluster,
+                new_speaker_id,
+                selected_nonce,
+                selected_ct,
+                selected_duration.min(i64::MAX as u64) as i64,
+                selected_observations.len().min(i64::MAX as usize) as i64,
+                f64::from(selected_consistency),
+                selected_observations
+                    .first()
+                    .map(|_| "wespeaker-ecapa512-lm-v4-vad"),
+                now,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let embedding_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO embeddings(
+                id, speaker_id, vector_nonce, vector_ct, source_session_id,
+                created_at, model_version, is_reference
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'wespeaker-ecapa512-lm-v4-vad', 1)",
+            params![
+                embedding_id,
+                new_speaker_id,
+                selected_nonce,
+                selected_ct,
+                session_id,
+                now,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        for segment_id in &selected {
+            tx.execute(
+                "UPDATE segments
+                    SET speaker_id=?1, speaker_label=?2, voice_group_id=?3
+                  WHERE id=?4 AND voice_group_id=?5",
+                params![
+                    new_speaker_id,
+                    new_speaker_label,
+                    new_group_id,
+                    segment_id,
+                    voice_group_id,
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        for observation in &selected_observations {
+            tx.execute(
+                "UPDATE voice_observations SET voice_group_id=?1 WHERE id=?2",
+                params![new_group_id, observation.id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let (remaining_nonce, remaining_ct) = self
+            .crypto
+            .encrypt(bytemuck::cast_slice(&remaining_centroid));
+        let remaining_duration = remaining_observations
+            .iter()
+            .map(|observation| observation.speech_duration_ms)
+            .sum::<u64>();
+        let remaining_consistency = remaining_observations
+            .iter()
+            .map(|observation| observation.consistency_score)
+            .fold(1.0_f32, f32::min);
+        tx.execute(
+            "UPDATE session_voice_groups
+                SET centroid_nonce=?1, centroid_ct=?2,
+                    selected_duration_ms=?3, selected_window_count=?4,
+                    consistency_score=?5, split_status='applied'
+              WHERE id=?6",
+            params![
+                remaining_nonce,
+                remaining_ct,
+                remaining_duration.min(i64::MAX as u64) as i64,
+                remaining_observations.len().min(i64::MAX as usize) as i64,
+                f64::from(remaining_consistency),
+                voice_group_id,
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+
+        if let Some(original_speaker_id) = original_speaker_id.as_deref() {
+            let original_label: Option<String> = tx
+                .query_row(
+                    "SELECT label FROM speakers WHERE id=?1",
+                    params![original_speaker_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?
+                .flatten();
+            if original_label.as_deref().is_some_and(is_provisional_label) {
+                tx.execute(
+                    "DELETE FROM embeddings
+                      WHERE speaker_id=?1 AND source_session_id=?2",
+                    params![original_speaker_id, session_id],
+                )
+                .map_err(|error| error.to_string())?;
+                let replacement_embedding_id = Uuid::new_v4().to_string();
+                tx.execute(
+                    "INSERT INTO embeddings(
+                        id, speaker_id, vector_nonce, vector_ct, source_session_id,
+                        created_at, model_version, is_reference
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'wespeaker-ecapa512-lm-v4-vad', 1)",
+                    params![
+                        replacement_embedding_id,
+                        original_speaker_id,
+                        remaining_nonce,
+                        remaining_ct,
+                        session_id,
+                        now,
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+                tx.execute(
+                    "DELETE FROM speaker_samples WHERE speaker_id=?1",
+                    params![original_speaker_id],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Self::rebuild_session_transcripts_in_transaction(&tx, &self.crypto, &[session_id.clone()])?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(VoiceGroupSplitResult {
+            session_id,
+            original_group_id: voice_group_id.to_string(),
+            new_group_id,
+            new_speaker_id,
+            new_speaker_label,
+            moved_interventions: selected.len(),
+            remaining_interventions: all_segment_ids.len().saturating_sub(selected.len()),
+            backup_path: backup.to_string_lossy().to_string(),
+        })
+    }
+
+    pub fn active_processing_job_count(&self) -> Result<usize, String> {
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .query_row(
+                "SELECT COUNT(*) FROM processing_jobs WHERE status IN ('queued', 'processing')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|value| value.max(0) as usize)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn preview_voice_recognition_reset(&self) -> Result<VoiceRecognitionResetPreview, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let count = |sql: &str| -> Result<usize, String> {
+            conn.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map(|value| value.max(0) as usize)
+                .map_err(|error| error.to_string())
+        };
+        let provisional_profiles = {
+            let mut stmt = conn
+                .prepare("SELECT label FROM speakers")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, Option<String>>(0))
+                .map_err(|error| error.to_string())?;
+            let mut count = 0usize;
+            for row in rows {
+                if row
+                    .map_err(|error| error.to_string())?
+                    .as_deref()
+                    .is_some_and(is_provisional_label)
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+        Ok(VoiceRecognitionResetPreview {
+            voiceprints: count("SELECT COUNT(*) FROM embeddings")?,
+            temporary_samples: count("SELECT COUNT(*) FROM speaker_samples")?,
+            match_decisions: count("SELECT COUNT(*) FROM voice_match_decisions")?,
+            meeting_voice_groups: count("SELECT COUNT(*) FROM session_voice_groups")?,
+            voice_observations: count("SELECT COUNT(*) FROM voice_observations")?,
+            provisional_profiles,
+            provisional_attributions_demoted: count(
+                "SELECT COUNT(*) FROM segments
+                  WHERE speaker_id IN (
+                    SELECT id FROM speakers WHERE label GLOB 'VOICE[0-9]*'
+                  )",
+            )?,
+            named_profiles_preserved: count(
+                "SELECT COUNT(*) FROM speakers
+                  WHERE label IS NOT NULL AND TRIM(label) <> ''
+                    AND label NOT GLOB 'VOICE[0-9]*'",
+            )?,
+        })
+    }
+
+    pub fn reset_voice_recognition_data(&self) -> Result<VoiceRecognitionResetResult, String> {
+        let preview = self.preview_voice_recognition_reset()?;
+        let backup = self.verified_runtime_backup("pre-voice-reset-v4")?;
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let provisional_ids = {
+            let mut stmt = tx
+                .prepare("SELECT id, label FROM speakers")
+                .map_err(|error| error.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut ids = Vec::new();
+            for row in rows {
+                let (id, label) = row.map_err(|error| error.to_string())?;
+                if label.as_deref().is_some_and(is_provisional_label) {
+                    ids.push(id);
+                }
+            }
+            ids
+        };
+        for speaker_id in &provisional_ids {
+            tx.execute(
+                "UPDATE segments SET speaker_id=NULL WHERE speaker_id=?1",
+                params![speaker_id],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.execute("UPDATE segments SET voice_group_id=NULL", [])
+            .map_err(|error| error.to_string())?;
+        for table in [
+            "voice_observations",
+            "session_voice_groups",
+            "voice_match_decisions",
+            "speaker_samples",
+            "embeddings",
+        ] {
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .map_err(|error| error.to_string())?;
+        }
+        for speaker_id in &provisional_ids {
+            tx.execute("DELETE FROM speakers WHERE id=?1", params![speaker_id])
+                .map_err(|error| error.to_string())?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('voice_recognition_reset_v4_at', ?1)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        let integrity_check: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if integrity_check != "ok" {
+            return Err(format!(
+                "Voice reset completed but the database integrity check failed: {integrity_check}"
+            ));
+        }
+        drop(conn);
+        self.prune_reset_backups(&backup)?;
+        Ok(VoiceRecognitionResetResult {
+            preview,
+            backup_path: backup.to_string_lossy().to_string(),
+            integrity_check,
+        })
+    }
+
+    fn prune_reset_backups(&self, keep: &Path) -> Result<(), String> {
+        let database_path = self
+            .path
+            .as_ref()
+            .ok_or_else(|| "A file-backed database is required for backup retention".to_string())?;
+        let parent = database_path
+            .parent()
+            .ok_or_else(|| "Recall database path has no parent".to_string())?;
+        let stem = database_path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        let prefix = format!("{stem}.pre-voice-reset-v4-");
+        for entry in std::fs::read_dir(parent).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            let matches_family = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".db"));
+            if matches_family && path != keep {
+                std::fs::remove_file(&path).map_err(|error| {
+                    format!("Could not remove superseded voice-reset backup: {error}")
+                })?;
+            }
+        }
+        Ok(())
     }
 
     pub fn insert_voice_match_decision(
@@ -4496,6 +5519,12 @@ impl Db {
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
+            "UPDATE session_voice_groups SET resulting_speaker_id=NULL
+              WHERE resulting_speaker_id=?1",
+            params![speaker_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
             "DELETE FROM speaker_samples WHERE speaker_id=?1",
             params![speaker_id],
         )
@@ -4679,6 +5708,12 @@ impl Db {
             params![target_id, target_label, source_id],
         )
         .map_err(|e| e.to_string())?;
+        tx.execute(
+            "UPDATE session_voice_groups SET resulting_speaker_id=?1
+              WHERE resulting_speaker_id=?2",
+            params![target_id, source_id],
+        )
+        .map_err(|error| error.to_string())?;
 
         let target_is_named = target_label
             .as_deref()
@@ -4876,6 +5911,12 @@ impl Db {
         tx.execute(
             "UPDATE segments SET speaker_id=?1, speaker_label=?2 WHERE speaker_id=?3",
             params![target_id, &target_label, source_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "UPDATE session_voice_groups SET resulting_speaker_id=?1
+              WHERE resulting_speaker_id=?2",
+            params![target_id, source_id],
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
@@ -5484,6 +6525,29 @@ mod tests {
     }
 
     #[test]
+    fn processing_job_keeps_the_recordings_stt_context_for_retry() {
+        let db = memory_db();
+        let session_id = Uuid::new_v4().to_string();
+        let language_hints = vec!["en".to_string(), "bn".to_string()];
+        db.create_processing_session_with_context(
+            &session_id,
+            "run-context",
+            "Context meeting",
+            "Draft",
+            12_000,
+            "/tmp/context.wav",
+            &language_hints,
+            Some(6),
+        )
+        .unwrap();
+
+        let job = db.processing_job(&session_id).unwrap().unwrap();
+
+        assert_eq!(job.language_hints, language_hints);
+        assert_eq!(job.expected_speakers, Some(6));
+    }
+
+    #[test]
     fn failed_processing_keeps_the_draft_and_removes_partial_voice_artifacts() {
         let db = memory_db();
         let audio_path =
@@ -5639,6 +6703,58 @@ mod tests {
                 0o600
             );
         }
+        drop(migrated);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(backup).unwrap();
+    }
+
+    #[test]
+    fn processing_context_migration_backs_up_and_defaults_existing_jobs() {
+        let path = std::env::temp_dir().join(format!(
+            "recall-processing-context-migration-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let backup = Db::processing_context_migration_backup_path(&path);
+        let session_id = Uuid::new_v4().to_string();
+        {
+            let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+            db.create_processing_session(
+                &session_id,
+                "legacy-run",
+                "Legacy draft",
+                "Draft transcript",
+                1_000,
+                "/tmp/legacy-context.wav",
+            )
+            .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE processing_jobs SET status='failed', error='legacy failure'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "ALTER TABLE processing_jobs DROP COLUMN language_hints_json",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "ALTER TABLE processing_jobs DROP COLUMN expected_speakers",
+                [],
+            )
+            .unwrap();
+        }
+
+        let migrated = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let job = migrated.processing_job(&session_id).unwrap().unwrap();
+
+        assert!(backup.is_file());
+        assert!(job.language_hints.is_empty());
+        assert_eq!(job.expected_speakers, None);
+        assert_eq!(job.status, "failed");
+        assert_eq!(migrated.list_sessions().unwrap().len(), 1);
         drop(migrated);
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(backup).unwrap();
@@ -6946,6 +8062,277 @@ mod tests {
             .any(|speaker| speaker.id == alice));
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn voice_group_provenance_and_observation_counts_round_trip() {
+        let db = memory_db();
+        let session = db.insert_session("Voice provenance", "", 4_000).unwrap();
+        let speaker = db.insert_speaker(Some("VOICE8")).unwrap();
+        let group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 0,
+                resulting_speaker_id: Some(&speaker),
+                status: "provisional_new",
+                centroid: Some(&[1.0, 0.0]),
+                selected_duration_ms: 4_000,
+                selected_window_count: 1,
+                consistency_score: Some(1.0),
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        let segment = db
+            .insert_segment_with_provenance(
+                &session,
+                0,
+                4_000,
+                Some(&speaker),
+                Some("VOICE8"),
+                Some("speaker_2"),
+                Some(&group),
+                "Hello",
+            )
+            .unwrap();
+        db.insert_voice_observation(&VoiceObservationSave {
+            voice_group_id: &group,
+            session_id: &session,
+            segment_id: &segment,
+            start_ms: 500,
+            end_ms: 3_500,
+            vector: &[1.0, 0.0],
+            model_version: crate::embedding::EMBEDDING_VERSION,
+            speech_duration_ms: 3_000,
+            consistency_score: 1.0,
+        })
+        .unwrap();
+
+        let saved_segment = db.list_segments(&session).unwrap().remove(0);
+        assert_eq!(
+            saved_segment.provider_speaker_label.as_deref(),
+            Some("speaker_2")
+        );
+        assert_eq!(
+            saved_segment.voice_group_id.as_deref(),
+            Some(group.as_str())
+        );
+        let saved_group = db.list_session_voice_groups(&session).unwrap().remove(0);
+        assert_eq!(saved_group.provider_speaker_label, "speaker_2");
+        assert_eq!(saved_group.voice_observation_count, 1);
+        assert_eq!(saved_group.intervention_count, 1);
+    }
+
+    #[test]
+    fn reviewed_voice_group_split_is_backed_up_and_reassigns_only_selected_turns() {
+        let path =
+            std::env::temp_dir().join(format!("recall-voice-split-test-{}.sqlite", Uuid::new_v4()));
+        let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let session = db.insert_session("Mixed voice", "", 16_000).unwrap();
+        let original = db.insert_speaker(Some("Alice")).unwrap();
+        let group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_1",
+                cluster_index: 0,
+                resulting_speaker_id: Some(&original),
+                status: "automatic",
+                centroid: Some(&[0.7, 0.7]),
+                selected_duration_ms: 12_000,
+                selected_window_count: 4,
+                consistency_score: Some(0.8),
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        let mut segment_ids = Vec::new();
+        for index in 0..4 {
+            let start = index * 4_000;
+            let segment = db
+                .insert_segment_with_provenance(
+                    &session,
+                    start,
+                    start + 4_000,
+                    Some(&original),
+                    Some("Alice"),
+                    Some("speaker_1"),
+                    Some(&group),
+                    &format!("Turn {}", index + 1),
+                )
+                .unwrap();
+            let vector = if index < 2 { [1.0, 0.0] } else { [0.0, 1.0] };
+            db.insert_voice_observation(&VoiceObservationSave {
+                voice_group_id: &group,
+                session_id: &session,
+                segment_id: &segment,
+                start_ms: start as u64 + 500,
+                end_ms: start as u64 + 3_500,
+                vector: &vector,
+                model_version: crate::embedding::EMBEDDING_VERSION,
+                speech_duration_ms: 3_000,
+                consistency_score: 1.0,
+            })
+            .unwrap();
+            segment_ids.push(segment);
+        }
+        db.set_voice_group_split_suggestion(
+            &group,
+            &[segment_ids[..2].to_vec(), segment_ids[2..].to_vec()],
+        )
+        .unwrap();
+
+        let result = db
+            .split_voice_group(&group, &segment_ids[2..])
+            .expect("apply reviewed split");
+        assert!(Path::new(&result.backup_path).is_file());
+        assert_eq!(result.moved_interventions, 2);
+        assert_eq!(result.remaining_interventions, 2);
+        let segments = db.list_segments(&session).unwrap();
+        assert!(segments[..2]
+            .iter()
+            .all(|segment| segment.speaker_id.as_deref() == Some(original.as_str())));
+        assert!(segments[2..].iter().all(|segment| {
+            segment.speaker_id.as_deref() == Some(result.new_speaker_id.as_str())
+                && segment.speaker_label.as_deref() == Some(result.new_speaker_label.as_str())
+                && segment.voice_group_id.as_deref() == Some(result.new_group_id.as_str())
+        }));
+        let groups = db.list_session_voice_groups(&session).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert!(groups
+            .iter()
+            .all(|group| group.voice_observation_count == 2));
+        assert!(db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap()
+            .iter()
+            .any(|embedding| embedding.speaker_id == result.new_speaker_id));
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(result.backup_path);
+    }
+
+    #[test]
+    fn voice_reset_preserves_named_people_and_historical_labels_with_bounded_backups() {
+        let path =
+            std::env::temp_dir().join(format!("recall-voice-reset-test-{}.sqlite", Uuid::new_v4()));
+        let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let session = db.insert_session("Reset", "", 8_000).unwrap();
+        let named = db.insert_speaker(Some("Alice")).unwrap();
+        let provisional = db.insert_speaker(Some("VOICE41")).unwrap();
+        let named_segment = db
+            .insert_segment(
+                &session,
+                0,
+                4_000,
+                Some(&named),
+                Some("Alice"),
+                "Named turn",
+            )
+            .unwrap();
+        let group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 0,
+                resulting_speaker_id: Some(&provisional),
+                status: "provisional_new",
+                centroid: Some(&[0.0, 1.0]),
+                selected_duration_ms: 4_000,
+                selected_window_count: 1,
+                consistency_score: Some(1.0),
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        let provisional_segment = db
+            .insert_segment_with_provenance(
+                &session,
+                4_000,
+                8_000,
+                Some(&provisional),
+                Some("VOICE41"),
+                Some("speaker_2"),
+                Some(&group),
+                "Provisional turn",
+            )
+            .unwrap();
+        for speaker in [&named, &provisional] {
+            db.insert_embedding(
+                speaker,
+                &session,
+                &[1.0, 0.0],
+                crate::embedding::EMBEDDING_VERSION,
+            )
+            .unwrap();
+            db.insert_sample(speaker, "dGVzdA==", 16_000).unwrap();
+        }
+        db.insert_voice_observation(&VoiceObservationSave {
+            voice_group_id: &group,
+            session_id: &session,
+            segment_id: &provisional_segment,
+            start_ms: 4_500,
+            end_ms: 7_500,
+            vector: &[0.0, 1.0],
+            model_version: crate::embedding::EMBEDDING_VERSION,
+            speech_duration_ms: 3_000,
+            consistency_score: 1.0,
+        })
+        .unwrap();
+        let provider_speakers = vec!["speaker_2".to_string()];
+        db.insert_voice_match_decision(&VoiceMatchDecisionSave {
+            session_id: &session,
+            provider_speakers: &provider_speakers,
+            resulting_speaker_id: Some(&provisional),
+            best_speaker_id: Some(&named),
+            runner_up_speaker_id: None,
+            best_score: Some(0.8),
+            runner_up_score: None,
+            support_count: 1,
+            selected_duration_ms: 3_000,
+            selected_window_count: 1,
+            consistency_score: Some(1.0),
+            model_version: crate::embedding::EMBEDDING_VERSION,
+            decision: "suggested",
+            reason: "test",
+        })
+        .unwrap();
+
+        let preview = db.preview_voice_recognition_reset().unwrap();
+        assert_eq!(preview.voiceprints, 2);
+        assert_eq!(preview.temporary_samples, 2);
+        assert_eq!(preview.provisional_profiles, 1);
+        assert_eq!(preview.named_profiles_preserved, 1);
+        let first = db.reset_voice_recognition_data().unwrap();
+        assert_eq!(first.integrity_check, "ok");
+        assert!(Path::new(&first.backup_path).is_file());
+        let speakers = db.list_speakers().unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].id, named);
+        assert_eq!(speakers[0].label.as_deref(), Some("Alice"));
+        let segments = db.list_segments(&session).unwrap();
+        let named_after = segments
+            .iter()
+            .find(|segment| segment.id == named_segment)
+            .unwrap();
+        assert_eq!(named_after.speaker_id.as_deref(), Some(named.as_str()));
+        let provisional_after = segments
+            .iter()
+            .find(|segment| segment.id == provisional_segment)
+            .unwrap();
+        assert!(provisional_after.speaker_id.is_none());
+        assert_eq!(provisional_after.speaker_label.as_deref(), Some("VOICE41"));
+        assert!(provisional_after.voice_group_id.is_none());
+        assert!(db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap()
+            .is_empty());
+        assert!(db.list_session_voice_groups(&session).unwrap().is_empty());
+        assert_eq!(db.next_voice_label().unwrap(), "VOICE42");
+
+        let second = db.reset_voice_recognition_data().unwrap();
+        assert!(Path::new(&second.backup_path).is_file());
+        assert!(!Path::new(&first.backup_path).exists());
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(second.backup_path);
     }
 
     #[test]
