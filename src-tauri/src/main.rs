@@ -37,20 +37,28 @@ mod embedding;
 mod jamie_import;
 mod openai;
 mod recap;
+mod recap_prompt_variables;
 mod soniox;
 mod state;
 mod vad;
 
 use config::AppConfig;
 use db::{
-    AgendaMetadata, AgendaRecord, Crypto, Db, ImportedSessionArtifact, RecapRecord, RecapSave,
-    SegmentRecord, Session, SessionSummary, SessionVoiceGroup, SessionVoiceGroupSave, Speaker,
-    StoredEmbedding, VoiceGroupSplitResult, VoiceMatchDecisionSave, VoiceObservationSave,
-    VoiceRecognitionResetPreview, VoiceRecognitionResetResult,
+    AgendaMetadata, AgendaRecord, Crypto, CustomRecapSave, Db, ImportedSessionArtifact,
+    RecapRecord, RecapSave, RecapType, SegmentRecord, Session, SessionSummary, SessionVoiceGroup,
+    SessionVoiceGroupSave, Speaker, StoredEmbedding, VoiceGroupSplitResult, VoiceMatchDecisionSave,
+    VoiceObservationSave, VoiceRecognitionResetPreview, VoiceRecognitionResetResult,
+    RECAP_TYPE_KIND_CUSTOM,
 };
 use embedding::EMBEDDING_VERSION;
 use jamie_import::{JamieImportDraft, JamieImportPreview};
-use recap::{AgendaFingerprint, RecapSourceSegment};
+use recap::{
+    AgendaFingerprint, RecapSourceSegment, StandardRecapPrompts, BUILTIN_ACTIONS_ID,
+    BUILTIN_EXECUTIVE_SUMMARY_ID, BUILTIN_FULL_SUMMARY_ID,
+};
+use recap_prompt_variables::{
+    expand_recap_prompt, RecapPromptVariableContext, RecapPromptVariableDefinition,
+};
 use soniox::{LiveAudioMessage, LiveTranscriptEvent, TranscriptSegment};
 use state::AppState;
 
@@ -59,7 +67,14 @@ const MIN_SPEAKER_MS: u64 = 3_000;
 const SAMPLE_EDGE_TRIM_MS: u64 = 350;
 const SAMPLE_WINDOW_MS: u64 = 4_000;
 const SAMPLE_OVERLAP_TOLERANCE_MS: u64 = 200;
-const MAX_SAMPLE_WINDOWS_PER_SPEAKER: usize = 8;
+// Spread each bounded candidate batch across interventions before taking a
+// second window from any one intervention. If a batch has no strict consistent
+// majority, a small number of later batches may recover from a locally noisy
+// or mixed first selection without turning the full recording into evidence.
+const SAMPLE_WINDOWS_PER_CANDIDATE_BATCH: usize = 8;
+const MAX_SAMPLE_CANDIDATE_BATCHES: usize = 3;
+const MAX_SAMPLE_WINDOWS_PER_SPEAKER: usize =
+    SAMPLE_WINDOWS_PER_CANDIDATE_BATCH * MAX_SAMPLE_CANDIDATE_BATCHES;
 const SAMPLE_CONSISTENCY_THRESHOLD: f32 = 0.90;
 const SAME_VOICE_SPLIT_THRESHOLD: f32 = 0.995;
 const MIN_COALESCE_WINDOWS_PER_LABEL: usize = 2;
@@ -142,7 +157,15 @@ struct SampleWindow {
     start_ms: u64,
     end_ms: u64,
     segment_index: usize,
+    candidate_batch: usize,
     pcm: Vec<f32>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TrustedSampleBatch {
+    batch_index: usize,
+    window_indices: Vec<usize>,
+    candidate_count: usize,
 }
 
 #[derive(Debug)]
@@ -158,6 +181,12 @@ struct VoiceGroupAssignment {
     group_id: String,
 }
 
+#[derive(Debug)]
+struct MeetingLocalPreviewPersistence {
+    diarized_speaker: String,
+    result: Result<(), String>,
+}
+
 #[derive(Debug, Serialize, Clone)]
 struct ProgressEvent {
     event_id: String,
@@ -171,6 +200,10 @@ struct RecapProgressEvent {
     session_id: String,
     stage: String,
     detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recap_type_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recap_type_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -289,10 +322,48 @@ struct PreferenceUpdate {
 struct RecapStateView {
     agenda: Option<AgendaMetadata>,
     recap: Option<RecapRecord>,
+    custom_recaps: Vec<CustomRecapStateView>,
     current_fingerprint: String,
     stale: bool,
     unresolved_profiles: Vec<String>,
     in_flight: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomRecapStateView {
+    recap_type_id: String,
+    name: String,
+    content_markdown: String,
+    target_language: String,
+    model: String,
+    source_fingerprint: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    generated_at: chrono::DateTime<chrono::Utc>,
+    stale: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RecapTypeView {
+    id: String,
+    kind: String,
+    name: String,
+    prompt: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl RecapTypeView {
+    fn from_record(value: RecapType, include_prompt: bool) -> Self {
+        Self {
+            id: value.id,
+            kind: value.kind,
+            name: value.name,
+            prompt: include_prompt.then_some(value.prompt),
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -312,6 +383,7 @@ struct VoiceRecognitionResetReadiness {
 }
 
 struct RecapSnapshot {
+    meeting_created_at: chrono::DateTime<chrono::Utc>,
     segments: Vec<RecapSourceSegment>,
     agenda: Option<AgendaRecord>,
     source_fingerprint: String,
@@ -1122,8 +1194,7 @@ fn transcribe_file_inner(
             &db,
             embedder.as_ref(),
             speech_intervals.as_deref(),
-            app_handle,
-            run_id,
+            (app_handle, run_id),
         )?;
     } else {
         process_segments(
@@ -1133,8 +1204,7 @@ fn transcribe_file_inner(
             &db,
             None,
             speech_intervals.as_deref(),
-            app_handle,
-            run_id,
+            (app_handle, run_id),
         )?;
     }
     emit_progress(
@@ -1735,6 +1805,58 @@ fn sample_range(audio: &AudioClip, start_ms: u64, end_ms: u64) -> Option<Vec<f32
     (end > start).then(|| audio.samples[start..end].to_vec())
 }
 
+fn bounded_centered_sample_ranges(
+    speech_intervals: &[vad::SpeechInterval],
+    segment_midpoint: u64,
+) -> (Vec<(u64, u64)>, usize) {
+    let mut ranges = Vec::new();
+    let mut short_speech_intervals = 0usize;
+    let range_cap = MAX_SAMPLE_WINDOWS_PER_SPEAKER as u64;
+
+    for interval in speech_intervals {
+        let speech_duration = interval.duration_ms();
+        if speech_duration < MIN_SPEAKER_MS {
+            short_speech_intervals += 1;
+            continue;
+        }
+        let full_windows = speech_duration / SAMPLE_WINDOW_MS;
+        if full_windows == 0 {
+            ranges.push((interval.start_ms, interval.end_ms));
+        } else {
+            let used = full_windows * SAMPLE_WINDOW_MS;
+            let offset = (speech_duration - used) / 2;
+            let first_start = interval.start_ms + offset;
+            let first_center = first_start + (SAMPLE_WINDOW_MS / 2);
+            let nearest_index = segment_midpoint
+                .saturating_sub(first_center)
+                .saturating_add(SAMPLE_WINDOW_MS / 2)
+                / SAMPLE_WINDOW_MS;
+            let nearest_index = nearest_index.min(full_windows.saturating_sub(1));
+            let selected_window_count = full_windows.min(range_cap);
+            let first_index = nearest_index
+                .saturating_sub(selected_window_count / 2)
+                .min(full_windows - selected_window_count);
+            ranges.extend(
+                (first_index..first_index + selected_window_count).map(|index| {
+                    let start = first_start + (index * SAMPLE_WINDOW_MS);
+                    (start, start + SAMPLE_WINDOW_MS)
+                }),
+            );
+        }
+
+        // Keep only the globally best bounded set while walking VAD intervals,
+        // rather than materializing every possible window in a long recording.
+        ranges.sort_by_key(|(start, end)| {
+            start
+                .saturating_add(end.saturating_sub(*start) / 2)
+                .abs_diff(segment_midpoint)
+        });
+        ranges.truncate(MAX_SAMPLE_WINDOWS_PER_SPEAKER);
+    }
+
+    (ranges, short_speech_intervals)
+}
+
 fn clean_sample_windows(
     audio: &AudioClip,
     segments: &[TranscriptSegment],
@@ -1752,11 +1874,9 @@ fn clean_sample_windows(
         (right.end_ms - right.start_ms).cmp(&(left.end_ms - left.start_ms))
     });
     let mut result = SampleWindowSet::default();
+    let mut candidate_ranges_by_intervention = Vec::new();
 
     for (segment_index, segment) in speaker_segments {
-        if result.windows.len() >= MAX_SAMPLE_WINDOWS_PER_SPEAKER {
-            break;
-        }
         if overlaps_other_speaker(segment, segments) {
             result.overlapping_segments += 1;
             continue;
@@ -1778,42 +1898,57 @@ fn clean_sample_windows(
             result.no_speech_segments += 1;
             continue;
         }
-        let mut ranges = Vec::new();
-        for interval in speech {
-            let speech_duration = interval.duration_ms();
-            if speech_duration < MIN_SPEAKER_MS {
-                result.short_speech_intervals += 1;
-                continue;
-            }
-            let full_windows = speech_duration / SAMPLE_WINDOW_MS;
-            if full_windows == 0 {
-                ranges.push((interval.start_ms, interval.end_ms));
-            } else {
-                let used = full_windows * SAMPLE_WINDOW_MS;
-                let offset = (speech_duration - used) / 2;
-                ranges.extend((0..full_windows).map(|index| {
-                    let start = interval.start_ms + offset + (index * SAMPLE_WINDOW_MS);
-                    (start, start + SAMPLE_WINDOW_MS)
-                }));
-            }
-        }
-        let segment_midpoint = segment.start_ms + (duration_ms / 2);
-        ranges.sort_by_key(|(start, end)| (start + ((end - start) / 2)).abs_diff(segment_midpoint));
-
-        for (start_ms, end_ms) in ranges {
-            if result.windows.len() >= MAX_SAMPLE_WINDOWS_PER_SPEAKER {
+        let segment_midpoint = segment.start_ms.saturating_add(duration_ms / 2);
+        let (ranges, short_speech_intervals) =
+            bounded_centered_sample_ranges(&speech, segment_midpoint);
+        result.short_speech_intervals += short_speech_intervals;
+        if !ranges.is_empty() {
+            candidate_ranges_by_intervention.push(
+                ranges
+                    .into_iter()
+                    .map(|(start_ms, end_ms)| (start_ms, end_ms, segment_index))
+                    .collect::<Vec<_>>(),
+            );
+            // One window from each of this many eligible interventions fills
+            // the complete bounded candidate set, so later interventions
+            // cannot be selected by the round-robin scheduler.
+            if candidate_ranges_by_intervention.len() >= MAX_SAMPLE_WINDOWS_PER_SPEAKER {
                 break;
             }
-            let Some(pcm) = sample_range(audio, start_ms, end_ms) else {
-                continue;
-            };
-            result.windows.push(SampleWindow {
-                start_ms,
-                end_ms,
-                segment_index,
-                pcm,
-            });
         }
+    }
+
+    // Walk the eligible interventions round-robin. This makes the first
+    // candidate round representative of distinct interventions instead of
+    // allowing the longest intervention to consume the complete window cap.
+    let mut next_range_indices = vec![0usize; candidate_ranges_by_intervention.len()];
+    let mut intervention_cursor = 0usize;
+    let mut consecutive_exhausted = 0usize;
+    while result.windows.len() < MAX_SAMPLE_WINDOWS_PER_SPEAKER
+        && !candidate_ranges_by_intervention.is_empty()
+        && consecutive_exhausted < candidate_ranges_by_intervention.len()
+    {
+        let intervention_index = intervention_cursor % candidate_ranges_by_intervention.len();
+        intervention_cursor += 1;
+        let range_index = next_range_indices[intervention_index];
+        let Some(&(start_ms, end_ms, segment_index)) =
+            candidate_ranges_by_intervention[intervention_index].get(range_index)
+        else {
+            consecutive_exhausted += 1;
+            continue;
+        };
+        next_range_indices[intervention_index] += 1;
+        consecutive_exhausted = 0;
+        let Some(pcm) = sample_range(audio, start_ms, end_ms) else {
+            continue;
+        };
+        result.windows.push(SampleWindow {
+            start_ms,
+            end_ms,
+            segment_index,
+            candidate_batch: result.windows.len() / SAMPLE_WINDOWS_PER_CANDIDATE_BATCH,
+            pcm,
+        });
     }
     result
 }
@@ -1824,7 +1959,7 @@ fn dominant_consistent_indices(vectors: &[Vec<f32>]) -> Vec<usize> {
     }
     let mut best_members = Vec::new();
     let mut best_similarity = f32::NEG_INFINITY;
-    for (index, vector) in vectors.iter().enumerate() {
+    for vector in vectors {
         let members = vectors
             .iter()
             .enumerate()
@@ -1843,14 +1978,46 @@ fn dominant_consistent_indices(vectors: &[Vec<f32>]) -> Vec<usize> {
             best_members = members;
             best_similarity = similarity;
         }
-        if index + 1 == vectors.len()
-            && vectors.len() > 1
-            && best_members.len() * 2 <= vectors.len()
-        {
-            return Vec::new();
-        }
     }
-    best_members
+    if best_members.len() * 2 > vectors.len() {
+        best_members
+    } else {
+        Vec::new()
+    }
+}
+
+fn first_trusted_sample_batch(
+    embedded_windows: &[(SampleWindow, Vec<f32>)],
+) -> Option<TrustedSampleBatch> {
+    for batch_index in 0..MAX_SAMPLE_CANDIDATE_BATCHES {
+        let candidate_indices = embedded_windows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (window, _))| {
+                (window.candidate_batch == batch_index).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if candidate_indices.is_empty() {
+            continue;
+        }
+        let vectors = candidate_indices
+            .iter()
+            .map(|index| embedded_windows[*index].1.clone())
+            .collect::<Vec<_>>();
+        let consistent_indices = dominant_consistent_indices(&vectors);
+        if consistent_indices.is_empty() {
+            continue;
+        }
+        return Some(TrustedSampleBatch {
+            batch_index,
+            window_indices: consistent_indices
+                .into_iter()
+                .map(|index| candidate_indices[index])
+                .collect(),
+            candidate_count: candidate_indices.len(),
+        });
+    }
+    None
 }
 
 fn average_embeddings(vectors: impl Iterator<Item = Vec<f32>>) -> Vec<f32> {
@@ -2091,6 +2258,117 @@ fn suggested_split_clusters(
     )
 }
 
+fn model_unavailable_voice_reason(
+    speech_intervals: Option<&[vad::SpeechInterval]>,
+) -> &'static str {
+    if speech_intervals.is_none() {
+        "the local VAD model was unavailable, so Recall did not create a global voice profile"
+    } else {
+        "the local ECAPA model was unavailable, so Recall did not create a global voice profile"
+    }
+}
+
+fn persist_model_unavailable_voice_groups(
+    audio: &AudioClip,
+    segments: &[TranscriptSegment],
+    ordered_speakers: &[String],
+    session_id: &str,
+    db: &Db,
+    speech_intervals: Option<&[vad::SpeechInterval]>,
+) -> Result<Vec<MeetingLocalPreviewPersistence>, String> {
+    let reason = model_unavailable_voice_reason(speech_intervals);
+    let mut assignments = HashMap::new();
+    let mut meeting_local_previews = HashMap::new();
+    for diarized_speaker in ordered_speakers
+        .iter()
+        .filter(|label| label.as_str() != "unknown")
+    {
+        if let Some(speech_intervals) = speech_intervals {
+            if let Some(window) =
+                clean_sample_windows(audio, segments, diarized_speaker, speech_intervals)
+                    .windows
+                    .into_iter()
+                    .next()
+            {
+                meeting_local_previews.insert(diarized_speaker.clone(), window.pcm);
+            }
+        }
+        let group_id = db.insert_session_voice_group(&SessionVoiceGroupSave {
+            session_id,
+            provider_speaker_label: diarized_speaker,
+            cluster_index: 0,
+            resulting_speaker_id: None,
+            status: "meeting_local_model_unavailable",
+            centroid: None,
+            selected_duration_ms: 0,
+            selected_window_count: 0,
+            consistency_score: None,
+            model_version: None,
+        })?;
+        let provider_speakers = vec![diarized_speaker.clone()];
+        db.insert_voice_match_decision(&VoiceMatchDecisionSave {
+            session_id,
+            provider_speakers: &provider_speakers,
+            resulting_speaker_id: None,
+            best_speaker_id: None,
+            runner_up_speaker_id: None,
+            best_score: None,
+            runner_up_score: None,
+            support_count: 0,
+            selected_duration_ms: 0,
+            selected_window_count: 0,
+            consistency_score: None,
+            model_version: EMBEDDING_VERSION,
+            decision: VoiceMatchKind::Skipped.as_str(),
+            reason,
+        })?;
+        assignments.insert(
+            diarized_speaker.clone(),
+            VoiceGroupAssignment {
+                speaker_id: None,
+                display_label: diarized_speaker.clone(),
+                group_id,
+            },
+        );
+    }
+    for segment in segments {
+        let assignment = assignments.get(&segment.speaker);
+        db.insert_segment_with_provenance(
+            session_id,
+            segment.start_ms as i64,
+            segment.end_ms as i64,
+            None,
+            assignment
+                .map(|value| value.display_label.as_str())
+                .or(Some("Unknown speaker")),
+            (segment.speaker != "unknown").then_some(segment.speaker.as_str()),
+            assignment.map(|value| value.group_id.as_str()),
+            segment.text.trim(),
+        )?;
+    }
+
+    let mut preview_results = Vec::new();
+    for diarized_speaker in ordered_speakers
+        .iter()
+        .filter(|label| label.as_str() != "unknown")
+    {
+        let Some(preview_pcm) = meeting_local_previews.remove(diarized_speaker) else {
+            continue;
+        };
+        let assignment = assignments
+            .get(diarized_speaker)
+            .expect("every non-unknown diarized speaker has a meeting-local group");
+        let result = encode_wav_base64(&preview_pcm, audio.sample_rate).and_then(|sample| {
+            db.upsert_voice_group_sample(&assignment.group_id, &sample, audio.sample_rate)
+        });
+        preview_results.push(MeetingLocalPreviewPersistence {
+            diarized_speaker: diarized_speaker.clone(),
+            result,
+        });
+    }
+    Ok(preview_results)
+}
+
 fn process_segments(
     audio: &AudioClip,
     segments: &[TranscriptSegment],
@@ -2098,9 +2376,9 @@ fn process_segments(
     db: &Db,
     embedder: Option<&embedding::Embedder>,
     speech_intervals: Option<&[vad::SpeechInterval]>,
-    app_handle: &tauri::AppHandle,
-    run_id: &str,
+    progress: (&tauri::AppHandle, &str),
 ) -> Result<(), String> {
+    let (app_handle, run_id) = progress;
     let known = db.list_embeddings(EMBEDDING_VERSION)?;
     let mut ordered_speakers = Vec::new();
     let mut seen = HashSet::new();
@@ -2115,70 +2393,39 @@ fn process_segments(
         Vec<InterventionVoiceObservation>,
     > = HashMap::new();
     let mut skipped_reasons: HashMap<String, String> = HashMap::new();
+    let mut meeting_local_previews: HashMap<String, Vec<f32>> = HashMap::new();
 
     if embedder.is_none() || speech_intervals.is_none() {
-        let reason = if speech_intervals.is_none() {
-            "the local VAD model was unavailable, so Recall did not create a global voice profile"
-        } else {
-            "the local ECAPA model was unavailable, so Recall did not create a global voice profile"
-        };
-        let mut assignments = HashMap::new();
-        for diarized_speaker in ordered_speakers
-            .iter()
-            .filter(|label| label.as_str() != "unknown")
-        {
-            let group_id = db.insert_session_voice_group(&SessionVoiceGroupSave {
-                session_id,
-                provider_speaker_label: diarized_speaker,
-                cluster_index: 0,
-                resulting_speaker_id: None,
-                status: "meeting_local_model_unavailable",
-                centroid: None,
-                selected_duration_ms: 0,
-                selected_window_count: 0,
-                consistency_score: None,
-                model_version: None,
-            })?;
-            let provider_speakers = vec![diarized_speaker.clone()];
-            db.insert_voice_match_decision(&VoiceMatchDecisionSave {
-                session_id,
-                provider_speakers: &provider_speakers,
-                resulting_speaker_id: None,
-                best_speaker_id: None,
-                runner_up_speaker_id: None,
-                best_score: None,
-                runner_up_score: None,
-                support_count: 0,
-                selected_duration_ms: 0,
-                selected_window_count: 0,
-                consistency_score: None,
-                model_version: EMBEDDING_VERSION,
-                decision: VoiceMatchKind::Skipped.as_str(),
-                reason,
-            })?;
-            assignments.insert(
-                diarized_speaker.clone(),
-                VoiceGroupAssignment {
-                    speaker_id: None,
-                    display_label: diarized_speaker.clone(),
-                    group_id,
-                },
-            );
-        }
-        for segment in segments {
-            let assignment = assignments.get(&segment.speaker);
-            db.insert_segment_with_provenance(
-                session_id,
-                segment.start_ms as i64,
-                segment.end_ms as i64,
-                None,
-                assignment
-                    .map(|value| value.display_label.as_str())
-                    .or(Some("Unknown speaker")),
-                (segment.speaker != "unknown").then_some(segment.speaker.as_str()),
-                assignment.map(|value| value.group_id.as_str()),
-                segment.text.trim(),
-            )?;
+        let reason = model_unavailable_voice_reason(speech_intervals);
+        let preview_results = persist_model_unavailable_voice_groups(
+            audio,
+            segments,
+            &ordered_speakers,
+            session_id,
+            db,
+            speech_intervals,
+        )?;
+        for preview_result in preview_results {
+            let diarized_speaker = preview_result.diarized_speaker;
+            let result = preview_result.result;
+            match result {
+                Ok(()) => emit_progress(
+                    app_handle,
+                    "voiceprint:meeting-local-sample:stored",
+                    Some(format!(
+                        "Stored a VAD-confirmed meeting-local preview for {diarized_speaker} because the ECAPA model was unavailable"
+                    )),
+                    Some(run_id),
+                ),
+                Err(error) => emit_progress(
+                    app_handle,
+                    "voiceprint:warning",
+                    Some(format!(
+                        "{diarized_speaker}: could not retain the meeting-local preview: {error}"
+                    )),
+                    Some(run_id),
+                ),
+            }
         }
         emit_progress(
             app_handle,
@@ -2222,23 +2469,39 @@ fn process_segments(
         }
 
         let mut embedded_windows = Vec::new();
-        for window in window_set.windows {
-            match embedder.embed(&window.pcm, audio.sample_rate) {
-                Ok(embedding) => embedded_windows.push((window, embedding)),
-                Err(error) => emit_progress(
-                    app_handle,
-                    "voiceprint:warning",
-                    Some(format!(
-                        "{diarized_speaker}: rejected one candidate excerpt: {error}"
-                    )),
-                    Some(run_id),
-                ),
+        let mut candidate_windows = window_set.windows.into_iter().peekable();
+        let mut trusted_batch = None;
+        for batch_index in 0..MAX_SAMPLE_CANDIDATE_BATCHES {
+            while candidate_windows
+                .peek()
+                .map(|window| window.candidate_batch == batch_index)
+                .unwrap_or(false)
+            {
+                let window = candidate_windows.next().expect("peeked candidate window");
+                meeting_local_previews
+                    .entry(diarized_speaker.clone())
+                    .or_insert_with(|| window.pcm.clone());
+                match embedder.embed(&window.pcm, audio.sample_rate) {
+                    Ok(embedding) => embedded_windows.push((window, embedding)),
+                    Err(error) => emit_progress(
+                        app_handle,
+                        "voiceprint:warning",
+                        Some(format!(
+                            "{diarized_speaker}: rejected one candidate excerpt: {error}"
+                        )),
+                        Some(run_id),
+                    ),
+                }
+            }
+            trusted_batch = first_trusted_sample_batch(&embedded_windows);
+            if trusted_batch.is_some() {
+                break;
             }
         }
-        let vectors = embedded_windows
-            .iter()
-            .map(|(_, embedding)| embedding.clone())
-            .collect::<Vec<_>>();
+
+        // Split review must see both the trusted majority and any outlier
+        // interventions from every batch that was evaluated. Later unneeded
+        // batches remain unembedded once a trusted batch has been found.
         let all_window_indices = (0..embedded_windows.len()).collect::<Vec<_>>();
         let intervention_observations =
             intervention_observations(&embedded_windows, &all_window_indices);
@@ -2246,10 +2509,9 @@ fn process_segments(
             intervention_observations_by_speaker
                 .insert(diarized_speaker.clone(), intervention_observations.clone());
         }
-        let consistent_indices = dominant_consistent_indices(&vectors);
-        if consistent_indices.is_empty() {
+        let Some(trusted_batch) = trusted_batch else {
             let reason =
-                "VAD-confirmed excerpts were not internally consistent enough for a trusted voiceprint"
+                "no bounded candidate batch had a strict internally consistent majority for a trusted voiceprint"
                     .to_string();
             skipped_reasons.insert(diarized_speaker.clone(), reason.clone());
             emit_progress(
@@ -2259,7 +2521,8 @@ fn process_segments(
                 Some(run_id),
             );
             continue;
-        }
+        };
+        let consistent_indices = trusted_batch.window_indices;
 
         let target_samples = ((audio.sample_rate as u64 * TARGET_SPEAKER_MS) / 1_000) as usize;
         let mut selected_samples_total = 0usize;
@@ -2320,12 +2583,22 @@ fn process_segments(
             .max_by_key(|window| window.end_ms.saturating_sub(window.start_ms))
             .map(|window| window.pcm.clone())
             .unwrap_or_default();
-        let consistency_rejections = embedded_windows.len() - consistent_indices.len();
+        let consistency_rejections = trusted_batch
+            .candidate_count
+            .saturating_sub(consistent_indices.len());
+        let fallback_batch_note = if trusted_batch.batch_index == 0 {
+            String::new()
+        } else {
+            format!(
+                " using fallback batch {}",
+                trusted_batch.batch_index.saturating_add(1)
+            )
+        };
         emit_progress(
             app_handle,
             "voiceprint:sample:selected",
             Some(format!(
-                "{diarized_speaker}: selected {selected_windows} clean central excerpt{} ({:.1}s); rejected {} inconsistent, {} overlapping, {} short, and {} silent candidate{}",
+                "{diarized_speaker}: selected {selected_windows} clean central excerpt{} ({:.1}s){fallback_batch_note}; rejected {} inconsistent, {} overlapping, {} short, and {} silent candidate{}",
                 if selected_windows == 1 { "" } else { "s" },
                 sample_duration_ms.min(selected_ms) as f64 / 1_000.0,
                 consistency_rejections,
@@ -2561,7 +2834,7 @@ fn process_segments(
             app_handle,
             "voiceprint:meeting-local",
             Some(format!(
-                "{diarized_speaker}: no global VOICE profile or preview was created; {reason}"
+                "{diarized_speaker}: no global VOICE profile was created; {reason}"
             )),
             Some(run_id),
         );
@@ -2608,6 +2881,35 @@ fn process_segments(
             segment.text.trim(),
         )?;
         segment_ids.insert(segment_index, segment_id);
+    }
+
+    for (diarized_speaker, preview_pcm) in meeting_local_previews {
+        let Some(assignment) = mapping.get(&diarized_speaker) else {
+            continue;
+        };
+        if assignment.speaker_id.is_some() || preview_pcm.is_empty() {
+            continue;
+        }
+        match encode_wav_base64(&preview_pcm, audio.sample_rate).and_then(|sample| {
+            db.upsert_voice_group_sample(&assignment.group_id, &sample, audio.sample_rate)
+        }) {
+            Ok(()) => emit_progress(
+                app_handle,
+                "voiceprint:meeting-local-sample:stored",
+                Some(format!(
+                    "Stored a meeting-local preview for {diarized_speaker}"
+                )),
+                Some(run_id),
+            ),
+            Err(error) => emit_progress(
+                app_handle,
+                "voiceprint:warning",
+                Some(format!(
+                    "{diarized_speaker}: could not retain the meeting-local preview: {error}"
+                )),
+                Some(run_id),
+            ),
+        }
     }
 
     for (diarized_speaker, interventions) in &intervention_observations_by_speaker {
@@ -3095,7 +3397,7 @@ fn update_segment_text(
 ) -> Result<(), String> {
     ensure_session_not_recapping(app_state.inner(), &session_id)?;
     let db = app_state.db_handle()?;
-    db.update_segment_text(&segment_id, &text)?;
+    db.update_segment_text(&session_id, &segment_id, &text)?;
     refresh_session_transcript(&db, &session_id)
 }
 
@@ -3110,7 +3412,7 @@ fn assign_segment_speaker(
     let sessions = vec![session_id.clone()];
     claim_identity_sessions(app_state.inner(), &sessions)?;
     let result = db
-        .assign_segment_speaker(&segment_id, speaker_id.as_deref())
+        .assign_segment_speaker(&session_id, &segment_id, speaker_id.as_deref())
         .and_then(|_| refresh_session_transcript(&db, &session_id));
     release_identity_sessions(app_state.inner(), &sessions);
     result
@@ -3133,11 +3435,62 @@ fn delete_session(session_id: String, app_state: State<AppState>) -> Result<usiz
 }
 
 fn recap_snapshot(db: &Db, session_id: &str) -> Result<RecapSnapshot, String> {
-    let session = db
-        .get_session(session_id)?
-        .ok_or_else(|| "Conversation not found".to_string())?;
-    let stored_segments = db.list_segments(session_id)?;
-    recap_snapshot_from(db, &session, &stored_segments)
+    let source = db.recap_source_snapshot(session_id)?;
+    let mut seen_unresolved = HashSet::new();
+    let unresolved_profiles = source
+        .segments
+        .iter()
+        .filter_map(|segment| {
+            let unresolved = segment.speaker_id.is_none()
+                || segment.speaker_label.trim().is_empty()
+                || segment
+                    .speaker_label
+                    .eq_ignore_ascii_case("Unknown speaker")
+                || is_provisional_label(&segment.speaker_label);
+            (unresolved && seen_unresolved.insert(segment.speaker_label.clone()))
+                .then(|| segment.speaker_label.clone())
+        })
+        .collect::<Vec<_>>();
+    Ok(RecapSnapshot {
+        meeting_created_at: source.meeting_created_at,
+        segments: source.segments,
+        agenda: source.agenda,
+        source_fingerprint: source.source_fingerprint,
+        unresolved_profiles,
+    })
+}
+
+fn standard_recap_prompts(
+    db: &Db,
+    variable_context: &RecapPromptVariableContext,
+) -> Result<StandardRecapPrompts, String> {
+    let mut executive_summary = None;
+    let mut full_summary = None;
+    let mut actions = None;
+    for recap_type in db.list_recap_types()? {
+        match recap_type.id.as_str() {
+            BUILTIN_EXECUTIVE_SUMMARY_ID => executive_summary = Some(recap_type.prompt),
+            BUILTIN_FULL_SUMMARY_ID => full_summary = Some(recap_type.prompt),
+            BUILTIN_ACTIONS_ID => actions = Some(recap_type.prompt),
+            _ => {}
+        }
+    }
+    let templates = StandardRecapPrompts {
+        executive_summary: executive_summary
+            .ok_or_else(|| "The Executive summary recap type is missing".to_string())?,
+        full_summary: full_summary
+            .ok_or_else(|| "The Full summary recap type is missing".to_string())?,
+        actions: actions.ok_or_else(|| "The Actions recap type is missing".to_string())?,
+    };
+    Ok(StandardRecapPrompts {
+        executive_summary: expand_recap_prompt(&templates.executive_summary, variable_context),
+        full_summary: expand_recap_prompt(&templates.full_summary, variable_context),
+        actions: expand_recap_prompt(&templates.actions, variable_context),
+    })
+}
+
+fn recap_prompt_variable_context(snapshot: &RecapSnapshot) -> RecapPromptVariableContext {
+    RecapPromptVariableContext::from_desktop_local(snapshot.meeting_created_at)
 }
 
 fn recap_snapshot_from(
@@ -3180,6 +3533,9 @@ fn recap_snapshot_from(
         .filter_map(|segment| {
             let unresolved = segment.speaker_id.is_none()
                 || segment.speaker_label.trim().is_empty()
+                || segment
+                    .speaker_label
+                    .eq_ignore_ascii_case("Unknown speaker")
                 || is_provisional_label(&segment.speaker_label);
             (unresolved && seen_unresolved.insert(segment.speaker_label.clone()))
                 .then(|| segment.speaker_label.clone())
@@ -3194,6 +3550,7 @@ fn recap_snapshot_from(
     });
     let source_fingerprint = recap::source_fingerprint(&segments, agenda_fingerprint)?;
     Ok(RecapSnapshot {
+        meeting_created_at: session.created_at,
         segments,
         agenda,
         source_fingerprint,
@@ -3249,6 +3606,28 @@ fn recap_state_view_from(
         .as_ref()
         .map(|recap| recap.source_fingerprint != snapshot.source_fingerprint)
         .unwrap_or(false);
+    let mut custom_recaps = db
+        .load_custom_recaps(session_id)?
+        .into_iter()
+        .map(|saved| CustomRecapStateView {
+            stale: saved.source_fingerprint != snapshot.source_fingerprint,
+            recap_type_id: saved.recap_type_id,
+            name: saved.name_snapshot,
+            content_markdown: saved.content_markdown,
+            target_language: saved.target_language,
+            model: saved.model,
+            source_fingerprint: saved.source_fingerprint,
+            input_tokens: saved.input_tokens,
+            output_tokens: saved.output_tokens,
+            generated_at: saved.generated_at,
+        })
+        .collect::<Vec<_>>();
+    custom_recaps.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.recap_type_id.cmp(&right.recap_type_id))
+    });
     let in_flight = app_state
         .recap_in_flight
         .lock()
@@ -3257,6 +3636,7 @@ fn recap_state_view_from(
     Ok(RecapStateView {
         agenda: snapshot.agenda.as_ref().map(AgendaRecord::metadata),
         recap,
+        custom_recaps,
         current_fingerprint: snapshot.source_fingerprint,
         stale,
         unresolved_profiles: snapshot.unresolved_profiles,
@@ -3292,6 +3672,67 @@ fn get_recap_state(
     app_state: State<AppState>,
 ) -> Result<RecapStateView, String> {
     recap_state_view(app_state.inner(), &session_id)
+}
+
+#[tauri::command]
+fn list_recap_types(
+    include_prompts: Option<bool>,
+    app_state: State<AppState>,
+) -> Result<Vec<RecapTypeView>, String> {
+    let include_prompts = include_prompts.unwrap_or(false);
+    Ok(app_state
+        .db_handle()?
+        .list_recap_types()?
+        .into_iter()
+        .map(|value| RecapTypeView::from_record(value, include_prompts))
+        .collect())
+}
+
+#[tauri::command]
+fn list_recap_prompt_variables() -> Vec<RecapPromptVariableDefinition> {
+    recap_prompt_variables::recap_prompt_variable_definitions()
+}
+
+#[tauri::command]
+fn create_recap_type(
+    name: String,
+    prompt: String,
+    app_state: State<AppState>,
+) -> Result<RecapTypeView, String> {
+    app_state
+        .db_handle()?
+        .create_recap_type(&name, &prompt)
+        .map(|value| RecapTypeView::from_record(value, true))
+}
+
+#[tauri::command]
+fn update_recap_type(
+    recap_type_id: String,
+    name: String,
+    prompt: String,
+    app_state: State<AppState>,
+) -> Result<RecapTypeView, String> {
+    app_state
+        .db_handle()?
+        .update_recap_type(&recap_type_id, &name, &prompt)
+        .map(|value| RecapTypeView::from_record(value, true))
+}
+
+#[tauri::command]
+fn delete_recap_type(recap_type_id: String, app_state: State<AppState>) -> Result<(), String> {
+    app_state.db_handle()?.delete_recap_type(&recap_type_id)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn restore_recap_type_default(
+    recap_type_id: String,
+    app_state: State<AppState>,
+) -> Result<RecapTypeView, String> {
+    app_state
+        .db_handle()?
+        .restore_recap_type_default(&recap_type_id)
+        .map(|value| RecapTypeView::from_record(value, true))
 }
 
 #[tauri::command]
@@ -3581,13 +4022,29 @@ fn get_imported_session_artifact(
 }
 
 fn emit_recap_progress(app_handle: &tauri::AppHandle, session_id: &str, stage: &str, detail: &str) {
-    eprintln!("[recap {session_id}] {stage}: {detail}");
+    emit_recap_progress_for(app_handle, session_id, None, None, stage, detail);
+}
+
+fn emit_recap_progress_for(
+    app_handle: &tauri::AppHandle,
+    session_id: &str,
+    recap_type_id: Option<&str>,
+    recap_type_name: Option<&str>,
+    stage: &str,
+    detail: &str,
+) {
+    let type_detail = recap_type_name
+        .map(|name| format!(" custom={name:?}"))
+        .unwrap_or_default();
+    eprintln!("[recap {session_id}{type_detail}] {stage}: {detail}");
     let _ = app_handle.emit(
         "recap:progress",
         RecapProgressEvent {
             session_id: session_id.to_string(),
             stage: stage.to_string(),
             detail: detail.to_string(),
+            recap_type_id: recap_type_id.map(str::to_string),
+            recap_type_name: recap_type_name.map(str::to_string),
         },
     );
 }
@@ -3616,6 +4073,8 @@ async fn generate_recap_inner(
     }
     let api_key = app_state.load_openai_key()?;
     let snapshot = recap_snapshot(&db, session_id)?;
+    let variable_context = recap_prompt_variable_context(&snapshot);
+    let standard_prompts = standard_recap_prompts(&db, &variable_context)?;
     if !allow_unresolved && !snapshot.unresolved_profiles.is_empty() {
         return Err(format!(
             "Name or assign {} unresolved voice profile{} before recapping, or explicitly choose Recap anyway",
@@ -3641,6 +4100,7 @@ async fn generate_recap_inner(
             agenda: snapshot.agenda.as_ref(),
             preferred_language: &config.preferred_language,
             no_translation_languages: &config.no_translation_languages,
+            standard_prompts: &standard_prompts,
         },
         |stage, detail| emit_recap_progress(app_handle, session_id, stage, detail),
     )
@@ -3660,15 +4120,8 @@ async fn generate_recap_inner(
         "validate",
         "Validating structured recap",
     );
-    let current_snapshot = recap_snapshot(&db, session_id)?;
-    if current_snapshot.source_fingerprint != snapshot.source_fingerprint {
-        return Err(
-            "The transcript, speakers, or agenda changed while the LLM provider was working. Nothing was replaced; run Recap again."
-                .into(),
-        );
-    }
     emit_recap_progress(app_handle, session_id, "save", "Saving recap locally");
-    db.save_recap_and_title(RecapSave {
+    db.save_recap_and_title_if_source_matches(RecapSave {
         session_id,
         title: &response.payload.meeting_title,
         model: &model,
@@ -3689,6 +4142,42 @@ async fn generate_recap_inner(
     Ok(())
 }
 
+fn claim_recap_session(app_state: &AppState, session_id: &str) -> Result<(), String> {
+    let maintenance = app_state
+        .maintenance_in_flight
+        .lock()
+        .map_err(|_| "Maintenance lock poisoned".to_string())?;
+    if *maintenance {
+        return Err(
+            "Voice recognition maintenance is running. Start the recap when it finishes.".into(),
+        );
+    }
+    let mut in_flight = app_state
+        .recap_in_flight
+        .lock()
+        .map_err(|_| "Recap lock poisoned".to_string())?;
+    let identity_in_flight = app_state
+        .identity_in_flight
+        .lock()
+        .map_err(|_| "Identity lock poisoned".to_string())?;
+    if identity_in_flight.contains(session_id) {
+        return Err(
+            "This conversation's people or voices are being changed. Run the recap after that operation finishes."
+                .into(),
+        );
+    }
+    if !in_flight.insert(session_id.to_string()) {
+        return Err("A recap is already being generated for this conversation".into());
+    }
+    Ok(())
+}
+
+fn release_recap_session(app_state: &AppState, session_id: &str) {
+    if let Ok(mut in_flight) = app_state.recap_in_flight.lock() {
+        in_flight.remove(session_id);
+    }
+}
+
 #[tauri::command]
 async fn generate_recap(
     session_id: String,
@@ -3697,44 +4186,157 @@ async fn generate_recap(
     app_handle: tauri::AppHandle,
 ) -> Result<RecapStateView, String> {
     let app_state = app_state.inner().clone();
-    {
-        let maintenance = app_state
-            .maintenance_in_flight
-            .lock()
-            .map_err(|_| "Maintenance lock poisoned".to_string())?;
-        if *maintenance {
-            return Err(
-                "Voice recognition maintenance is running. Start the recap when it finishes."
-                    .into(),
-            );
-        }
-        let mut in_flight = app_state
-            .recap_in_flight
-            .lock()
-            .map_err(|_| "Recap lock poisoned".to_string())?;
-        let identity_in_flight = app_state
-            .identity_in_flight
-            .lock()
-            .map_err(|_| "Identity lock poisoned".to_string())?;
-        if identity_in_flight.contains(&session_id) {
-            return Err(
-                "This conversation's people or voices are being changed. Run the recap after that operation finishes."
-                    .into(),
-            );
-        }
-        if !in_flight.insert(session_id.clone()) {
-            return Err("A recap is already being generated for this conversation".into());
-        }
-        drop(maintenance);
-    }
+    claim_recap_session(&app_state, &session_id)?;
     let result = generate_recap_inner(&session_id, allow_unresolved, &app_state, &app_handle).await;
-    if let Ok(mut in_flight) = app_state.recap_in_flight.lock() {
-        in_flight.remove(&session_id);
-    }
+    release_recap_session(&app_state, &session_id);
     match result {
         Ok(()) => recap_state_view(&app_state, &session_id),
         Err(error) => {
             emit_recap_progress(&app_handle, &session_id, "error", &error);
+            Err(error)
+        }
+    }
+}
+
+async fn generate_custom_recap_inner(
+    session_id: &str,
+    recap_type: &RecapType,
+    allow_unresolved: bool,
+    app_state: &AppState,
+    app_handle: &tauri::AppHandle,
+) -> Result<(), String> {
+    let emit = |stage: &str, detail: &str| {
+        emit_recap_progress_for(
+            app_handle,
+            session_id,
+            Some(&recap_type.id),
+            Some(&recap_type.name),
+            stage,
+            detail,
+        )
+    };
+    emit("prepare", "Preparing transcript and agenda");
+    let db = app_state.db_handle()?;
+    let config = app_state
+        .config
+        .lock()
+        .map_err(|_| "Configuration lock poisoned".to_string())?
+        .clone();
+    let model = config.openai_model.trim().to_string();
+    if model.is_empty() {
+        return Err("Configure an LLM model in Settings before creating a recap".into());
+    }
+    let api_key = app_state.load_openai_key()?;
+    let snapshot = recap_snapshot(&db, session_id)?;
+    let variable_context = recap_prompt_variable_context(&snapshot);
+    let expanded_prompt = expand_recap_prompt(&recap_type.prompt, &variable_context);
+    if !allow_unresolved && !snapshot.unresolved_profiles.is_empty() {
+        return Err(format!(
+            "Name or assign {} unresolved voice profile{} before recapping, or explicitly choose Recap anyway",
+            snapshot.unresolved_profiles.len(),
+            if snapshot.unresolved_profiles.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ));
+    }
+    emit("llm:start", "Starting the on-demand custom recap run");
+    let response = openai::generate_custom_recap(
+        openai::CustomRecapRequest {
+            api_key: &api_key,
+            model: &model,
+            segments: &snapshot.segments,
+            agenda: snapshot.agenda.as_ref(),
+            preferred_language: &config.preferred_language,
+            prompt: &expanded_prompt,
+        },
+        |stage, detail| emit(stage, detail),
+    )
+    .await?;
+    emit("llm:done", "LLM custom recap request complete");
+    emit("validate", "Validating the custom recap and source");
+    emit("save", "Saving custom recap locally");
+    save_custom_recap_if_source_matches(
+        &db,
+        session_id,
+        recap_type,
+        &expanded_prompt,
+        &model,
+        &snapshot.source_fingerprint,
+        &response,
+    )?;
+    emit("complete", "Custom recap ready");
+    Ok(())
+}
+
+fn save_custom_recap_if_source_matches(
+    db: &Db,
+    session_id: &str,
+    recap_type: &RecapType,
+    expanded_prompt: &str,
+    model: &str,
+    expected_source_fingerprint: &str,
+    response: &openai::CustomRecapResponse,
+) -> Result<(), String> {
+    db.save_custom_recap_if_source_matches(CustomRecapSave {
+        session_id,
+        recap_type_id: &recap_type.id,
+        name_snapshot: &recap_type.name,
+        prompt_snapshot: expanded_prompt,
+        content_markdown: &response.content_markdown,
+        target_language: &response.target_language,
+        model,
+        source_fingerprint: expected_source_fingerprint,
+        input_tokens: response.input_tokens,
+        output_tokens: response.output_tokens,
+    })?;
+    let persisted = db
+        .load_custom_recap(session_id, &recap_type.id)?
+        .ok_or_else(|| "The custom recap save completed but could not be read back".to_string())?;
+    if persisted.source_fingerprint != expected_source_fingerprint {
+        return Err("The saved custom recap failed its source-integrity check".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn generate_custom_recap(
+    session_id: String,
+    recap_type_id: String,
+    allow_unresolved: bool,
+    app_state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<RecapStateView, String> {
+    let app_state = app_state.inner().clone();
+    let recap_type = app_state
+        .db_handle()?
+        .load_recap_type(&recap_type_id)?
+        .ok_or_else(|| "Recap type not found".to_string())?;
+    if recap_type.kind != RECAP_TYPE_KIND_CUSTOM {
+        return Err("Only custom recap types can be run from the split menu".into());
+    }
+    claim_recap_session(&app_state, &session_id)?;
+    let result = generate_custom_recap_inner(
+        &session_id,
+        &recap_type,
+        allow_unresolved,
+        &app_state,
+        &app_handle,
+    )
+    .await;
+    release_recap_session(&app_state, &session_id);
+    match result {
+        Ok(()) => recap_state_view(&app_state, &session_id),
+        Err(error) => {
+            emit_recap_progress_for(
+                &app_handle,
+                &session_id,
+                Some(&recap_type.id),
+                Some(&recap_type.name),
+                "error",
+                &error,
+            );
             Err(error)
         }
     }
@@ -3789,16 +4391,27 @@ fn preview_identity_consolidation(
 #[tauri::command]
 async fn consolidate_identities(
     request: db::IdentityConsolidationRequest,
+    expected_affected_session_ids: Vec<String>,
+    expected_impact_revision: String,
     app_state: State<'_, AppState>,
 ) -> Result<db::IdentityConsolidationResult, String> {
     let app_state = app_state.inner().clone();
     let db = app_state.db_handle()?;
     let preview = db.preview_identity_consolidation(&request)?;
+    if preview.affected_session_ids != expected_affected_session_ids
+        || preview.impact_revision != expected_impact_revision
+    {
+        return Err(
+            "The people, voices, recaps, or affected conversations changed after the impact preview. Review the operation again."
+                .into(),
+        );
+    }
     let affected_session_ids = preview.affected_session_ids.clone();
     claim_identity_sessions(&app_state, &affected_session_ids)?;
-    let expected_session_ids = affected_session_ids.clone();
+    let expected_session_ids = expected_affected_session_ids;
+    let expected_revision = expected_impact_revision;
     let result = tokio::task::spawn_blocking(move || {
-        db.consolidate_identities(&request, &expected_session_ids)
+        db.consolidate_identities(&request, &expected_session_ids, &expected_revision)
     })
     .await
     .map_err(|error| format!("People and voices operation stopped unexpectedly: {error}"))
@@ -4040,6 +4653,16 @@ fn get_speaker_samples(
 }
 
 #[tauri::command]
+fn get_voice_group_sample(
+    voice_group_id: String,
+    app_state: State<AppState>,
+) -> Result<Option<db::VoiceGroupSample>, String> {
+    app_state
+        .db_handle()?
+        .get_voice_group_sample(&voice_group_id)
+}
+
+#[tauri::command]
 fn merge_speakers(
     target_id: String,
     source_id: String,
@@ -4203,6 +4826,12 @@ fn main() {
             assign_segment_speaker,
             delete_session,
             get_recap_state,
+            list_recap_types,
+            list_recap_prompt_variables,
+            create_recap_type,
+            update_recap_type,
+            delete_recap_type,
+            restore_recap_type_default,
             save_agenda_text,
             choose_agenda_file,
             remove_agenda,
@@ -4215,6 +4844,7 @@ fn main() {
             list_import_batches,
             get_imported_session_artifact,
             generate_recap,
+            generate_custom_recap,
             list_speakers,
             list_speakers_with_stats,
             list_identity_profiles,
@@ -4232,6 +4862,7 @@ fn main() {
             rename_speaker,
             delete_speaker,
             get_speaker_samples,
+            get_voice_group_sample,
             merge_speakers,
             accept_voice_match_suggestion,
             open_external_url,
@@ -4325,6 +4956,183 @@ mod tests {
             snapshot.segments[0].text,
             "Unknown speaker: cached legacy transcript"
         );
+        assert_eq!(snapshot.meeting_created_at, session.created_at);
+        assert_eq!(snapshot.unresolved_profiles, vec!["Unknown speaker"]);
+    }
+
+    #[test]
+    fn standard_recap_variables_expand_for_the_run_without_mutating_templates() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let template =
+            "Summarize the meeting on {{meeting_datetime}}. Keep {{future_variable}} literal.";
+        db.update_recap_type(BUILTIN_EXECUTIVE_SUMMARY_ID, "Executive summary", template)
+            .unwrap();
+        let context = RecapPromptVariableContext::from_fixed_offset(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T07:30:45Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            chrono::FixedOffset::east_opt(2 * 60 * 60).unwrap(),
+        );
+
+        let prompts = standard_recap_prompts(&db, &context).unwrap();
+
+        assert_eq!(
+            prompts.executive_summary,
+            "Summarize the meeting on 2026/09/01 09:30 UTC+02:00. Keep {{future_variable}} literal."
+        );
+        assert_eq!(
+            db.load_recap_type(BUILTIN_EXECUTIVE_SUMMARY_ID)
+                .unwrap()
+                .unwrap()
+                .prompt,
+            template
+        );
+    }
+
+    #[test]
+    fn recap_prompt_context_uses_the_selected_sessions_persisted_timestamp() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db
+            .insert_session("Daily", "Alice: Status update", 4_000)
+            .unwrap();
+        let session = db.get_session(&session_id).unwrap().unwrap();
+        let snapshot = recap_snapshot(&db, &session_id).unwrap();
+
+        let expanded = expand_recap_prompt(
+            "{{meeting_datetime}}",
+            &recap_prompt_variable_context(&snapshot),
+        );
+        let local_timestamp = session.created_at.with_timezone(&chrono::Local);
+
+        assert_eq!(
+            expanded,
+            format!(
+                "{} UTC{}",
+                local_timestamp.format("%Y/%m/%d %H:%M"),
+                local_timestamp.format("%:z")
+            )
+        );
+    }
+
+    #[test]
+    fn an_existing_speaker_without_a_label_still_requires_participant_review() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db.insert_session("Meeting", "", 4_000).unwrap();
+        let speaker_id = db.insert_speaker(None).unwrap();
+        db.insert_segment(
+            &session_id,
+            0,
+            4_000,
+            Some(&speaker_id),
+            None,
+            "Unattributed transcript",
+        )
+        .unwrap();
+
+        let snapshot = recap_snapshot(&db, &session_id).unwrap();
+
+        assert_eq!(snapshot.unresolved_profiles, vec!["Unknown speaker"]);
+    }
+
+    #[test]
+    fn changed_custom_recap_source_rejects_replacement_and_preserves_title_and_result() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db
+            .insert_session("Original title", "Alice: Original transcript", 4_000)
+            .unwrap();
+        let recap_type = db
+            .create_recap_type("Risk review", "Identify material risks")
+            .unwrap();
+        let original_snapshot = recap_snapshot(&db, &session_id).unwrap();
+        db.save_custom_recap(CustomRecapSave {
+            session_id: &session_id,
+            recap_type_id: &recap_type.id,
+            name_snapshot: &recap_type.name,
+            prompt_snapshot: &recap_type.prompt,
+            content_markdown: "# Previous result",
+            target_language: "en",
+            model: "test-model",
+            source_fingerprint: &original_snapshot.source_fingerprint,
+            input_tokens: 10,
+            output_tokens: 5,
+        })
+        .unwrap();
+        db.update_session_transcript(&session_id, "Alice: Changed transcript")
+            .unwrap();
+
+        let error = save_custom_recap_if_source_matches(
+            &db,
+            &session_id,
+            &recap_type,
+            &recap_type.prompt,
+            "test-model",
+            &original_snapshot.source_fingerprint,
+            &openai::CustomRecapResponse {
+                target_language: "en".into(),
+                content_markdown: "# Replacement result".into(),
+                input_tokens: 20,
+                output_tokens: 10,
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed while the LLM provider was working"));
+        let preserved = db
+            .load_custom_recap(&session_id, &recap_type.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.content_markdown, "# Previous result");
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().title,
+            "Original title"
+        );
+    }
+
+    #[test]
+    fn custom_recap_snapshot_persists_the_expanded_prompt_without_mutating_the_template() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db
+            .insert_session("Daily", "Alice: Yesterday I fixed the issue.", 4_000)
+            .unwrap();
+        let template = "Heading date: {{meeting_date}} at {{meeting_time}}. {{future_variable}}";
+        let recap_type = db.create_recap_type("Daily", template).unwrap();
+        let source = recap_snapshot(&db, &session_id).unwrap();
+        let context = RecapPromptVariableContext::from_fixed_offset(
+            chrono::DateTime::parse_from_rfc3339("2026-09-01T07:30:45Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            chrono::FixedOffset::east_opt(2 * 60 * 60).unwrap(),
+        );
+        let expanded_prompt = expand_recap_prompt(&recap_type.prompt, &context);
+
+        save_custom_recap_if_source_matches(
+            &db,
+            &session_id,
+            &recap_type,
+            &expanded_prompt,
+            "test-model",
+            &source.source_fingerprint,
+            &openai::CustomRecapResponse {
+                target_language: "en".into(),
+                content_markdown: "# Daily".into(),
+                input_tokens: 20,
+                output_tokens: 10,
+            },
+        )
+        .unwrap();
+
+        let persisted = db
+            .load_custom_recap(&session_id, &recap_type.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.prompt_snapshot,
+            "Heading date: 2026/09/01 at 09:30. {{future_variable}}"
+        );
+        assert_eq!(
+            db.load_recap_type(&recap_type.id).unwrap().unwrap().prompt,
+            template
+        );
     }
 
     fn write_test_wav(path: &Path, seconds: u32) {
@@ -4356,6 +5164,23 @@ mod tests {
             created_at: chrono::Utc::now(),
             model_version: EMBEDDING_VERSION.into(),
         }
+    }
+
+    fn embedded_sample_window(
+        candidate_batch: usize,
+        segment_index: usize,
+        vector: Vec<f32>,
+    ) -> (SampleWindow, Vec<f32>) {
+        (
+            SampleWindow {
+                start_ms: 0,
+                end_ms: SAMPLE_WINDOW_MS,
+                segment_index,
+                candidate_batch,
+                pcm: Vec::new(),
+            },
+            vector,
+        )
     }
 
     #[test]
@@ -4586,6 +5411,233 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_embedder_keeps_vad_confirmed_meeting_local_previews() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db.insert_session("Unavailable ECAPA", "", 12_000).unwrap();
+        let audio = AudioClip {
+            samples: vec![0.25; 12_000],
+            sample_rate: 1_000,
+        };
+        let segments = vec![
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 0,
+                end_ms: 5_000,
+                text: "First speaker".into(),
+            },
+            TranscriptSegment {
+                speaker: "unknown".into(),
+                start_ms: 5_200,
+                end_ms: 5_600,
+                text: "Unattributed sound".into(),
+            },
+            TranscriptSegment {
+                speaker: "speaker_2".into(),
+                start_ms: 6_000,
+                end_ms: 11_000,
+                text: "Second speaker".into(),
+            },
+        ];
+        let ordered_speakers = vec!["speaker_1".into(), "unknown".into(), "speaker_2".into()];
+        let speech_intervals = vec![
+            vad::SpeechInterval {
+                start_ms: 0,
+                end_ms: 5_000,
+            },
+            vad::SpeechInterval {
+                start_ms: 6_000,
+                end_ms: 11_000,
+            },
+        ];
+        let reason =
+            "the local ECAPA model was unavailable, so Recall did not create a global voice profile";
+
+        let preview_results = persist_model_unavailable_voice_groups(
+            &audio,
+            &segments,
+            &ordered_speakers,
+            &session_id,
+            &db,
+            Some(&speech_intervals),
+        )
+        .unwrap();
+
+        assert_eq!(
+            preview_results
+                .iter()
+                .map(|result| result.diarized_speaker.as_str())
+                .collect::<Vec<_>>(),
+            vec!["speaker_1", "speaker_2"]
+        );
+        assert!(preview_results.iter().all(|result| result.result.is_ok()));
+        let groups = db.list_session_voice_groups(&session_id).unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.provider_speaker_label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["speaker_1", "speaker_2"]
+        );
+        assert!(groups.iter().all(|group| {
+            group.status == "meeting_local_model_unavailable"
+                && group.resulting_speaker_id.is_none()
+                && group.has_preview_sample
+                && group.model_version.is_none()
+        }));
+        for group in &groups {
+            let preview = db
+                .get_voice_group_sample(&group.id)
+                .unwrap()
+                .expect("each diarized speaker should retain one preview");
+            assert_eq!(preview.sample_rate, audio.sample_rate);
+            assert!(!preview.sample_b64.is_empty());
+        }
+        let saved_segments = db.list_segments(&session_id).unwrap();
+        assert_eq!(saved_segments.len(), 3);
+        assert!(saved_segments
+            .iter()
+            .all(|segment| segment.speaker_id.is_none()));
+        assert_eq!(
+            saved_segments[0].speaker_label.as_deref(),
+            Some("speaker_1")
+        );
+        assert!(saved_segments[0].voice_group_id.is_some());
+        assert_eq!(
+            saved_segments[1].speaker_label.as_deref(),
+            Some("Unknown speaker")
+        );
+        assert!(saved_segments[1].provider_speaker_label.is_none());
+        assert!(saved_segments[1].voice_group_id.is_none());
+        assert_eq!(
+            saved_segments[2].speaker_label.as_deref(),
+            Some("speaker_2")
+        );
+        assert!(saved_segments[2].voice_group_id.is_some());
+        assert!(db.list_speakers().unwrap().is_empty());
+        assert!(db.list_embeddings(EMBEDDING_VERSION).unwrap().is_empty());
+        let decisions = db.list_voice_match_decisions(&session_id).unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert!(decisions.iter().all(|decision| {
+            decision.decision == VoiceMatchKind::Skipped.as_str()
+                && decision.resulting_speaker_id.is_none()
+                && decision.reason == reason
+        }));
+    }
+
+    #[test]
+    fn unavailable_embedder_does_not_invent_a_preview_without_vad_speech() {
+        let db = Db::open(":memory:", Crypto::new(None, None)).unwrap();
+        let session_id = db
+            .insert_session("No VAD-confirmed speech", "", 5_000)
+            .unwrap();
+        let audio = AudioClip {
+            samples: vec![0.25; 5_000],
+            sample_rate: 1_000,
+        };
+        let segments = vec![TranscriptSegment {
+            speaker: "speaker_1".into(),
+            start_ms: 0,
+            end_ms: 5_000,
+            text: "Provider-labelled noise".into(),
+        }];
+        let ordered_speakers = vec!["speaker_1".into()];
+
+        let preview_results = persist_model_unavailable_voice_groups(
+            &audio,
+            &segments,
+            &ordered_speakers,
+            &session_id,
+            &db,
+            Some(&[]),
+        )
+        .unwrap();
+
+        assert!(preview_results.is_empty());
+        let group = db.list_session_voice_groups(&session_id).unwrap().remove(0);
+        assert_eq!(group.status, "meeting_local_model_unavailable");
+        assert!(!group.has_preview_sample);
+        assert!(db.get_voice_group_sample(&group.id).unwrap().is_none());
+        assert!(db.list_speakers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bounded_voice_candidate_ranges_cap_a_pathologically_long_intervention() {
+        let full_windows = MAX_SAMPLE_WINDOWS_PER_SPEAKER as u64 + 10_000;
+        let end_ms = full_windows * SAMPLE_WINDOW_MS;
+        let midpoint = end_ms / 2;
+
+        let (ranges, short_intervals) = bounded_centered_sample_ranges(
+            &[vad::SpeechInterval {
+                start_ms: 0,
+                end_ms,
+            }],
+            midpoint,
+        );
+
+        assert_eq!(short_intervals, 0);
+        assert_eq!(ranges.len(), MAX_SAMPLE_WINDOWS_PER_SPEAKER);
+        assert!(ranges
+            .iter()
+            .all(|(start, end)| end - start == SAMPLE_WINDOW_MS));
+        assert!(ranges.iter().any(|(start, end)| {
+            (start + ((end - start) / 2)).abs_diff(midpoint) <= SAMPLE_WINDOW_MS / 2
+        }));
+    }
+
+    #[test]
+    fn first_voice_candidate_round_covers_distinct_interventions() {
+        let audio = AudioClip {
+            samples: vec![1.0; 56_000],
+            sample_rate: 1_000,
+        };
+        let segments = vec![
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 0,
+                end_ms: 16_000,
+                text: "First long intervention".into(),
+            },
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 20_000,
+                end_ms: 36_000,
+                text: "Second long intervention".into(),
+            },
+            TranscriptSegment {
+                speaker: "speaker_1".into(),
+                start_ms: 40_000,
+                end_ms: 56_000,
+                text: "Third long intervention".into(),
+            },
+        ];
+
+        let selected = clean_sample_windows(
+            &audio,
+            &segments,
+            "speaker_1",
+            &[vad::SpeechInterval {
+                start_ms: 0,
+                end_ms: 56_000,
+            }],
+        );
+
+        let first_round = selected
+            .windows
+            .iter()
+            .take(segments.len())
+            .map(|window| window.segment_index)
+            .collect::<HashSet<_>>();
+        assert_eq!(first_round.len(), segments.len());
+        assert!(selected
+            .windows
+            .iter()
+            .take(segments.len())
+            .all(|window| window.candidate_batch == 0));
+        assert!(selected.windows.len() <= MAX_SAMPLE_WINDOWS_PER_SPEAKER);
+    }
+
+    #[test]
     fn voice_samples_reject_interventions_overlapping_another_provider_speaker() {
         let audio = AudioClip {
             samples: vec![1.0; 7_000],
@@ -4625,6 +5677,65 @@ mod tests {
         let vectors = vec![vec![1.0, 0.0], vec![0.95, 0.312_249_9], vec![0.0, 1.0]];
         assert_eq!(dominant_consistent_indices(&vectors), vec![0, 1]);
         assert!(dominant_consistent_indices(&[vec![1.0, 0.0], vec![0.0, 1.0]]).is_empty());
+    }
+
+    #[test]
+    fn later_voice_candidate_batch_can_recover_after_an_inconsistent_first_batch() {
+        let mut embedded = Vec::new();
+        for index in 0..SAMPLE_WINDOWS_PER_CANDIDATE_BATCH {
+            embedded.push(embedded_sample_window(
+                0,
+                index,
+                if index % 2 == 0 {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                },
+            ));
+        }
+        for index in 0..SAMPLE_WINDOWS_PER_CANDIDATE_BATCH {
+            embedded.push(embedded_sample_window(
+                1,
+                SAMPLE_WINDOWS_PER_CANDIDATE_BATCH + index,
+                if index < 5 {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                },
+            ));
+        }
+
+        let trusted = first_trusted_sample_batch(&embedded).expect("second batch should recover");
+
+        assert_eq!(trusted.batch_index, 1);
+        assert_eq!(trusted.candidate_count, SAMPLE_WINDOWS_PER_CANDIDATE_BATCH);
+        assert_eq!(trusted.window_indices.len(), 5);
+        assert!(trusted.window_indices.iter().all(|index| *index >= 8));
+    }
+
+    #[test]
+    fn bounded_voice_candidate_batches_never_trust_a_batch_without_a_majority() {
+        let mut embedded = Vec::new();
+        for batch in 0..MAX_SAMPLE_CANDIDATE_BATCHES {
+            for index in 0..SAMPLE_WINDOWS_PER_CANDIDATE_BATCH {
+                embedded.push(embedded_sample_window(
+                    batch,
+                    batch * SAMPLE_WINDOWS_PER_CANDIDATE_BATCH + index,
+                    if index % 2 == 0 {
+                        vec![1.0, 0.0]
+                    } else {
+                        vec![0.0, 1.0]
+                    },
+                ));
+            }
+        }
+        embedded.push(embedded_sample_window(
+            MAX_SAMPLE_CANDIDATE_BATCHES,
+            MAX_SAMPLE_WINDOWS_PER_SPEAKER,
+            vec![1.0, 0.0],
+        ));
+
+        assert!(first_trusted_sample_batch(&embedded).is_none());
     }
 
     #[test]

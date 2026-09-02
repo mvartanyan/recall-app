@@ -23,7 +23,14 @@ async function installTauriMock(page) {
     let releaseAppStatus = null;
     const conversationLoadGates = new Map();
     const releaseConversationLoads = new Map();
+    const customRecapGates = new Map();
+    const releaseCustomRecaps = new Map();
+    const customRecapFailures = new Map();
+    const customRecapMarkdown = new Map();
     const commandCounts = {};
+    const commandCalls = [];
+    let lastIdentityImpactPreview = null;
+    let identityImpactGeneration = 0;
     const native = {
       recording: false,
       sttContext: { language_hints: ["en", "de"], expected_speakers: null },
@@ -114,14 +121,76 @@ async function installTauriMock(page) {
       no_translation_languages: ["de"],
       onboarding_version: "1",
     };
-    const recapState = {
+    const makeRecapState = () => ({
       agenda: null,
       recap: null,
+      custom_recaps: [],
       current_fingerprint: "fingerprint",
       stale: false,
       unresolved_profiles: [],
       in_flight: false,
+    });
+    const recapStates = { [session.id]: makeRecapState() };
+    const recapStateFor = (sessionId) => {
+      if (!recapStates[sessionId]) recapStates[sessionId] = makeRecapState();
+      return recapStates[sessionId];
     };
+    const recapTypeDefaults = {
+      "builtin-executive-summary": "Summarize the purpose, conclusions, decisions, material risks, disagreements and open questions.",
+      "builtin-full-summary": "Give a detailed sectioned account of topics, arguments, rationale, decisions, dependencies, risks and next steps.",
+      "builtin-actions": "Identify explicit future commitments and already-completed actions with participant, timing and uncertainty.",
+    };
+    const recapTypes = [
+      {
+        id: "builtin-executive-summary",
+        kind: "builtin",
+        name: "Executive summary",
+        prompt: recapTypeDefaults["builtin-executive-summary"],
+        is_builtin: true,
+        created_at: "2026-07-23T08:00:00Z",
+        updated_at: "2026-07-23T08:00:00Z",
+      },
+      {
+        id: "builtin-full-summary",
+        kind: "builtin",
+        name: "Full summary",
+        prompt: recapTypeDefaults["builtin-full-summary"],
+        is_builtin: true,
+        created_at: "2026-07-23T08:00:00Z",
+        updated_at: "2026-07-23T08:00:00Z",
+      },
+      {
+        id: "builtin-actions",
+        kind: "builtin",
+        name: "Actions",
+        prompt: recapTypeDefaults["builtin-actions"],
+        is_builtin: true,
+        created_at: "2026-07-23T08:00:00Z",
+        updated_at: "2026-07-23T08:00:00Z",
+      },
+    ];
+    const recapPromptVariables = [
+      {
+        token: "{{meeting_date}}",
+        label: "Meeting date",
+        description: "The selected conversation's saved local date.",
+        example: "2026/07/23",
+      },
+      {
+        token: "{{meeting_time}}",
+        label: "Meeting time",
+        description: "The selected conversation's saved local time.",
+        example: "10:00",
+      },
+      {
+        token: "{{meeting_datetime}}",
+        label: "Meeting date and time",
+        description: "The selected conversation's saved local date and time.",
+        example: "2026/07/23 10:00",
+      },
+    ];
+    let recapPromptVariablesUnavailable = false;
+    let recapTypeSequence = 0;
     const jamiePreview = {
       draft: {
         id: "aaaaaaaaaaaaaaaa",
@@ -251,6 +320,7 @@ async function installTauriMock(page) {
     };
     const invoke = async (command, args = {}) => {
       commandCounts[command] = (commandCounts[command] || 0) + 1;
+      commandCalls.push({ command, args: structuredClone(args) });
       if (command === "load_conversation" && args.sessionId) {
         const scopedKey = command + ":" + args.sessionId;
         commandCounts[scopedKey] = (commandCounts[scopedKey] || 0) + 1;
@@ -315,7 +385,7 @@ async function installTauriMock(page) {
             session: selected,
             segments: native.segments[args.sessionId] || [],
             voice_groups: native.voiceGroups[args.sessionId] || [],
-            recap_state: recapState,
+            recap_state: recapStateFor(args.sessionId),
             imported_artifact: native.importedArtifacts[args.sessionId] || null,
           });
         }
@@ -342,7 +412,7 @@ async function installTauriMock(page) {
         case "list_segments":
           return structuredClone(native.segments[args.sessionId] || []);
         case "get_recap_state":
-          return structuredClone(recapState);
+          return structuredClone(recapStateFor(args.sessionId));
         case "get_imported_session_artifact":
           return structuredClone(native.importedArtifacts[args.sessionId] || null);
         case "list_speakers_with_stats":
@@ -427,15 +497,32 @@ async function installTauriMock(page) {
         case "preview_identity_consolidation": {
           const targetId = args.request.target_speaker_id;
           const target = speakers.find((speaker) => speaker.id === targetId);
-          return {
+          const affectedSessionIds = Array.from(
+            new Set(
+              args.request.unassigned_groups.map((group) => group.session_id),
+            ),
+          ).sort();
+          if (!affectedSessionIds.length) affectedSessionIds.push(session.id);
+          const affectedInterventionCount = Object.values(native.segments)
+            .flat()
+            .filter((segment) =>
+              args.request.unassigned_groups.some(
+                (group) =>
+                  group.session_id === segment.session_id &&
+                  (group.voice_group_id
+                    ? group.voice_group_id === segment.voice_group_id
+                    : group.speaker_label === segment.speaker_label) &&
+                  !segment.speaker_id,
+              ),
+            ).length + args.request.profile_ids.length;
+          const preview = {
             target_speaker_id: targetId,
             target_label: args.request.final_label,
             source_profiles: [],
             unassigned_groups: [],
-            affected_session_ids: [session.id],
-            affected_conversation_count: 1,
-            affected_intervention_count:
-              args.request.profile_ids.length + args.request.unassigned_groups.length,
+            affected_session_ids: affectedSessionIds,
+            affected_conversation_count: affectedSessionIds.length,
+            affected_intervention_count: affectedInterventionCount,
             stale_recap_count: 1,
             active_voiceprint_count: args.request.profile_ids.length,
             inactive_voiceprint_count: 0,
@@ -447,8 +534,31 @@ async function installTauriMock(page) {
               "Temporary voice samples will be deleted for privacy.",
             ],
           };
+          preview.impact_revision =
+            "mock-impact-token-" +
+            identityImpactGeneration +
+            "-" +
+            commandCounts.preview_identity_consolidation;
+          lastIdentityImpactPreview = {
+            request: structuredClone(args.request),
+            preview: structuredClone(preview),
+            generation: identityImpactGeneration,
+          };
+          return preview;
         }
         case "consolidate_identities": {
+          if (
+            !lastIdentityImpactPreview ||
+            lastIdentityImpactPreview.generation !== identityImpactGeneration ||
+            args.expectedImpactRevision !==
+              lastIdentityImpactPreview.preview.impact_revision ||
+            JSON.stringify(args.expectedAffectedSessionIds || []) !==
+              JSON.stringify(lastIdentityImpactPreview.preview.affected_session_ids)
+          ) {
+            throw new Error(
+              "The people, voices, recaps, or affected conversations changed after the impact preview. Review the operation again.",
+            );
+          }
           const request = args.request;
           let target = speakers.find(
             (speaker) => speaker.id === request.target_speaker_id,
@@ -473,7 +583,9 @@ async function installTauriMock(page) {
               const groupSelected = request.unassigned_groups.some(
                 (group) =>
                   group.session_id === segment.session_id &&
-                  group.speaker_label === segment.speaker_label &&
+                  (group.voice_group_id
+                    ? group.voice_group_id === segment.voice_group_id
+                    : group.speaker_label === segment.speaker_label) &&
                   !segment.speaker_id,
               );
               if (sourceIds.has(segment.speaker_id) || groupSelected) {
@@ -482,6 +594,23 @@ async function installTauriMock(page) {
               } else if (segment.speaker_id === target.id) {
                 segment.speaker_label = request.final_label;
               }
+            }
+          }
+          for (const groupKey of request.unassigned_groups) {
+            if (!groupKey.voice_group_id) continue;
+            const group = (native.voiceGroups[groupKey.session_id] || []).find(
+              (candidate) => candidate.id === groupKey.voice_group_id,
+            );
+            const groupSegments = (native.segments[groupKey.session_id] || []).filter(
+              (segment) => segment.voice_group_id === groupKey.voice_group_id,
+            );
+            if (
+              group &&
+              groupSegments.length &&
+              groupSegments.every((segment) => segment.speaker_id === target.id)
+            ) {
+              group.resulting_speaker_id = target.id;
+              group.resulting_speaker_label = request.final_label;
             }
           }
           target.label = request.final_label;
@@ -549,6 +678,7 @@ async function installTauriMock(page) {
           };
           native.sessions = [draft, ...native.sessions];
           native.segments[draft.id] = [];
+          recapStateFor(draft.id);
           return { run_id: "run-draft", session_id: draft.id };
         }
         case "get_progress":
@@ -817,7 +947,63 @@ async function installTauriMock(page) {
           preferences.preferred_language = args.preferences.preferredLanguage;
           preferences.no_translation_languages = args.preferences.noTranslationLanguages;
           return null;
-        case "generate_recap":
+        case "list_recap_types":
+          return structuredClone(
+            recapTypes.map((recapType) => ({
+              ...recapType,
+              prompt: args.includePrompts ? recapType.prompt : null,
+            })),
+          );
+        case "list_recap_prompt_variables":
+          if (recapPromptVariablesUnavailable) {
+            throw new Error("Prompt variable registry unavailable");
+          }
+          return structuredClone(recapPromptVariables);
+        case "create_recap_type": {
+          const name = String(args.name || "").normalize("NFC").trim().replace(/\s+/gu, " ");
+          if (!name) throw new Error("Custom recap type names cannot be empty");
+          if (Array.from(name).length > 20) {
+            throw new Error("Custom recap type names are limited to 20 characters");
+          }
+          recapTypeSequence += 1;
+          const recapType = {
+            id: "custom-type-" + recapTypeSequence,
+            kind: "custom",
+            name,
+            prompt: String(args.prompt || ""),
+            is_builtin: false,
+            created_at: "2026-07-23T09:0" + recapTypeSequence + ":00Z",
+            updated_at: "2026-07-23T09:0" + recapTypeSequence + ":00Z",
+          };
+          recapTypes.push(recapType);
+          return structuredClone(recapType);
+        }
+        case "update_recap_type": {
+          const recapType = recapTypes.find((candidate) => candidate.id === args.recapTypeId);
+          if (!recapType) throw new Error("Recap type not found");
+          if (!recapType.is_builtin) {
+            recapType.name = String(args.name || "").normalize("NFC").trim().replace(/\s+/gu, " ");
+          }
+          recapType.prompt = String(args.prompt || "");
+          recapType.updated_at = "2026-07-23T09:20:00Z";
+          return structuredClone(recapType);
+        }
+        case "delete_recap_type": {
+          const index = recapTypes.findIndex((candidate) => candidate.id === args.recapTypeId);
+          if (index < 0) throw new Error("Recap type not found");
+          if (recapTypes[index].is_builtin) throw new Error("Built-in recap types cannot be deleted");
+          recapTypes.splice(index, 1);
+          return null;
+        }
+        case "restore_recap_type_default": {
+          const recapType = recapTypes.find((candidate) => candidate.id === args.recapTypeId);
+          if (!recapType?.is_builtin) throw new Error("Only built-in recap types have defaults");
+          recapType.prompt = recapTypeDefaults[recapType.id];
+          recapType.updated_at = "2026-07-23T09:21:00Z";
+          return structuredClone(recapType);
+        }
+        case "generate_recap": {
+          const recapState = recapStateFor(args.sessionId);
           recapState.recap = {
             generated_at: "2026-07-23T09:05:00Z",
             input_tokens: 20,
@@ -839,6 +1025,50 @@ async function installTauriMock(page) {
             },
           };
           return structuredClone(recapState);
+        }
+        case "generate_custom_recap": {
+          const recapType = structuredClone(
+            recapTypes.find((candidate) => candidate.id === args.recapTypeId),
+          );
+          if (!recapType || recapType.kind !== "custom") {
+            throw new Error("Custom recap type not found");
+          }
+          const recapState = recapStateFor(args.sessionId);
+          if (recapState.unresolved_profiles.length && !args.allowUnresolved) {
+            throw new Error("Resolve participants or choose Recap anyway");
+          }
+          recapState.in_flight = true;
+          const gate = customRecapGates.get(args.sessionId);
+          if (gate) await gate;
+          const failure = customRecapFailures.get(args.sessionId);
+          if (failure) {
+            customRecapFailures.delete(args.sessionId);
+            recapState.in_flight = false;
+            throw new Error(failure);
+          }
+          const result = {
+            recap_type_id: recapType.id,
+            name: recapType.name,
+            generated_at: "2026-07-23T09:30:00Z",
+            target_language: preferences.preferred_language,
+            model: preferences.openai_model,
+            source_fingerprint: recapState.current_fingerprint,
+            content_markdown:
+              customRecapMarkdown.get(recapType.id) ||
+              "## " + recapType.name + "\n\nGenerated custom content.",
+            input_tokens: 30,
+            output_tokens: 15,
+            stale: false,
+          };
+          recapState.custom_recaps = [
+            ...recapState.custom_recaps.filter(
+              (candidate) => candidate.recap_type_id !== recapType.id,
+            ),
+            result,
+          ];
+          recapState.in_flight = false;
+          return structuredClone(recapState);
+        }
         default:
           throw new Error("Unhandled mocked command: " + command);
       }
@@ -861,6 +1091,70 @@ async function installTauriMock(page) {
       preferences.preferred_language = language;
     };
     window.__mockCommandCount = (command) => commandCounts[command] || 0;
+    window.__mockLastCommandArgs = (command) => {
+      const call = commandCalls.findLast((candidate) => candidate.command === command);
+      return call ? structuredClone(call.args) : null;
+    };
+    window.__invalidateIdentityImpactPreview = () => {
+      identityImpactGeneration += 1;
+    };
+    window.__mockIdentityImpactRevision = () =>
+      lastIdentityImpactPreview?.preview?.impact_revision || null;
+    window.__setMockPromptVariablesUnavailable = (unavailable) => {
+      recapPromptVariablesUnavailable = Boolean(unavailable);
+    };
+    let clipboardText = "";
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: async (value) => {
+          clipboardText = String(value);
+        },
+      },
+    });
+    window.__mockClipboardText = () => clipboardText;
+    window.__addMockRecapType = (name, prompt = "Create a focused custom recap.") => {
+      recapTypeSequence += 1;
+      const recapType = {
+        id: "custom-type-" + recapTypeSequence,
+        kind: "custom",
+        name,
+        prompt,
+        is_builtin: false,
+        created_at: "2026-07-23T09:0" + recapTypeSequence + ":00Z",
+        updated_at: "2026-07-23T09:0" + recapTypeSequence + ":00Z",
+      };
+      recapTypes.push(recapType);
+      return recapType.id;
+    };
+    window.__setMockCustomMarkdown = (recapTypeId, markdown) => {
+      customRecapMarkdown.set(recapTypeId, String(markdown));
+    };
+    window.__setMockUnresolvedProfiles = (sessionId, labels) => {
+      recapStateFor(sessionId).unresolved_profiles = [...labels];
+    };
+    window.__setMockCustomRecapStale = (sessionId, recapTypeId, stale) => {
+      const recap = recapStateFor(sessionId).custom_recaps.find(
+        (candidate) => candidate.recap_type_id === recapTypeId,
+      );
+      if (recap) recap.stale = Boolean(stale);
+    };
+    window.__deferCustomRecap = (sessionId) => {
+      customRecapGates.set(
+        sessionId,
+        new Promise((resolve) => releaseCustomRecaps.set(sessionId, resolve)),
+      );
+    };
+    window.__releaseCustomRecap = (sessionId) => {
+      releaseCustomRecaps.get(sessionId)?.();
+      releaseCustomRecaps.delete(sessionId);
+      customRecapGates.delete(sessionId);
+    };
+    window.__failNextCustomRecap = (sessionId, message = "Mock custom recap failure") => {
+      customRecapFailures.set(sessionId, message);
+    };
+    window.__mockCustomRecaps = (sessionId) =>
+      structuredClone(recapStateFor(sessionId).custom_recaps);
     window.__mockConversationLoadCount = (sessionId) =>
       commandCounts["load_conversation:" + sessionId] || 0;
     window.__mockSessionTranscript = (sessionId) =>
@@ -910,6 +1204,7 @@ async function installTauriMock(page) {
         fixtureSession,
         ...native.sessions.filter((candidate) => candidate.id !== sessionId),
       ];
+      recapStateFor(sessionId);
       native.segments[fixtureSession.id] = Array.from(
         { length: segmentCount },
         (_, index) => ({
@@ -1023,6 +1318,81 @@ async function installTauriMock(page) {
       ];
       return sessionId;
     };
+    window.__addNoSafeVoiceFixture = (includeAssignedTurn = true) => {
+      const sessionId = "session-no-safe-voice";
+      const fixtureSession = {
+        id: sessionId,
+        created_at: "2026-07-26T08:00:00Z",
+        title: "Provider-only speaker labels",
+        duration_ms: includeAssignedTurn ? 18_000 : 12_000,
+        transcript: includeAssignedTurn
+          ? "speaker_2: First turn\nspeaker_2: Second turn\nAlice: Already assigned turn"
+          : "speaker_2: First turn\nspeaker_2: Second turn",
+        processing_status: null,
+        processing_error: null,
+        processing_run_id: null,
+        recoverable_audio: false,
+      };
+      native.sessions = [
+        fixtureSession,
+        ...native.sessions.filter((candidate) => candidate.id !== sessionId),
+      ];
+      recapStateFor(sessionId);
+      native.segments[sessionId] = [
+        {
+          id: "no-safe-segment-1",
+          session_id: sessionId,
+          start_ms: 0,
+          end_ms: 5_000,
+          speaker_id: null,
+          speaker_label: "speaker_2",
+          voice_group_id: "voice-group-no-safe",
+          text: "First provider-only turn.",
+        },
+        {
+          id: "no-safe-segment-2",
+          session_id: sessionId,
+          start_ms: 6_000,
+          end_ms: 11_000,
+          speaker_id: null,
+          speaker_label: "speaker_2",
+          voice_group_id: "voice-group-no-safe",
+          text: "Second provider-only turn.",
+        },
+      ];
+      if (includeAssignedTurn) {
+        native.segments[sessionId].push({
+          id: "no-safe-segment-assigned",
+          session_id: sessionId,
+          start_ms: 12_000,
+          end_ms: 17_000,
+          speaker_id: "speaker-alice",
+          speaker_label: "Alice",
+          voice_group_id: "voice-group-no-safe",
+          text: "Already assigned turn.",
+        });
+      }
+      native.voiceGroups[sessionId] = [
+        {
+          id: "voice-group-no-safe",
+          session_id: sessionId,
+          provider_speaker_label: "speaker_2",
+          cluster_index: 0,
+          resulting_speaker_id: null,
+          resulting_speaker_label: null,
+          status: "meeting_local_no_safe_speech",
+          selected_duration_ms: 0,
+          selected_window_count: 0,
+          consistency_score: null,
+          model_version: "wespeaker-ecapa512-lm-v4-vad",
+          split_status: "none",
+          split_clusters: [],
+          intervention_count: includeAssignedTurn ? 3 : 2,
+          voice_observation_count: 0,
+        },
+      ];
+      return sessionId;
+    };
     window.__addLargeConversation = () =>
       window.__addConversationFixture({
         sessionId: "session-large",
@@ -1068,6 +1438,283 @@ test.beforeEach(async ({ page }) => {
   await installTauriMock(page);
   await page.goto("/");
   await expect(page.getByText("Recall is ready", { exact: false })).toBeAttached();
+});
+
+test("recap type manager protects dirty edits, restores built-ins, and enables the split action", async ({
+  page,
+}) => {
+  await expect(page.getByRole("button", { name: "Choose a custom recap type" })).toBeHidden();
+  await page.getByRole("button", { name: "Recap types" }).click();
+  const manager = page.getByRole("dialog", { name: "Recap types" });
+  await expect(manager).toBeVisible();
+  await expect(manager.locator(".recap-type-option strong")).toHaveText([
+    "Executive summary",
+    "Full summary",
+    "Actions",
+  ]);
+
+  await manager.getByRole("option", { name: /Executive summary/ }).click();
+  const prompt = manager.getByLabel("Instructions");
+  const shippedPrompt = await prompt.inputValue();
+  await expect(manager.locator(".recap-prompt-variable code")).toHaveText([
+    "{{meeting_date}}",
+    "{{meeting_time}}",
+    "{{meeting_datetime}}",
+  ]);
+  await expect(
+    manager.getByRole("button", {
+      name: "Insert Meeting date variable {{meeting_date}}",
+    }),
+  ).toHaveAttribute("title", /saved local date.*Example: 2026\/07\/23/s);
+  await prompt.fill("Unsaved prompt edit");
+  await manager.getByRole("button", { name: "Close recap types" }).click();
+  const discard = page.getByRole("alertdialog", { name: "Discard unsaved changes?" });
+  await expect(discard).toBeVisible();
+  await discard.getByRole("button", { name: "Cancel" }).click();
+  await expect(manager).toBeVisible();
+  await expect(prompt).toHaveValue("Unsaved prompt edit");
+
+  await prompt.fill("Saved replacement prompt");
+  await manager.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(manager.getByText("Saved.", { exact: true })).toBeVisible();
+  await manager.getByRole("button", { name: "Restore default" }).click();
+  await page
+    .getByRole("alertdialog", { name: "Restore the shipped prompt?" })
+    .getByRole("button", { name: "Restore default" })
+    .click();
+  await expect(prompt).toHaveValue(shippedPrompt);
+
+  await manager.getByRole("button", { name: "New custom type" }).click();
+  await manager.getByLabel("Name").fill("  Risk   review  ");
+  await manager.getByLabel("Instructions").fill("Report risks for DATE.");
+  await manager.getByLabel("Instructions").evaluate((textarea) => {
+    const start = textarea.value.indexOf("DATE");
+    textarea.focus();
+    textarea.setSelectionRange(start, start + 4);
+  });
+  await manager
+    .getByRole("button", { name: "Insert Meeting date variable {{meeting_date}}" })
+    .click();
+  await expect(manager.getByLabel("Instructions")).toHaveValue(
+    "Report risks for {{meeting_date}}.",
+  );
+  await expect(manager.getByLabel("Instructions")).toBeFocused();
+  expect(
+    await manager.getByLabel("Instructions").evaluate((textarea) => ({
+      start: textarea.selectionStart,
+      end: textarea.selectionEnd,
+    })),
+  ).toEqual({ start: 33, end: 33 });
+  await manager.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(manager.getByRole("option", { name: /Risk review/ })).toBeVisible();
+  await manager
+    .getByLabel("Instructions")
+    .fill("Focus on material risks, mitigations, and owners for {{meeting_date}}.");
+  await manager.getByRole("button", { name: "Save", exact: true }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.__mockCommandCount("update_recap_type")))
+    .toBe(2);
+  await manager.getByRole("button", { name: "Close recap types" }).click();
+  await expect(manager).toBeHidden();
+
+  const menuButton = page.getByRole("button", { name: "Choose a custom recap type" });
+  await expect(menuButton).toBeVisible();
+  await menuButton.click();
+  const riskReview = page.getByRole("menuitem", { name: "Risk review" });
+  await expect(riskReview).toBeVisible();
+  await expect(page.getByRole("button", { name: "Recap", exact: true })).toBeVisible();
+  await riskReview.click();
+  await expect(page.getByRole("tab", { name: "Risk review" })).toBeVisible();
+  expect(await page.evaluate(() => window.__mockCommandCount("generate_custom_recap"))).toBe(1);
+});
+
+test("recap prompt editing remains available when the variable registry cannot load", async ({
+  page,
+}) => {
+  await page.evaluate(() => window.__setMockPromptVariablesUnavailable(true));
+  await page.getByRole("button", { name: "Recap types" }).click();
+  const manager = page.getByRole("dialog", { name: "Recap types" });
+  await expect(manager.getByText(
+    "Variables are unavailable. You can still edit and save the prompt.",
+  )).toBeVisible();
+  await manager.getByLabel("Instructions").fill("Prompt editing still works.");
+  await expect(manager.getByLabel("Instructions")).toHaveValue("Prompt editing still works.");
+});
+
+test("custom recap reuses participant review, renders hostile Markdown safely, exports both formats, and preserves deleted snapshots", async ({
+  page,
+}) => {
+  const markdown = [
+    "# Risk review",
+    "",
+    "Decision **approved** with *uncertain* timing and `owner_id`.",
+    "",
+    "- First action",
+    "- Second action",
+    "",
+    "> Quoted context",
+    "",
+    '<script>window.__recapScriptExecuted = true</script>',
+    '<img src=x onerror="window.__recapImageExecuted = true">',
+  ].join("\n");
+  const recapTypeId = await page.evaluate((content) => {
+    const id = window.__addMockRecapType("Risk review", "Focus on risk.");
+    window.__setMockCustomMarkdown(id, content);
+    window.__setMockUnresolvedProfiles("session-old", ["VOICE12"]);
+    return id;
+  }, markdown);
+  await page.getByRole("button", { name: "Recap types" }).click();
+  await page.getByRole("button", { name: "Close recap types" }).click();
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+
+  await page.getByRole("button", { name: "Choose a custom recap type" }).click();
+  await page.getByRole("menuitem", { name: "Risk review" }).click();
+  const participantReview = page.getByRole("dialog", { name: "Name participants first?" });
+  await expect(participantReview).toBeVisible();
+  expect(await page.evaluate(() => window.__mockCommandCount("generate_custom_recap"))).toBe(0);
+  await participantReview.getByRole("button", { name: "Recap anyway" }).click();
+  await expect(page.getByRole("tab", { name: "Risk review" })).toBeVisible();
+  await expect(page.locator("#generatedTitle")).toHaveText("Risk review");
+  await expect(page.locator("#generatedContent")).toContainText(
+    "<script>window.__recapScriptExecuted = true</script>",
+  );
+  await expect(page.locator("#generatedContent script")).toHaveCount(0);
+  await expect(page.locator("#generatedContent img")).toHaveCount(0);
+  expect(
+    await page.evaluate(() => [window.__recapScriptExecuted, window.__recapImageExecuted]),
+  ).toEqual([undefined, undefined]);
+  expect(
+    await page.evaluate(() => window.__mockLastCommandArgs("generate_custom_recap")),
+  ).toEqual({ sessionId: "session-old", recapTypeId, allowUnresolved: true });
+
+  await page.getByRole("button", { name: "Copy Markdown" }).click();
+  await expect.poll(() => page.evaluate(() => window.__mockClipboardText())).toBe(markdown);
+  await page.getByRole("button", { name: "Copy text" }).click();
+  await expect
+    .poll(() => page.evaluate(() => window.__mockClipboardText()))
+    .toBe(
+      [
+        "Risk review",
+        "",
+        "Decision approved with uncertain timing and owner_id.",
+        "",
+        "- First action\n- Second action",
+        "",
+        "Quoted context",
+        "",
+        '<script>window.__recapScriptExecuted = true</script>\n<img src=x onerror="window.__recapImageExecuted = true">',
+      ].join("\n"),
+    );
+
+  const replacementMarkdown = "## Risk review\n\nReplacement content after regeneration.";
+  await page.evaluate(({ id, content }) => {
+    window.__setMockUnresolvedProfiles("session-old", []);
+    window.__setMockCustomMarkdown(id, content);
+    window.__failNextCustomRecap("session-old", "Replacement failed validation");
+  }, { id: recapTypeId, content: replacementMarkdown });
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+  await page.getByRole("button", { name: "Choose a custom recap type" }).click();
+  await page.getByRole("menuitem", { name: "Risk review" }).click();
+  await expect(page.getByText("Risk review failed", { exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: "Risk review" }).click();
+  await expect(page.locator("#generatedContent")).toContainText("Decision approved");
+  expect(await page.evaluate(() => window.__mockCustomRecaps("session-old").length)).toBe(1);
+
+  await page.getByRole("button", { name: "Choose a custom recap type" }).click();
+  await page.getByRole("menuitem", { name: "Risk review" }).click();
+  await expect(page.locator("#generatedContent")).toContainText(
+    "Replacement content after regeneration.",
+  );
+  expect(
+    await page.evaluate((id) =>
+      window
+        .__mockCustomRecaps("session-old")
+        .find((recap) => recap.recap_type_id === id)?.content_markdown,
+    recapTypeId),
+  ).toBe(replacementMarkdown);
+
+  await page.evaluate((id) => {
+    window.__setMockCustomRecapStale("session-old", id, true);
+  }, recapTypeId);
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+  await page.getByRole("tab", { name: "Risk review" }).click();
+  await expect(page.getByText("This custom recap is out of date.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Regenerate" })).toBeVisible();
+
+  await page.getByRole("button", { name: "Recap types" }).click();
+  const manager = page.getByRole("dialog", { name: "Recap types" });
+  await manager.getByRole("option", { name: /Risk review/ }).click();
+  await manager.getByRole("button", { name: "Delete type" }).click();
+  const deletion = page.getByRole("alertdialog", { name: "Delete this recap type?" });
+  await expect(deletion).toContainText("Recaps already generated for meetings keep their saved names and content.");
+  await deletion.getByRole("button", { name: "Delete type" }).click();
+  await manager.getByRole("button", { name: "Close recap types" }).click();
+  await expect(page.getByRole("button", { name: "Choose a custom recap type" })).toBeHidden();
+  await expect(page.getByRole("tab", { name: "Risk review" })).toBeVisible();
+  await expect(page.getByText("Its recap type has since been deleted.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Regenerate" })).toBeHidden();
+});
+
+test("custom recap tabs sort duplicate names and background generation reloads after navigation", async ({
+  page,
+}) => {
+  const typeIds = await page.evaluate(() => [
+    window.__addMockRecapType("Risk review"),
+    window.__addMockRecapType("Board note"),
+    window.__addMockRecapType("Risk review"),
+  ]);
+  await page.getByRole("button", { name: "Recap types" }).click();
+  await page.getByRole("button", { name: "Close recap types" }).click();
+
+  const chooseType = async (name, index = 0) => {
+    await page.getByRole("button", { name: "Choose a custom recap type" }).click();
+    await page.getByRole("menuitem", { name }).nth(index).click();
+  };
+  await chooseType("Risk review", 1);
+  await expect(page.getByRole("tab", { name: "Risk review" })).toHaveCount(1);
+  await chooseType("Board note");
+  await chooseType("Risk review", 0);
+  await expect(page.getByRole("tab", { name: "Risk review" })).toHaveCount(2);
+  await expect(page.locator("#recapTabs .recap-tab:visible")).toHaveText([
+    "Transcript",
+    "Board note",
+    "Risk review",
+    "Risk review",
+  ]);
+  expect(await page.evaluate(() => window.__mockCustomRecaps("session-old").length)).toBe(3);
+
+  await page.evaluate((boardTypeId) => {
+    window.__deferCustomRecap("session-old");
+    window.__setMockCustomMarkdown(boardTypeId, "## Board note\n\nBackground board result.");
+    window.__addConversationFixture({
+      sessionId: "session-parallel",
+      title: "Parallel conversation",
+      segmentCount: 2,
+    });
+  }, typeIds[1]);
+  await chooseType("Board note");
+  await expect(page.getByText("Creating Board note", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Parallel conversation/ }).click();
+  await chooseType("Risk review", 0);
+  await expect(page.getByRole("tab", { name: "Risk review" })).toBeVisible();
+  await page.evaluate(() => window.__releaseCustomRecap("session-old"));
+  await expect
+    .poll(() =>
+      page.evaluate((boardTypeId) =>
+        window
+          .__mockCustomRecaps("session-old")
+          .find((recap) => recap.recap_type_id === boardTypeId)?.content_markdown,
+      typeIds[1]),
+    )
+    .toContain("Background board result");
+  await page.getByRole("button", { name: /Earlier planning meeting/ }).click();
+  await expect(page.getByRole("tab", { name: "Board note" })).toBeVisible();
+  expect(await page.evaluate(() => window.__mockCustomRecaps("session-parallel").length)).toBe(1);
+  expect(typeIds).toHaveLength(3);
 });
 
 test("live speaker turns keep code switches inline and provide a complete preferred-language line", async ({ page }) => {
@@ -1668,7 +2315,7 @@ test("live legacy passages remain fluid and available while working in conversat
 
   await currentRecording.click();
   await expect(page.getByRole("heading", { name: "Live" })).toBeVisible();
-  await expect(page.getByText("[ru] Hello", { exact: true })).toBeVisible();
+  await expect(page.getByText("[ru] Hello everyone", { exact: true })).toBeVisible();
   await expect(page.locator("[data-live-caption-translation]")).toHaveCount(2);
   await expect(page.getByRole("button", { name: "Jump to latest ↓" })).toBeVisible();
   expect(
@@ -1970,6 +2617,111 @@ test("the conversation filter contains named people only", async ({ page }) => {
   await expect(filter.locator("option")).toHaveText(["All voices", "Alice"]);
 });
 
+test("a no-safe-voiceprint card assigns all provider turns without per-turn work", async ({
+  page,
+}) => {
+  await page.evaluate(() => window.__addNoSafeVoiceFixture());
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Provider-only speaker labels/ }).click();
+
+  const card = page.locator("#speakersList .speaker-card").filter({ hasText: "speaker_2" });
+  await expect(card.getByText("No safe voiceprint", { exact: true })).toBeVisible();
+  await expect(card.getByRole("button", { name: "Assign or name…" })).toBeVisible();
+  await card.getByRole("button", { name: "Assign or name…" }).click();
+
+  let assignment = page.getByRole("dialog", { name: "Assign or name speaker" });
+  await expect(assignment).toContainText(
+    "Assign 2 unresolved interventions labelled speaker_2 in this conversation",
+  );
+  await expect(assignment.getByLabel("Assign to").locator("option").first()).toHaveText(
+    "Create a new name-only person",
+  );
+  await assignment.getByRole("button", { name: "Cancel" }).click();
+  await expect(assignment).toBeHidden();
+
+  await page.getByRole("button", { name: "People & Voices" }).click();
+  const manager = page.getByRole("dialog", { name: "People & Voices" });
+  await expect(manager.getByText("Nothing selected", { exact: true })).toBeVisible();
+  await expect(manager.getByRole("button", { name: "Merge or assign selected" })).toBeDisabled();
+  await page.getByRole("button", { name: "Close People and Voices" }).click();
+
+  await card.getByRole("button", { name: "Assign or name…" }).click();
+  assignment = page.getByRole("dialog", { name: "Assign or name speaker" });
+  const previewCallsBeforeSelection = await page.evaluate(() =>
+    window.__mockCommandCount("preview_identity_consolidation"),
+  );
+  await assignment.getByLabel("Assign to").selectOption("speaker-alice");
+  await expect(assignment.locator("#identityFinalLabel")).toHaveValue("Alice");
+  await expect(assignment.getByLabel("New person's name")).toBeHidden();
+  await expect(assignment.getByRole("button", { name: "Review impact" })).toHaveCount(0);
+  await expect(
+    assignment.locator(".identity-impact-stat").filter({ hasText: "interventions" }),
+  ).toContainText("2");
+  await expect
+    .poll(() => page.evaluate(() => window.__mockCommandCount("preview_identity_consolidation")))
+    .toBeGreaterThan(previewCallsBeforeSelection);
+  await expect(assignment.getByRole("button", { name: "Confirm changes" })).toBeEnabled();
+  await assignment.getByRole("button", { name: "Confirm changes" }).click();
+
+  await expect(assignment).toBeHidden();
+  await expect(card).toHaveCount(0);
+  await expect(page.locator("#segmentsList .segment-speaker-button")).toHaveText([
+    "Alice",
+    "Alice",
+    "Alice",
+  ]);
+  const consolidationArgs = await page.evaluate(() =>
+    window.__mockLastCommandArgs("consolidate_identities"),
+  );
+  expect(consolidationArgs.request.unassigned_groups[0].voice_group_id).toBe(
+    "voice-group-no-safe",
+  );
+  expect(consolidationArgs.expectedAffectedSessionIds).toEqual([
+    "session-no-safe-voice",
+  ]);
+  expect(consolidationArgs.expectedImpactRevision).toBe(
+    await page.evaluate(() => window.__mockIdentityImpactRevision()),
+  );
+  expect(consolidationArgs.expectedImpactRevision).toMatch(/^mock-impact-token-\d+-\d+$/);
+});
+
+test("a no-safe-voiceprint card can create a name-only person", async ({ page }) => {
+  await page.evaluate(() => window.__addNoSafeVoiceFixture(false));
+  await page.getByRole("button", { name: "Refresh conversations" }).click();
+  await page.getByRole("button", { name: /Provider-only speaker labels/ }).click();
+
+  const card = page.locator("#speakersList .speaker-card").filter({ hasText: "speaker_2" });
+  await card.getByRole("button", { name: "Assign or name…" }).click();
+  const assignment = page.getByRole("dialog", { name: "Assign or name speaker" });
+  await expect(assignment.getByLabel("Assign to")).toHaveValue("__new__");
+  expect(
+    await page.evaluate(() => window.__mockCommandCount("preview_identity_consolidation")),
+  ).toBe(0);
+  await assignment.getByLabel("New person's name").fill("Dmitrii");
+  await expect(assignment.getByText("Ready to confirm.")).toBeVisible();
+  await expect(assignment.getByRole("button", { name: "Review impact" })).toHaveCount(0);
+  await assignment.getByRole("button", { name: "Confirm changes" }).click();
+
+  await expect(card).toHaveCount(0);
+  await expect(page.locator("#segmentsList .segment-speaker-button")).toHaveText([
+    "Dmitrii",
+    "Dmitrii",
+  ]);
+  const namedCard = page.locator("#speakersList .speaker-card").filter({ hasText: "Dmitrii" });
+  await expect(namedCard.getByText("No current voiceprint", { exact: true })).toBeVisible();
+  const request = await page.evaluate(
+    () => window.__mockLastCommandArgs("consolidate_identities").request,
+  );
+  expect(request.target_speaker_id).toBeNull();
+  expect(request.unassigned_groups).toEqual([
+    {
+      session_id: "session-no-safe-voice",
+      speaker_label: "speaker_2",
+      voice_group_id: "voice-group-no-safe",
+    },
+  ]);
+});
+
 test("People & Voices keeps cross-view selections and confirms an impact-reviewed merge", async ({
   page,
 }) => {
@@ -1999,10 +2751,16 @@ test("People & Voices keeps cross-view selections and confirms an impact-reviewe
 
   const review = page.getByRole("dialog", { name: "Merge or assign selected" });
   await expect(review).toBeVisible();
-  await expect(review.getByLabel("Canonical person")).toHaveValue("speaker-alice");
+  await expect(review.getByLabel("Person to keep")).toHaveValue("speaker-alice");
   await review.getByLabel("Final display name").fill("Alice Consolidated");
-  await review.getByRole("button", { name: "Review impact" }).click();
+  await expect(review.getByText("Ready to confirm.")).toBeVisible();
+  await expect(review.getByRole("button", { name: "Review impact" })).toHaveCount(0);
   await expect(review.getByText(/1 saved recap will be marked out of date/)).toBeVisible();
+  await expect(review.locator(".identity-impact-stat")).toHaveCount(3);
+  await expect(
+    review.locator(".identity-impact-stat").filter({ hasText: "recaps made out of date" }),
+  ).toHaveCount(0);
+  await expect(review.getByText("No additional warnings.", { exact: true })).toHaveCount(0);
   await expect(review.getByText(/make and verify a local database backup/)).toBeVisible();
   await review.getByRole("button", { name: "Confirm changes" }).click();
 
@@ -2048,6 +2806,10 @@ test("a suggested mixed voice stays review-only until selected turns are split",
   await page.getByRole("button", { name: /Mixed voice review/ }).click();
 
   await expect(page.getByText("Possible mixed voice", { exact: true })).toBeVisible();
+  const mixedCard = page
+    .locator("#speakersList .speaker-card")
+    .filter({ hasText: "Possible mixed voice" });
+  await expect(mixedCard.getByRole("button", { name: "Assign or name…" })).toHaveCount(0);
   await page.getByRole("button", { name: "Review split…" }).click();
 
   const dialog = page.getByRole("dialog", { name: "Review a possible mixed voice" });
@@ -2069,6 +2831,10 @@ test("a suggested mixed voice stays review-only until selected turns are split",
   await expect(
     page.locator("#segmentsList").getByText("Second turn from another local cluster."),
   ).toBeVisible();
+  const remainingCard = page
+    .locator("#speakersList .speaker-card")
+    .filter({ hasText: "Speaker 1" });
+  await expect(remainingCard.getByRole("button", { name: "Assign or name…" })).toBeVisible();
   expect(await page.evaluate(() => window.__mockCommandCount("split_voice_group"))).toBe(1);
 });
 

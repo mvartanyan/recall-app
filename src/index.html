@@ -46,6 +46,10 @@
             People &amp; Voices
             <span id="identityOperationBadge" class="activity-badge" hidden>Working</span>
           </button>
+          <button id="recapTypesButton" class="sidebar-action" type="button">
+            <span aria-hidden="true">▤</span>
+            Recap types
+          </button>
           <button id="settingsButton" class="sidebar-action" type="button">
             <span aria-hidden="true">⚙</span>
             Settings
@@ -66,7 +70,11 @@
           </div>
           <div class="topbar-actions">
             <button id="agendaButton" class="secondary-button compact-action" type="button" hidden>Add agenda</button>
-            <button id="recapButton" class="primary-button compact-action" type="button" hidden>Recap</button>
+            <div id="recapAction" class="recap-action" hidden>
+              <button id="recapButton" class="primary-button compact-action recap-main-button" type="button">Recap</button>
+              <button id="recapMenuButton" class="primary-button compact-action recap-menu-button" type="button" aria-label="Choose a custom recap type" aria-haspopup="menu" aria-expanded="false" hidden>▾</button>
+              <div id="recapTypeMenu" class="recap-type-menu" role="menu" aria-label="Custom recap types" hidden></div>
+            </div>
             <span id="serviceBadge" class="service-badge warning" hidden>Soniox key needed</span>
             <span id="openaiServiceBadge" class="service-badge warning" hidden>OpenAI key needed</span>
             <button id="deleteSessionButton" class="icon-button danger" type="button" title="Delete conversation" aria-label="Delete conversation" hidden>⌫</button>
@@ -162,8 +170,8 @@
 
               <div id="recapStaleBanner" class="recap-stale-banner" hidden>
                 <div>
-                  <strong>This recap is out of date.</strong>
-                  <span>The transcript, participants, or agenda changed after it was generated.</span>
+                  <strong id="recapStaleTitle">This recap is out of date.</strong>
+                  <span id="recapStaleDetail">The transcript, participants, or agenda changed after it was generated.</span>
                 </div>
                 <button id="staleRegenerateButton" class="secondary-button compact-action" type="button">Regenerate</button>
               </div>
@@ -376,27 +384,32 @@
           <span class="eyebrow">People &amp; Voices</span>
           <h2 id="identityMergeTitle">Merge or assign selected</h2>
         </div>
-        <button class="icon-button" type="button" data-close-dialog="identityMergeDialog" aria-label="Close merge review">×</button>
+        <button class="icon-button" type="button" data-close-dialog="identityMergeDialog" aria-label="Close assignment or merge">×</button>
       </div>
       <div class="identity-merge-body">
         <p id="identityMergeSelection" class="supporting-copy"></p>
         <div class="identity-merge-fields">
           <label>
-            <span class="field-label">Canonical person</span>
+            <span id="identityTargetLabel" class="field-label">Person to keep</span>
             <select id="identityTarget"></select>
           </label>
-          <label>
-            <span class="field-label">Final display name</span>
+          <label id="identityFinalLabelField">
+            <span id="identityFinalLabelLabel" class="field-label">Final display name</span>
             <input id="identityFinalLabel" type="text" placeholder="Full name" autocomplete="off" />
           </label>
         </div>
-        <button id="identityPreviewButton" class="secondary-button" type="button">Review impact</button>
+        <div class="identity-impact-heading">
+          <span class="field-label">Impact</span>
+          <div class="identity-impact-status">
+            <p id="identityMergeFeedback" class="modal-feedback" role="status" aria-live="polite"></p>
+            <button id="identityPreviewRetryButton" class="text-button" type="button" hidden>Retry</button>
+          </div>
+        </div>
         <section id="identityImpact" class="identity-impact" hidden aria-live="polite">
           <div id="identityImpactStats" class="identity-impact-stats"></div>
-          <ul id="identityImpactWarnings" class="identity-impact-warnings"></ul>
+          <ul id="identityImpactWarnings" class="identity-impact-warnings" hidden></ul>
           <p class="identity-backup-note">Recall will make and verify a local database backup before changing anything. The selected changes then run in one database transaction.</p>
         </section>
-        <p id="identityMergeFeedback" class="modal-feedback" role="status" aria-live="polite"></p>
       </div>
       <div class="modal-footer">
         <button class="text-button" type="button" data-close-dialog="identityMergeDialog">Cancel</button>
@@ -419,6 +432,54 @@
         </div>
       </form>
     </div>
+
+    <dialog id="recapTypesDialog" class="modal recap-types-modal" aria-labelledby="recapTypesTitle">
+      <div class="modal-header">
+        <div>
+          <span class="eyebrow">Recap prompts</span>
+          <h2 id="recapTypesTitle">Recap types</h2>
+        </div>
+        <button id="closeRecapTypesButton" class="icon-button" type="button" aria-label="Close recap types">×</button>
+      </div>
+      <div class="recap-types-body">
+        <aside class="recap-types-list-pane">
+          <p>Built-in types control the standard Recap. Custom types run separately and create their own meeting tabs.</p>
+          <button id="createRecapTypeButton" class="secondary-button" type="button">New custom type</button>
+          <div id="recapTypesList" class="recap-types-list" role="listbox" aria-label="Recap types"></div>
+        </aside>
+        <form id="recapTypeForm" class="recap-type-editor">
+          <div class="recap-type-editor-heading">
+            <div>
+              <span id="recapTypeKind" class="eyebrow">Built-in type</span>
+              <h3 id="recapTypeEditorTitle">Executive summary</h3>
+            </div>
+          </div>
+          <label class="field-label" for="recapTypeName">Name</label>
+          <input id="recapTypeName" type="text" autocomplete="off" aria-describedby="recapTypeNameHelp" />
+          <div id="recapTypeNameHelp" class="recap-type-name-help">
+            <span>Custom names may repeat and are limited to 20 characters.</span>
+            <span id="recapTypeNameCount">0 / 20</span>
+          </div>
+          <label class="field-label" for="recapTypePrompt">Instructions</label>
+          <textarea id="recapTypePrompt" rows="16" spellcheck="true" aria-describedby="recapTypePromptHelp recapPromptVariablesHelp"></textarea>
+          <p id="recapTypePromptHelp" class="field-help">Recall supplies the complete attributed transcript and any saved agenda automatically. Write only the instructions for the recap content.</p>
+          <div class="recap-prompt-variables">
+            <div class="recap-prompt-variables-heading">
+              <span class="field-label">Insert variable</span>
+              <span id="recapPromptVariablesHelp">Recall fills these with the selected conversation's saved date and time automatically.</span>
+            </div>
+            <div id="recapPromptVariables" class="recap-prompt-variable-list" role="list" aria-label="Prompt variables" aria-busy="true"></div>
+            <p id="recapPromptVariablesStatus" class="recap-prompt-variables-status" role="status" aria-live="polite">Loading variables…</p>
+          </div>
+          <p id="recapTypeFeedback" class="modal-feedback" role="status" aria-live="polite"></p>
+          <div class="recap-type-editor-actions">
+            <button id="deleteRecapTypeButton" class="text-button danger-text" type="button" hidden>Delete type</button>
+            <button id="restoreRecapTypeButton" class="secondary-button" type="button">Restore default</button>
+            <button id="saveRecapTypeButton" class="primary-button" type="submit">Save</button>
+          </div>
+        </form>
+      </div>
+    </dialog>
 
     <dialog id="settingsDialog" class="modal settings-modal">
       <form id="settingsForm" method="dialog">
@@ -708,11 +769,11 @@
       </form>
     </dialog>
 
-    <dialog id="unresolvedDialog" class="modal compact-modal unresolved-modal">
+    <dialog id="unresolvedDialog" class="modal compact-modal unresolved-modal" aria-labelledby="unresolvedDialogTitle">
       <div class="modal-header">
         <div>
           <span class="eyebrow">Participant check</span>
-          <h2>Name participants first?</h2>
+          <h2 id="unresolvedDialogTitle">Name participants first?</h2>
         </div>
       </div>
       <div class="unresolved-body">

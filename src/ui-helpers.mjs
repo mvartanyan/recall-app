@@ -254,10 +254,298 @@ export function parseNoTranslationLanguages(value, preferredLanguage = "en") {
 export function recapTabAvailability(recapState) {
   const payload = recapState?.recap?.payload;
   const tabs = ["transcript"];
-  if (!payload) return tabs;
-  tabs.push("executive", "full", "actions");
-  if (payload.agenda_present) tabs.push("agenda");
+  if (payload) {
+    tabs.push("executive", "full", "actions");
+    if (payload.agenda_present) tabs.push("agenda");
+  }
+  for (const recap of sortCustomRecaps(recapState?.custom_recaps)) {
+    if (recap?.recap_type_id) tabs.push("custom:" + recap.recap_type_id);
+  }
   return tabs;
+}
+
+const BUILT_IN_RECAP_ORDER = ["Executive summary", "Full summary", "Actions"];
+
+export function normalizeRecapTypeName(value) {
+  return String(value || "").normalize("NFC").trim().replace(/\s+/gu, " ");
+}
+
+export function recapTypeNameLength(value) {
+  return Array.from(normalizeRecapTypeName(value)).length;
+}
+
+function recapTypeIsCustom(recapType) {
+  if (!recapType) return false;
+  if (typeof recapType.is_builtin === "boolean") return !recapType.is_builtin;
+  return String(recapType.kind || "").toLowerCase() === "custom";
+}
+
+function compareNames(left, right) {
+  const base = String(left || "").localeCompare(String(right || ""), undefined, {
+    sensitivity: "base",
+    numeric: true,
+  });
+  return base || String(left || "").localeCompare(String(right || ""));
+}
+
+function builtInRecapRank(recapType) {
+  const byName = BUILT_IN_RECAP_ORDER.indexOf(String(recapType?.name || ""));
+  if (byName >= 0) return byName;
+  const kind = String(recapType?.kind || "").toLowerCase().replaceAll("-", "_");
+  if (kind.includes("executive")) return 0;
+  if (kind.includes("full")) return 1;
+  if (kind.includes("action")) return 2;
+  return BUILT_IN_RECAP_ORDER.length;
+}
+
+export function sortRecapTypes(recapTypes) {
+  return [...(recapTypes || [])].sort((left, right) => {
+    const leftCustom = recapTypeIsCustom(left);
+    const rightCustom = recapTypeIsCustom(right);
+    if (leftCustom !== rightCustom) return leftCustom ? 1 : -1;
+    if (!leftCustom) {
+      const rank = builtInRecapRank(left) - builtInRecapRank(right);
+      if (rank) return rank;
+    }
+    return (
+      compareNames(left?.name, right?.name) ||
+      String(left?.id || "").localeCompare(String(right?.id || ""))
+    );
+  });
+}
+
+export function normalizeRecapPromptVariables(variables) {
+  if (!Array.isArray(variables)) return [];
+  return variables.flatMap((variable) => {
+    const token = String(variable?.token || "").trim();
+    if (!token) return [];
+    return [{
+      token,
+      label: String(variable?.label || token).trim() || token,
+      description: String(variable?.description || "").trim(),
+      example: String(variable?.example || "").trim(),
+    }];
+  });
+}
+
+export function insertRecapPromptVariable(value, token, selectionStart, selectionEnd) {
+  const source = String(value || "");
+  const insertion = String(token || "");
+  const clampIndex = (candidate, fallback) => {
+    const numeric = Number(candidate);
+    if (!Number.isFinite(numeric)) return fallback;
+    return Math.max(0, Math.min(source.length, Math.trunc(numeric)));
+  };
+  const first = clampIndex(selectionStart, source.length);
+  const second = clampIndex(selectionEnd, first);
+  const start = Math.min(first, second);
+  const end = Math.max(first, second);
+  const caret = start + insertion.length;
+  return {
+    value: source.slice(0, start) + insertion + source.slice(end),
+    selectionStart: caret,
+    selectionEnd: caret,
+  };
+}
+
+export function sortCustomRecaps(recaps) {
+  return [...(recaps || [])].sort(
+    (left, right) =>
+      compareNames(left?.name, right?.name) ||
+      String(left?.recap_type_id || "").localeCompare(String(right?.recap_type_id || "")),
+  );
+}
+
+function appendInlineText(tokens, value) {
+  if (!value) return;
+  const last = tokens.at(-1);
+  if (last?.type === "text") last.text += value;
+  else tokens.push({ type: "text", text: value });
+}
+
+export function parseSafeMarkdownInline(value) {
+  const source = String(value || "");
+  const tokens = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    if (source[cursor] === "\\" && cursor + 1 < source.length) {
+      appendInlineText(tokens, source[cursor + 1]);
+      cursor += 2;
+      continue;
+    }
+    if (source[cursor] === "`") {
+      const end = source.indexOf("`", cursor + 1);
+      if (end > cursor + 1) {
+        tokens.push({ type: "code", text: source.slice(cursor + 1, end) });
+        cursor = end + 1;
+        continue;
+      }
+    }
+    const strongMarker = source.startsWith("**", cursor)
+      ? "**"
+      : source.startsWith("__", cursor)
+        ? "__"
+        : null;
+    if (strongMarker) {
+      const end = source.indexOf(strongMarker, cursor + 2);
+      if (end > cursor + 2) {
+        tokens.push({
+          type: "strong",
+          children: parseSafeMarkdownInline(source.slice(cursor + 2, end)),
+        });
+        cursor = end + 2;
+        continue;
+      }
+    }
+    const emphasisMarker = source[cursor] === "*" || source[cursor] === "_"
+      ? source[cursor]
+      : null;
+    if (emphasisMarker) {
+      const end = source.indexOf(emphasisMarker, cursor + 1);
+      if (end > cursor + 1) {
+        tokens.push({
+          type: "emphasis",
+          children: parseSafeMarkdownInline(source.slice(cursor + 1, end)),
+        });
+        cursor = end + 1;
+        continue;
+      }
+    }
+    appendInlineText(tokens, source[cursor]);
+    cursor += 1;
+  }
+  return tokens;
+}
+
+function markdownBlockStart(line) {
+  return (
+    /^\s*$/.test(line) ||
+    /^\s*```/.test(line) ||
+    /^(#{1,6})\s+/.test(line) ||
+    /^\s*</.test(line) ||
+    /^\s*>/.test(line) ||
+    /^\s*[-+*]\s+/.test(line) ||
+    /^\s*\d+[.)]\s+/.test(line)
+  );
+}
+
+export function parseSafeMarkdown(value) {
+  const lines = String(value || "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+  const blocks = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const fence = line.match(/^\s*```\s*([^`]*)$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push({
+        type: "code_block",
+        language: fence[1].trim(),
+        text: code.join("\n"),
+      });
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+?)\s*#*\s*$/);
+    if (heading) {
+      blocks.push({
+        type: "heading",
+        level: heading[1].length,
+        children: parseSafeMarkdownInline(heading[2]),
+      });
+      index += 1;
+      continue;
+    }
+    if (/^\s*</.test(line)) {
+      const rawLines = [line];
+      index += 1;
+      while (index < lines.length && /^\s*</.test(lines[index])) {
+        rawLines.push(lines[index]);
+        index += 1;
+      }
+      blocks.push({
+        type: "paragraph",
+        children: [{ type: "text", text: rawLines.join("\n") }],
+      });
+      continue;
+    }
+    if (/^\s*>/.test(line)) {
+      const quoteLines = [];
+      while (index < lines.length && /^\s*>/.test(lines[index])) {
+        quoteLines.push(lines[index].replace(/^\s*>\s?/, ""));
+        index += 1;
+      }
+      blocks.push({ type: "blockquote", blocks: parseSafeMarkdown(quoteLines.join("\n")) });
+      continue;
+    }
+    const unordered = line.match(/^\s*[-+*]\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      const isOrdered = Boolean(ordered);
+      const items = [];
+      const expression = isOrdered ? /^\s*\d+[.)]\s+(.+)$/ : /^\s*[-+*]\s+(.+)$/;
+      while (index < lines.length) {
+        const item = lines[index].match(expression);
+        if (!item) break;
+        items.push({ children: parseSafeMarkdownInline(item[1]) });
+        index += 1;
+      }
+      blocks.push({ type: "list", ordered: isOrdered, items });
+      continue;
+    }
+    const paragraph = [line];
+    index += 1;
+    while (index < lines.length && !markdownBlockStart(lines[index])) {
+      paragraph.push(lines[index]);
+      index += 1;
+    }
+    blocks.push({
+      type: "paragraph",
+      children: parseSafeMarkdownInline(paragraph.join("\n")),
+    });
+  }
+  return blocks;
+}
+
+function safeMarkdownInlineText(tokens) {
+  return (tokens || [])
+    .map((token) =>
+      token.type === "text" || token.type === "code"
+        ? String(token.text || "")
+        : safeMarkdownInlineText(token.children),
+    )
+    .join("");
+}
+
+function safeMarkdownBlockText(block) {
+  if (block.type === "heading" || block.type === "paragraph") {
+    return safeMarkdownInlineText(block.children);
+  }
+  if (block.type === "code_block") return String(block.text || "");
+  if (block.type === "blockquote") {
+    return (block.blocks || []).map(safeMarkdownBlockText).filter(Boolean).join("\n\n");
+  }
+  if (block.type === "list") {
+    return (block.items || [])
+      .map((item, itemIndex) =>
+        (block.ordered ? itemIndex + 1 + ". " : "- ") + safeMarkdownInlineText(item.children),
+      )
+      .join("\n");
+  }
+  return "";
+}
+
+export function safeMarkdownPlainText(value) {
+  return parseSafeMarkdown(value).map(safeMarkdownBlockText).filter(Boolean).join("\n\n").trim();
 }
 
 export function buildTranslationPlan(text, annotations) {

@@ -25,12 +25,20 @@ import {
   normalizeLiveCaptionRevision,
   normalizeLiveCaptionTurns,
   normalizePreferredLanguage,
+  normalizeRecapPromptVariables,
+  normalizeRecapTypeName,
   parseLanguageHints,
   parseNoTranslationLanguages,
+  parseSafeMarkdown,
   processingRunIds,
   recapTabAvailability,
+  recapTypeNameLength,
+  insertRecapPromptVariable,
+  safeMarkdownPlainText,
   setCachedConversation,
   shouldShowOnboarding,
+  sortCustomRecaps,
+  sortRecapTypes,
   translatedSegmentText,
   transcriptFromSegments,
 } from "./ui-helpers.mjs";
@@ -274,6 +282,142 @@ test("a persisted recap always exposes its generated tabs", () => {
     recapTabAvailability({ recap: { payload: { agenda_present: true } } }),
     ["transcript", "executive", "full", "actions", "agenda"],
   );
+  assert.deepEqual(
+    recapTabAvailability({
+      recap: null,
+      custom_recaps: [
+        { recap_type_id: "risk-z", name: "Risk review" },
+        { recap_type_id: "board", name: "Board note" },
+        { recap_type_id: "risk-a", name: "Risk review" },
+      ],
+    }),
+    ["transcript", "custom:board", "custom:risk-a", "custom:risk-z"],
+  );
+});
+
+test("recap types keep built-ins fixed and sort duplicate custom names deterministically", () => {
+  const sorted = sortRecapTypes([
+    { id: "risk-z", kind: "custom", name: "Risk review" },
+    { id: "actions", kind: "actions", name: "Actions" },
+    { id: "full", kind: "full_summary", name: "Full summary" },
+    { id: "board", kind: "custom", name: "board note" },
+    { id: "risk-a", kind: "custom", name: "Risk review" },
+    { id: "executive", kind: "executive_summary", name: "Executive summary" },
+  ]);
+  assert.deepEqual(
+    sorted.map((recapType) => recapType.id),
+    ["executive", "full", "actions", "board", "risk-a", "risk-z"],
+  );
+  assert.deepEqual(
+    sortCustomRecaps([
+      { recap_type_id: "risk-z", name: "Risk review" },
+      { recap_type_id: "board", name: "board note" },
+      { recap_type_id: "risk-a", name: "Risk review" },
+    ]).map((recap) => recap.recap_type_id),
+    ["board", "risk-a", "risk-z"],
+  );
+});
+
+test("custom recap names normalize whitespace and count Unicode code points", () => {
+  assert.equal(normalizeRecapTypeName("  Risk\n\t review  "), "Risk review");
+  assert.equal(recapTypeNameLength("  🌍 climate  "), 9);
+});
+
+test("recap prompt variables are normalized from the native registry", () => {
+  assert.deepEqual(
+    normalizeRecapPromptVariables([
+      {
+        token: " {{meeting_date}} ",
+        label: " Meeting date ",
+        description: " The saved local date. ",
+        example: " 2026/09/01 ",
+      },
+      {
+        token: "{{future_variable}}",
+        label: "",
+        description: null,
+        example: null,
+      },
+      { token: "   ", label: "Ignored" },
+    ]),
+    [
+      {
+        token: "{{meeting_date}}",
+        label: "Meeting date",
+        description: "The saved local date.",
+        example: "2026/09/01",
+      },
+      {
+        token: "{{future_variable}}",
+        label: "{{future_variable}}",
+        description: "",
+        example: "",
+      },
+    ],
+  );
+  assert.deepEqual(normalizeRecapPromptVariables(null), []);
+});
+
+test("a recap prompt variable replaces the current selection and returns its caret", () => {
+  assert.deepEqual(
+    insertRecapPromptVariable("Use OLD here", "{{meeting_date}}", 4, 7),
+    {
+      value: "Use {{meeting_date}} here",
+      selectionStart: 20,
+      selectionEnd: 20,
+    },
+  );
+  assert.deepEqual(
+    insertRecapPromptVariable("Prompt: ", "{{future_variable}}"),
+    {
+      value: "Prompt: {{future_variable}}",
+      selectionStart: 27,
+      selectionEnd: 27,
+    },
+  );
+});
+
+test("safe recap Markdown supports the allowed subset and produces plain text", () => {
+  const markdown = [
+    "# Risk review",
+    "",
+    "A **material** risk with *uncertain* timing and `owner_id`.",
+    "",
+    "- First item",
+    "- Second item",
+    "",
+    "> Quoted context",
+    "",
+    "```js",
+    "const safe = true;",
+    "```",
+  ].join("\n");
+  assert.deepEqual(
+    parseSafeMarkdown(markdown).map((block) => block.type),
+    ["heading", "paragraph", "list", "blockquote", "code_block"],
+  );
+  assert.equal(
+    safeMarkdownPlainText(markdown),
+    [
+      "Risk review",
+      "",
+      "A material risk with uncertain timing and owner_id.",
+      "",
+      "- First item\n- Second item",
+      "",
+      "Quoted context",
+      "",
+      "const safe = true;",
+    ].join("\n"),
+  );
+});
+
+test("safe recap Markdown treats raw HTML and scripts as literal text", () => {
+  const malicious = '<script>globalThis.pwned=true</script>\n\n<img src=x onerror="pwned=true">';
+  const blocks = parseSafeMarkdown(malicious);
+  assert.deepEqual(blocks.map((block) => block.type), ["paragraph", "paragraph"]);
+  assert.equal(safeMarkdownPlainText(malicious), malicious);
+  assert.doesNotMatch(JSON.stringify(blocks), /"type":"html"/);
 });
 
 test("translation annotations are inserted after exact non-overlapping excerpts", () => {

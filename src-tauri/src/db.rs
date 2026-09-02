@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use rand::RngCore;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use zeroize::Zeroize;
@@ -24,7 +25,11 @@ use crate::{
         is_generic_speaker_label, validate_import_draft, JamieArchive, JamieImportDraft,
         JamieKnownPerson, JAMIE_IMPORTER_VERSION,
     },
-    recap::RecapPayload,
+    recap::{
+        self, AgendaFingerprint, RecapPayload, RecapSourceSegment, BUILTIN_ACTIONS_ID,
+        BUILTIN_EXECUTIVE_SUMMARY_ID, BUILTIN_FULL_SUMMARY_ID, DEFAULT_ACTIONS_PROMPT,
+        DEFAULT_EXECUTIVE_SUMMARY_PROMPT, DEFAULT_FULL_SUMMARY_PROMPT,
+    },
 };
 
 const SUGGESTION_REFERENCE_COMPATIBILITY_THRESHOLD: f32 = 0.94;
@@ -213,6 +218,7 @@ pub struct SessionVoiceGroup {
     pub split_clusters: Vec<Vec<String>>,
     pub intervention_count: usize,
     pub voice_observation_count: usize,
+    pub has_preview_sample: bool,
 }
 
 pub struct SessionVoiceGroupSave<'a> {
@@ -291,6 +297,14 @@ pub struct SpeakerSample {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VoiceGroupSample {
+    pub voice_group_id: String,
+    pub sample_b64: String,
+    pub sample_rate: u32,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Speaker {
     pub id: String,
@@ -342,6 +356,8 @@ pub struct IdentityProfilePage {
 pub struct UnassignedIdentityKey {
     pub session_id: String,
     pub speaker_label: Option<String>,
+    #[serde(default)]
+    pub voice_group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -389,6 +405,7 @@ pub struct IdentityConsolidationPreview {
     pub imported_source_profile_count: usize,
     pub creates_new_person: bool,
     pub warnings: Vec<String>,
+    pub impact_revision: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -491,6 +508,14 @@ pub struct AgendaRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
+pub struct RecapSourceSnapshot {
+    pub meeting_created_at: DateTime<Utc>,
+    pub segments: Vec<RecapSourceSegment>,
+    pub agenda: Option<AgendaRecord>,
+    pub source_fingerprint: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AgendaMetadata {
     pub source_kind: String,
@@ -538,6 +563,80 @@ pub struct RecapSave<'a> {
     pub payload: &'a RecapPayload,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+pub const RECAP_TYPE_KIND_BUILTIN: &str = "builtin";
+pub const RECAP_TYPE_KIND_CUSTOM: &str = "custom";
+
+const BUILTIN_RECAP_TYPES: [(&str, &str, &str); 3] = [
+    (
+        BUILTIN_EXECUTIVE_SUMMARY_ID,
+        "Executive summary",
+        DEFAULT_EXECUTIVE_SUMMARY_PROMPT,
+    ),
+    (
+        BUILTIN_FULL_SUMMARY_ID,
+        "Full summary",
+        DEFAULT_FULL_SUMMARY_PROMPT,
+    ),
+    (BUILTIN_ACTIONS_ID, "Actions", DEFAULT_ACTIONS_PROMPT),
+];
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RecapType {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub prompt: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CustomRecapRecord {
+    pub session_id: String,
+    pub recap_type_id: String,
+    pub name_snapshot: String,
+    #[serde(skip_serializing)]
+    pub prompt_snapshot: String,
+    pub content_markdown: String,
+    pub target_language: String,
+    pub model: String,
+    pub source_fingerprint: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub generated_at: DateTime<Utc>,
+}
+
+pub struct CustomRecapSave<'a> {
+    pub session_id: &'a str,
+    pub recap_type_id: &'a str,
+    pub name_snapshot: &'a str,
+    pub prompt_snapshot: &'a str,
+    pub content_markdown: &'a str,
+    pub target_language: &'a str,
+    pub model: &'a str,
+    pub source_fingerprint: &'a str,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+struct PreparedCustomRecap {
+    session_id: String,
+    recap_type_id: String,
+    name_snapshot: String,
+    prompt_snapshot: String,
+    prompt_nonce: String,
+    prompt_ciphertext: String,
+    content_markdown: String,
+    content_nonce: String,
+    content_ciphertext: String,
+    target_language: String,
+    model: String,
+    source_fingerprint: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    generated_at: DateTime<Utc>,
 }
 
 fn is_provisional_label(label: &str) -> bool {
@@ -603,6 +702,37 @@ fn display_person_name(label: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn normalized_recap_type_name(name: &str) -> Result<String, String> {
+    let normalized = name
+        .nfc()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return Err("Recap type name cannot be empty".into());
+    }
+    if normalized.chars().count() > 20 {
+        return Err("Recap type name cannot be longer than 20 characters".into());
+    }
+    Ok(normalized)
+}
+
+fn normalized_recap_type_prompt(prompt: &str) -> Result<String, String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("Recap type prompt cannot be empty".into());
+    }
+    Ok(prompt.to_string())
+}
+
+fn builtin_recap_type(id: &str) -> Option<(&'static str, &'static str)> {
+    BUILTIN_RECAP_TYPES
+        .iter()
+        .find(|(candidate_id, _, _)| *candidate_id == id)
+        .map(|(_, name, prompt)| (*name, *prompt))
 }
 
 fn natural_label_cmp(left: &str, right: &str) -> Ordering {
@@ -688,6 +818,27 @@ impl Db {
             return Ok(());
         }
         let conn = Connection::open(path).map_err(|error| error.to_string())?;
+        let voice_group_samples_migration_needed = Self::table_exists(&conn, "sessions")?
+            && !Self::table_exists(&conn, "voice_group_samples")?;
+        if voice_group_samples_migration_needed {
+            let backup = Self::voice_group_samples_migration_backup_path(path);
+            Self::create_and_verify_migration_backup(
+                &conn,
+                &backup,
+                "adding meeting-local voice-group previews",
+            )?;
+        }
+        let recap_types_migration_needed = Self::table_exists(&conn, "sessions")?
+            && (!Self::table_exists(&conn, "recap_types")?
+                || !Self::table_exists(&conn, "session_custom_recaps")?);
+        if recap_types_migration_needed {
+            let backup = Self::recap_types_migration_backup_path(path);
+            Self::create_and_verify_migration_backup(
+                &conn,
+                &backup,
+                "adding recap types and custom recap results",
+            )?;
+        }
         let recap_migration_needed = Self::table_exists(&conn, "sessions")?
             && (!Self::table_exists(&conn, "session_agendas")?
                 || !Self::table_exists(&conn, "session_recaps")?);
@@ -822,6 +973,199 @@ impl Db {
         Ok(())
     }
 
+    fn create_and_verify_migration_backup(
+        conn: &Connection,
+        backup: &Path,
+        purpose: &str,
+    ) -> Result<(), String> {
+        let candidate = Self::migration_backup_artifact_path(backup, "candidate");
+        let create_candidate = || -> Result<(), String> {
+            conn.execute(
+                "VACUUM INTO ?1",
+                params![candidate.to_string_lossy().to_string()],
+            )
+            .map_err(|error| {
+                format!(
+                    "Could not create the database backup candidate at {} before {purpose}: {error}",
+                    candidate.display()
+                )
+            })?;
+            Self::restrict_file_permissions(&candidate)?;
+            Self::verify_migration_backup_against_source(conn, &candidate, purpose)
+        };
+        if let Err(error) = create_candidate() {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(error);
+        }
+
+        if backup.exists() {
+            let identical = match Self::files_are_identical(backup, &candidate) {
+                Ok(identical) => identical,
+                Err(error) => {
+                    eprintln!(
+                        "[database] could not compare the existing migration backup at {} with the verified source snapshot: {error}",
+                        backup.display()
+                    );
+                    false
+                }
+            };
+            if identical {
+                Self::restrict_file_permissions(backup)?;
+                if let Err(error) = std::fs::remove_file(&candidate) {
+                    eprintln!(
+                        "[database] could not remove the redundant verified backup candidate at {}: {error}",
+                        candidate.display()
+                    );
+                }
+                eprintln!(
+                    "[database] verified the exact migration database backup at {}",
+                    backup.display()
+                );
+                return Ok(());
+            }
+
+            let preserved = Self::migration_backup_artifact_path(backup, "replaced");
+            if backup.is_file() {
+                Self::restrict_file_permissions(backup)?;
+            }
+            std::fs::rename(backup, &preserved).map_err(|error| {
+                let _ = std::fs::remove_file(&candidate);
+                format!(
+                    "Could not preserve the non-matching migration backup at {} as {} before {purpose}: {error}",
+                    backup.display(),
+                    preserved.display()
+                )
+            })?;
+            if preserved.is_file() {
+                Self::restrict_file_permissions(&preserved)?;
+            }
+            if let Err(error) = std::fs::rename(&candidate, backup) {
+                let restore_error = std::fs::rename(&preserved, backup).err();
+                let restore_message = restore_error
+                    .map(|restore| format!("; restoring the prior artifact also failed: {restore}"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Could not promote the verified migration backup candidate {} to {} before {purpose}: {error}{restore_message}",
+                    candidate.display(),
+                    backup.display()
+                ));
+            }
+            Self::restrict_file_permissions(backup)?;
+            eprintln!(
+                "[database] preserved a non-matching migration backup at {} and replaced {} with an exact verified snapshot",
+                preserved.display(),
+                backup.display()
+            );
+            return Ok(());
+        }
+
+        std::fs::rename(&candidate, backup).map_err(|error| {
+            format!(
+                "Could not promote the verified migration backup candidate {} to {} before {purpose}: {error}",
+                candidate.display(),
+                backup.display()
+            )
+        })?;
+        Self::restrict_file_permissions(backup)?;
+        eprintln!(
+            "[database] created and verified the exact migration database backup at {}",
+            backup.display()
+        );
+        Ok(())
+    }
+
+    fn verify_migration_backup_against_source(
+        conn: &Connection,
+        backup: &Path,
+        purpose: &str,
+    ) -> Result<(), String> {
+        let verification = Connection::open(backup).map_err(|error| {
+            format!(
+                "Could not open the database backup at {} for verification: {error}",
+                backup.display()
+            )
+        })?;
+        let integrity: String = verification
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(|error| {
+                format!(
+                    "Could not verify the database backup at {}: {error}",
+                    backup.display()
+                )
+            })?;
+        if integrity != "ok" {
+            return Err(format!(
+                "The database backup at {} failed its integrity check: {integrity}",
+                backup.display()
+            ));
+        }
+        let mut source_tables_statement = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type='table' AND name NOT LIKE 'sqlite_%'
+                  ORDER BY name",
+            )
+            .map_err(|error| error.to_string())?;
+        let source_tables = source_tables_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        for table in source_tables {
+            if !Self::table_exists(&verification, &table)? {
+                return Err(format!(
+                    "The database backup at {} is missing the {table} table required before {purpose}",
+                    backup.display()
+                ));
+            }
+            let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+            let count_sql = format!("SELECT COUNT(*) FROM {quoted_table}");
+            let source_count: i64 = conn
+                .query_row(&count_sql, [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            let backup_count: i64 = verification
+                .query_row(&count_sql, [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if backup_count != source_count {
+                return Err(format!(
+                    "The database backup at {} has {backup_count} {table} rows, expected {source_count} before {purpose}",
+                    backup.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn migration_backup_artifact_path(backup: &Path, kind: &str) -> PathBuf {
+        let stem = backup
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall.pre-migration");
+        backup.with_file_name(format!("{stem}.{kind}-{}.db", Uuid::new_v4().simple()))
+    }
+
+    fn files_are_identical(left: &Path, right: &Path) -> std::io::Result<bool> {
+        use std::io::Read as _;
+
+        if std::fs::metadata(left)?.len() != std::fs::metadata(right)?.len() {
+            return Ok(false);
+        }
+        let mut left = std::io::BufReader::new(std::fs::File::open(left)?);
+        let mut right = std::io::BufReader::new(std::fs::File::open(right)?);
+        let mut left_buffer = [0u8; 64 * 1024];
+        let mut right_buffer = [0u8; 64 * 1024];
+        loop {
+            let left_read = left.read(&mut left_buffer)?;
+            let right_read = right.read(&mut right_buffer)?;
+            if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+                return Ok(false);
+            }
+            if left_read == 0 {
+                return Ok(true);
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn restrict_file_permissions(path: &Path) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
@@ -879,6 +1223,22 @@ impl Db {
             .and_then(|value| value.to_str())
             .unwrap_or("recall");
         path.with_file_name(format!("{stem}.pre-recap-v1.db"))
+    }
+
+    fn recap_types_migration_backup_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        path.with_file_name(format!("{stem}.pre-recap-types-v1.db"))
+    }
+
+    fn voice_group_samples_migration_backup_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("recall");
+        path.with_file_name(format!("{stem}.pre-voice-group-samples-v1.db"))
     }
 
     fn processing_migration_backup_path(path: &Path) -> PathBuf {
@@ -1023,6 +1383,12 @@ impl Db {
                     created_at TEXT NOT NULL,
                     UNIQUE(session_id, provider_speaker_label, cluster_index)
                  );
+                 CREATE TABLE IF NOT EXISTS voice_group_samples (
+                    voice_group_id TEXT PRIMARY KEY,
+                    sample_b64 TEXT NOT NULL,
+                    sample_rate INTEGER NOT NULL CHECK(sample_rate > 0),
+                    created_at TEXT NOT NULL
+                 );
                  CREATE TABLE IF NOT EXISTS voice_observations (
                     id TEXT PRIMARY KEY,
                     voice_group_id TEXT NOT NULL,
@@ -1057,6 +1423,31 @@ impl Db {
                     payload_ct TEXT NOT NULL,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE IF NOT EXISTS recap_types (
+                    id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL CHECK(kind IN ('builtin', 'custom')),
+                    name TEXT NOT NULL,
+                    prompt_nonce TEXT,
+                    prompt_ct TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_custom_recaps (
+                    session_id TEXT NOT NULL,
+                    recap_type_id TEXT NOT NULL,
+                    name_snapshot TEXT NOT NULL,
+                    prompt_snapshot_nonce TEXT,
+                    prompt_snapshot_ct TEXT NOT NULL,
+                    content_markdown_nonce TEXT,
+                    content_markdown_ct TEXT NOT NULL,
+                    target_language TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    generated_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id, recap_type_id)
                  );
                  CREATE TABLE IF NOT EXISTS processing_jobs (
                     session_id TEXT PRIMARY KEY,
@@ -1246,9 +1637,37 @@ impl Db {
                  CREATE INDEX IF NOT EXISTS voice_observations_group_idx
                     ON voice_observations(voice_group_id, start_ms, id);
                  CREATE INDEX IF NOT EXISTS voice_observations_session_idx
-                    ON voice_observations(session_id, segment_id);",
+                    ON voice_observations(session_id, segment_id);
+                 CREATE INDEX IF NOT EXISTS session_custom_recaps_session_name_idx
+                    ON session_custom_recaps(session_id, name_snapshot, recap_type_id);",
             )
             .map_err(|error| error.to_string())?;
+        self.seed_builtin_recap_types(&conn_guard)?;
+        Ok(())
+    }
+
+    fn seed_builtin_recap_types(&self, conn: &Connection) -> Result<(), String> {
+        let now: DateTime<Utc> = SystemTime::now().into();
+        for (id, name, prompt) in BUILTIN_RECAP_TYPES {
+            let (nonce, ciphertext) = self.crypto.encrypt(prompt.as_bytes());
+            conn.execute(
+                "INSERT INTO recap_types(
+                    id, kind, name, prompt_nonce, prompt_ct, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    kind=excluded.kind,
+                    name=excluded.name",
+                params![
+                    id,
+                    RECAP_TYPE_KIND_BUILTIN,
+                    name,
+                    nonce,
+                    ciphertext,
+                    now.to_rfc3339()
+                ],
+            )
+            .map_err(|error| format!("Could not seed built-in recap type {name}: {error}"))?;
+        }
         Ok(())
     }
 
@@ -1297,6 +1716,14 @@ impl Db {
         .map_err(|error| error.to_string())?;
         tx.execute(
             "DELETE FROM voice_observations WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM voice_group_samples
+              WHERE voice_group_id IN (
+                    SELECT id FROM session_voice_groups WHERE session_id=?1
+              )",
             params![session_id],
         )
         .map_err(|error| error.to_string())?;
@@ -1766,6 +2193,11 @@ impl Db {
         )
         .map_err(|error| error.to_string())?;
         tx.execute(
+            "DELETE FROM session_custom_recaps WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
             "DELETE FROM session_agendas WHERE session_id=?1",
             params![session_id],
         )
@@ -1782,6 +2214,14 @@ impl Db {
         .map_err(|error| error.to_string())?;
         tx.execute(
             "DELETE FROM voice_observations WHERE session_id=?1",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM voice_group_samples
+              WHERE voice_group_id IN (
+                    SELECT id FROM session_voice_groups WHERE session_id=?1
+              )",
             params![session_id],
         )
         .map_err(|error| error.to_string())?;
@@ -2611,9 +3051,18 @@ impl Db {
             values
         };
         for session_id in &session_ids {
+            tx.execute(
+                "DELETE FROM voice_group_samples
+                  WHERE voice_group_id IN (
+                        SELECT id FROM session_voice_groups WHERE session_id=?1
+                  )",
+                params![session_id],
+            )
+            .map_err(|error| error.to_string())?;
             for table in [
                 "segments",
                 "session_recaps",
+                "session_custom_recaps",
                 "session_agendas",
                 "processing_jobs",
                 "voice_match_decisions",
@@ -2894,6 +3343,14 @@ impl Db {
 
     pub fn load_agenda(&self, session_id: &str) -> Result<Option<AgendaRecord>, String> {
         let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        self.load_agenda_with_connection(&conn, session_id)
+    }
+
+    fn load_agenda_with_connection(
+        &self,
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<Option<AgendaRecord>, String> {
         let row = conn
             .query_row(
                 "SELECT source_kind, filename, mime_type, content_nonce, content_ct, updated_at
@@ -2927,6 +3384,112 @@ impl Db {
             content,
             updated_at,
         }))
+    }
+
+    fn recap_source_snapshot_with_connection(
+        &self,
+        conn: &Connection,
+        session_id: &str,
+    ) -> Result<RecapSourceSnapshot, String> {
+        let session = conn
+            .query_row(
+                "SELECT created_at, COALESCE(duration_ms, 0), transcript_nonce, transcript_ct
+                   FROM sessions
+                  WHERE id=?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Conversation not found".to_string())?;
+        let meeting_created_at = DateTime::parse_from_rfc3339(&session.0)
+            .map_err(|error| format!("Could not read the conversation timestamp: {error}"))?
+            .with_timezone(&Utc);
+        let transcript =
+            String::from_utf8(self.crypto.decrypt(&session.2, &session.3)?).unwrap_or_default();
+        let mut segments = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT id, start_ms, end_ms, speaker_id, speaker_label, text_nonce, text_ct
+                       FROM segments
+                      WHERE session_id=?1
+                      ORDER BY start_ms ASC",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut segments = Vec::new();
+            for row in rows {
+                let (id, start_ms, end_ms, speaker_id, speaker_label, nonce, ciphertext) =
+                    row.map_err(|error| error.to_string())?;
+                let text = String::from_utf8(self.crypto.decrypt(&nonce, &ciphertext)?)
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    continue;
+                }
+                segments.push(RecapSourceSegment {
+                    id,
+                    start_ms,
+                    end_ms,
+                    speaker_id,
+                    speaker_label: speaker_label
+                        .filter(|label| !label.trim().is_empty())
+                        .unwrap_or_else(|| "Unknown speaker".to_string()),
+                    text,
+                });
+            }
+            segments
+        };
+        if segments.is_empty() && !transcript.trim().is_empty() {
+            segments.push(RecapSourceSegment {
+                id: format!("legacy-{session_id}"),
+                start_ms: 0,
+                end_ms: session.1,
+                speaker_id: None,
+                speaker_label: "Unknown speaker".into(),
+                text: transcript,
+            });
+        }
+        if segments.is_empty() {
+            return Err("This conversation has no transcript to recap".into());
+        }
+        let agenda = self.load_agenda_with_connection(conn, session_id)?;
+        let agenda_fingerprint = agenda.as_ref().map(|agenda| AgendaFingerprint {
+            source_kind: &agenda.source_kind,
+            filename: &agenda.filename,
+            mime_type: &agenda.mime_type,
+            content: &agenda.content,
+        });
+        let source_fingerprint = recap::source_fingerprint(&segments, agenda_fingerprint)?;
+        Ok(RecapSourceSnapshot {
+            meeting_created_at,
+            segments,
+            agenda,
+            source_fingerprint,
+        })
+    }
+
+    pub fn recap_source_snapshot(&self, session_id: &str) -> Result<RecapSourceSnapshot, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        self.recap_source_snapshot_with_connection(&conn, session_id)
     }
 
     pub fn delete_agenda(&self, session_id: &str) -> Result<bool, String> {
@@ -3020,14 +3583,14 @@ impl Db {
         Ok(())
     }
 
-    pub fn save_recap_and_title(&self, recap: RecapSave<'_>) -> Result<RecapRecord, String> {
-        let generated_at: DateTime<Utc> = SystemTime::now().into();
-        let payload_bytes = serde_json::to_vec(recap.payload)
-            .map_err(|error| format!("Could not serialize the recap: {error}"))?;
-        let (nonce, ct) = self.crypto.encrypt(&payload_bytes);
-        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
-        let tx = conn.transaction().map_err(|error| error.to_string())?;
-        let changed = tx
+    fn write_recap_and_title(
+        conn: &Connection,
+        recap: &RecapSave<'_>,
+        generated_at: DateTime<Utc>,
+        nonce: &str,
+        ciphertext: &str,
+    ) -> Result<RecapRecord, String> {
+        let changed = conn
             .execute(
                 "UPDATE sessions SET title=?1 WHERE id=?2",
                 params![recap.title.trim(), recap.session_id],
@@ -3036,7 +3599,7 @@ impl Db {
         if changed == 0 {
             return Err("Conversation not found".into());
         }
-        tx.execute(
+        conn.execute(
             "INSERT INTO session_recaps(
                 session_id, generated_at, model, prompt_version, schema_version,
                 source_fingerprint, payload_nonce, payload_ct, input_tokens, output_tokens
@@ -3059,13 +3622,12 @@ impl Db {
                 recap.schema_version,
                 recap.source_fingerprint,
                 nonce,
-                ct,
+                ciphertext,
                 recap.input_tokens.min(i64::MAX as u64) as i64,
                 recap.output_tokens.min(i64::MAX as u64) as i64,
             ],
         )
         .map_err(|error| error.to_string())?;
-        tx.commit().map_err(|error| error.to_string())?;
         Ok(RecapRecord {
             session_id: recap.session_id.to_string(),
             generated_at,
@@ -3079,15 +3641,564 @@ impl Db {
         })
     }
 
-    pub fn update_segment_text(&self, segment_id: &str, text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    pub fn save_recap_and_title(&self, recap: RecapSave<'_>) -> Result<RecapRecord, String> {
+        let generated_at: DateTime<Utc> = SystemTime::now().into();
+        let payload_bytes = serde_json::to_vec(recap.payload)
+            .map_err(|error| format!("Could not serialize the recap: {error}"))?;
+        let (nonce, ct) = self.crypto.encrypt(&payload_bytes);
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let saved = Self::write_recap_and_title(&tx, &recap, generated_at, &nonce, &ct)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(saved)
+    }
+
+    pub fn save_recap_and_title_if_source_matches(
+        &self,
+        recap: RecapSave<'_>,
+    ) -> Result<RecapRecord, String> {
+        let generated_at: DateTime<Utc> = SystemTime::now().into();
+        let payload_bytes = serde_json::to_vec(recap.payload)
+            .map_err(|error| format!("Could not serialize the recap: {error}"))?;
+        let (nonce, ciphertext) = self.crypto.encrypt(&payload_bytes);
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let current = self.recap_source_snapshot_with_connection(&tx, recap.session_id)?;
+        if current.source_fingerprint != recap.source_fingerprint {
+            return Err(
+                "The transcript, speakers, or agenda changed while the LLM provider was working. Nothing was replaced; run Recap again."
+                    .into(),
+            );
+        }
+        let saved = Self::write_recap_and_title(&tx, &recap, generated_at, &nonce, &ciphertext)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(saved)
+    }
+
+    pub fn list_recap_types(&self) -> Result<Vec<RecapType>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, name, prompt_nonce, prompt_ct, created_at, updated_at
+                   FROM recap_types",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut recap_types = Vec::new();
+        for row in rows {
+            let (id, kind, name, nonce, ciphertext, created_at, updated_at) =
+                row.map_err(|error| error.to_string())?;
+            let prompt = String::from_utf8(self.crypto.decrypt(&nonce, &ciphertext)?)
+                .map_err(|_| "A saved recap type prompt is not valid UTF-8".to_string())?;
+            recap_types.push(RecapType {
+                id,
+                kind,
+                name,
+                prompt,
+                created_at: DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|error| error.to_string())?
+                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                    .map_err(|error| error.to_string())?
+                    .with_timezone(&Utc),
+            });
+        }
+        recap_types.sort_by(|left, right| {
+            let builtin_position = |value: &RecapType| {
+                BUILTIN_RECAP_TYPES
+                    .iter()
+                    .position(|(id, _, _)| *id == value.id)
+            };
+            match (builtin_position(left), builtin_position(right)) {
+                (Some(left), Some(right)) => left.cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => left
+                    .name
+                    .to_lowercase()
+                    .cmp(&right.name.to_lowercase())
+                    .then_with(|| left.name.cmp(&right.name))
+                    .then_with(|| left.id.cmp(&right.id)),
+            }
+        });
+        Ok(recap_types)
+    }
+
+    pub fn load_recap_type(&self, recap_type_id: &str) -> Result<Option<RecapType>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let row = conn
+            .query_row(
+                "SELECT kind, name, prompt_nonce, prompt_ct, created_at, updated_at
+                   FROM recap_types
+                  WHERE id=?1",
+                params![recap_type_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((kind, name, nonce, ciphertext, created_at, updated_at)) = row else {
+            return Ok(None);
+        };
+        let prompt = String::from_utf8(self.crypto.decrypt(&nonce, &ciphertext)?)
+            .map_err(|_| "The saved recap type prompt is not valid UTF-8".to_string())?;
+        Ok(Some(RecapType {
+            id: recap_type_id.to_string(),
+            kind,
+            name,
+            prompt,
+            created_at: DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|error| error.to_string())?
+                .with_timezone(&Utc),
+            updated_at: DateTime::parse_from_rfc3339(&updated_at)
+                .map_err(|error| error.to_string())?
+                .with_timezone(&Utc),
+        }))
+    }
+
+    pub fn create_recap_type(&self, name: &str, prompt: &str) -> Result<RecapType, String> {
+        let name = normalized_recap_type_name(name)?;
+        let prompt = normalized_recap_type_prompt(prompt)?;
+        let id = Uuid::new_v4().to_string();
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let (nonce, ciphertext) = self.crypto.encrypt(prompt.as_bytes());
+        self.conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "INSERT INTO recap_types(
+                    id, kind, name, prompt_nonce, prompt_ct, created_at, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    id,
+                    RECAP_TYPE_KIND_CUSTOM,
+                    name,
+                    nonce,
+                    ciphertext,
+                    now.to_rfc3339()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(RecapType {
+            id,
+            kind: RECAP_TYPE_KIND_CUSTOM.into(),
+            name,
+            prompt,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn update_recap_type(
+        &self,
+        recap_type_id: &str,
+        name: &str,
+        prompt: &str,
+    ) -> Result<RecapType, String> {
+        let prompt = normalized_recap_type_prompt(prompt)?;
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let existing = tx
+            .query_row(
+                "SELECT kind, created_at FROM recap_types WHERE id=?1",
+                params![recap_type_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Recap type not found".to_string())?;
+        let (kind, created_at) = existing;
+        let name = if kind == RECAP_TYPE_KIND_BUILTIN {
+            let (fixed_name, _) = builtin_recap_type(recap_type_id)
+                .ok_or_else(|| "That built-in recap type cannot be edited".to_string())?;
+            if normalized_recap_type_name(name)? != fixed_name {
+                return Err("Built-in recap type names cannot be changed".into());
+            }
+            fixed_name.to_string()
+        } else if kind == RECAP_TYPE_KIND_CUSTOM {
+            normalized_recap_type_name(name)?
+        } else {
+            return Err("The saved recap type has an unsupported kind".into());
+        };
+        let (nonce, ciphertext) = self.crypto.encrypt(prompt.as_bytes());
+        let updated_at: DateTime<Utc> = SystemTime::now().into();
+        tx.execute(
+            "UPDATE recap_types
+                SET name=?1, prompt_nonce=?2, prompt_ct=?3, updated_at=?4
+              WHERE id=?5",
+            params![
+                name,
+                nonce,
+                ciphertext,
+                updated_at.to_rfc3339(),
+                recap_type_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(RecapType {
+            id: recap_type_id.to_string(),
+            kind,
+            name,
+            prompt,
+            created_at: DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|error| error.to_string())?
+                .with_timezone(&Utc),
+            updated_at,
+        })
+    }
+
+    pub fn delete_recap_type(&self, recap_type_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let kind = conn
+            .query_row(
+                "SELECT kind FROM recap_types WHERE id=?1",
+                params![recap_type_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Recap type not found".to_string())?;
+        if kind == RECAP_TYPE_KIND_BUILTIN {
+            return Err("Built-in recap types cannot be deleted".into());
+        }
+        if kind != RECAP_TYPE_KIND_CUSTOM {
+            return Err("The saved recap type has an unsupported kind".into());
+        }
+        conn.execute(
+            "DELETE FROM recap_types WHERE id=?1 AND kind=?2",
+            params![recap_type_id, RECAP_TYPE_KIND_CUSTOM],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    pub fn restore_recap_type_default(&self, recap_type_id: &str) -> Result<RecapType, String> {
+        let (name, prompt) = builtin_recap_type(recap_type_id)
+            .ok_or_else(|| "Only built-in recap types have a shipped default".to_string())?;
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let existing = tx
+            .query_row(
+                "SELECT kind, created_at FROM recap_types WHERE id=?1",
+                params![recap_type_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Built-in recap type not found".to_string())?;
+        if existing.0 != RECAP_TYPE_KIND_BUILTIN {
+            return Err("Only built-in recap types can be restored".into());
+        }
+        let (nonce, ciphertext) = self.crypto.encrypt(prompt.as_bytes());
+        let updated_at: DateTime<Utc> = SystemTime::now().into();
+        tx.execute(
+            "UPDATE recap_types
+                SET name=?1, prompt_nonce=?2, prompt_ct=?3, updated_at=?4
+              WHERE id=?5",
+            params![
+                name,
+                nonce,
+                ciphertext,
+                updated_at.to_rfc3339(),
+                recap_type_id
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(RecapType {
+            id: recap_type_id.to_string(),
+            kind: RECAP_TYPE_KIND_BUILTIN.into(),
+            name: name.into(),
+            prompt: prompt.into(),
+            created_at: DateTime::parse_from_rfc3339(&existing.1)
+                .map_err(|error| error.to_string())?
+                .with_timezone(&Utc),
+            updated_at,
+        })
+    }
+
+    pub fn load_custom_recaps(&self, session_id: &str) -> Result<Vec<CustomRecapRecord>, String> {
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT recap_type_id, name_snapshot,
+                        prompt_snapshot_nonce, prompt_snapshot_ct,
+                        content_markdown_nonce, content_markdown_ct,
+                        target_language, model, source_fingerprint,
+                        input_tokens, output_tokens, generated_at
+                   FROM session_custom_recaps
+                  WHERE session_id=?1",
+            )
+            .map_err(|error| error.to_string())?;
+        let rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut recaps = Vec::new();
+        for row in rows {
+            let (
+                recap_type_id,
+                name_snapshot,
+                prompt_nonce,
+                prompt_ciphertext,
+                content_nonce,
+                content_ciphertext,
+                target_language,
+                model,
+                source_fingerprint,
+                input_tokens,
+                output_tokens,
+                generated_at,
+            ) = row.map_err(|error| error.to_string())?;
+            let prompt_snapshot =
+                String::from_utf8(self.crypto.decrypt(&prompt_nonce, &prompt_ciphertext)?)
+                    .map_err(|_| "A saved custom recap prompt is not valid UTF-8".to_string())?;
+            let content_markdown =
+                String::from_utf8(self.crypto.decrypt(&content_nonce, &content_ciphertext)?)
+                    .map_err(|_| "Saved custom recap Markdown is not valid UTF-8".to_string())?;
+            recaps.push(CustomRecapRecord {
+                session_id: session_id.to_string(),
+                recap_type_id,
+                name_snapshot,
+                prompt_snapshot,
+                content_markdown,
+                target_language,
+                model,
+                source_fingerprint,
+                input_tokens: input_tokens.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                generated_at: DateTime::parse_from_rfc3339(&generated_at)
+                    .map_err(|error| error.to_string())?
+                    .with_timezone(&Utc),
+            });
+        }
+        recaps.sort_by(|left, right| {
+            left.name_snapshot
+                .to_lowercase()
+                .cmp(&right.name_snapshot.to_lowercase())
+                .then_with(|| left.name_snapshot.cmp(&right.name_snapshot))
+                .then_with(|| left.recap_type_id.cmp(&right.recap_type_id))
+        });
+        Ok(recaps)
+    }
+
+    pub fn load_custom_recap(
+        &self,
+        session_id: &str,
+        recap_type_id: &str,
+    ) -> Result<Option<CustomRecapRecord>, String> {
+        Ok(self
+            .load_custom_recaps(session_id)?
+            .into_iter()
+            .find(|recap| recap.recap_type_id == recap_type_id))
+    }
+
+    fn prepare_custom_recap(
+        &self,
+        recap: CustomRecapSave<'_>,
+    ) -> Result<PreparedCustomRecap, String> {
+        let recap_type_id = recap.recap_type_id.trim();
+        if recap_type_id.is_empty() {
+            return Err("Recap type ID cannot be empty".into());
+        }
+        let name_snapshot = normalized_recap_type_name(recap.name_snapshot)?;
+        let prompt_snapshot = normalized_recap_type_prompt(recap.prompt_snapshot)?;
+        if recap.content_markdown.trim().is_empty() {
+            return Err("Custom recap Markdown cannot be empty".into());
+        }
+        let target_language = recap.target_language.trim();
+        if target_language.is_empty() {
+            return Err("Custom recap target language cannot be empty".into());
+        }
+        let model = recap.model.trim();
+        if model.is_empty() {
+            return Err("Custom recap model cannot be empty".into());
+        }
+        let source_fingerprint = recap.source_fingerprint.trim();
+        if source_fingerprint.is_empty() {
+            return Err("Custom recap source fingerprint cannot be empty".into());
+        }
+        let (prompt_nonce, prompt_ciphertext) = self.crypto.encrypt(prompt_snapshot.as_bytes());
+        let (content_nonce, content_ciphertext) =
+            self.crypto.encrypt(recap.content_markdown.as_bytes());
+        let generated_at: DateTime<Utc> = SystemTime::now().into();
+        Ok(PreparedCustomRecap {
+            session_id: recap.session_id.to_string(),
+            recap_type_id: recap_type_id.to_string(),
+            name_snapshot,
+            prompt_snapshot,
+            prompt_nonce,
+            prompt_ciphertext,
+            content_markdown: recap.content_markdown.to_string(),
+            content_nonce,
+            content_ciphertext,
+            target_language: target_language.to_string(),
+            model: model.to_string(),
+            source_fingerprint: source_fingerprint.to_string(),
+            input_tokens: recap.input_tokens,
+            output_tokens: recap.output_tokens,
+            generated_at,
+        })
+    }
+
+    fn write_custom_recap(
+        conn: &Connection,
+        recap: &PreparedCustomRecap,
+    ) -> Result<CustomRecapRecord, String> {
+        let session_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)",
+                params![recap.session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !session_exists {
+            return Err("Conversation not found".into());
+        }
+        conn.execute(
+            "INSERT INTO session_custom_recaps(
+                session_id, recap_type_id, name_snapshot,
+                prompt_snapshot_nonce, prompt_snapshot_ct,
+                content_markdown_nonce, content_markdown_ct,
+                target_language, model, source_fingerprint,
+                input_tokens, output_tokens, generated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(session_id, recap_type_id) DO UPDATE SET
+                name_snapshot=excluded.name_snapshot,
+                prompt_snapshot_nonce=excluded.prompt_snapshot_nonce,
+                prompt_snapshot_ct=excluded.prompt_snapshot_ct,
+                content_markdown_nonce=excluded.content_markdown_nonce,
+                content_markdown_ct=excluded.content_markdown_ct,
+                target_language=excluded.target_language,
+                model=excluded.model,
+                source_fingerprint=excluded.source_fingerprint,
+                input_tokens=excluded.input_tokens,
+                output_tokens=excluded.output_tokens,
+                generated_at=excluded.generated_at",
+            params![
+                recap.session_id,
+                recap.recap_type_id,
+                recap.name_snapshot,
+                recap.prompt_nonce,
+                recap.prompt_ciphertext,
+                recap.content_nonce,
+                recap.content_ciphertext,
+                recap.target_language,
+                recap.model,
+                recap.source_fingerprint,
+                recap.input_tokens.min(i64::MAX as u64) as i64,
+                recap.output_tokens.min(i64::MAX as u64) as i64,
+                recap.generated_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(CustomRecapRecord {
+            session_id: recap.session_id.clone(),
+            recap_type_id: recap.recap_type_id.clone(),
+            name_snapshot: recap.name_snapshot.clone(),
+            prompt_snapshot: recap.prompt_snapshot.clone(),
+            content_markdown: recap.content_markdown.clone(),
+            target_language: recap.target_language.clone(),
+            model: recap.model.clone(),
+            source_fingerprint: recap.source_fingerprint.clone(),
+            input_tokens: recap.input_tokens,
+            output_tokens: recap.output_tokens,
+            generated_at: recap.generated_at,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn save_custom_recap(
+        &self,
+        recap: CustomRecapSave<'_>,
+    ) -> Result<CustomRecapRecord, String> {
+        let prepared = self.prepare_custom_recap(recap)?;
+        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        Self::write_custom_recap(&conn, &prepared)
+    }
+
+    pub fn save_custom_recap_if_source_matches(
+        &self,
+        recap: CustomRecapSave<'_>,
+    ) -> Result<CustomRecapRecord, String> {
+        self.save_custom_recap_if_source_matches_with_hook(recap, || {})
+    }
+
+    fn save_custom_recap_if_source_matches_with_hook<F>(
+        &self,
+        recap: CustomRecapSave<'_>,
+        after_validation: F,
+    ) -> Result<CustomRecapRecord, String>
+    where
+        F: FnOnce(),
+    {
+        let prepared = self.prepare_custom_recap(recap)?;
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
+        let current =
+            self.recap_source_snapshot_with_connection(&tx, prepared.session_id.as_str())?;
+        if current.source_fingerprint != prepared.source_fingerprint {
+            return Err(
+                "The transcript, speakers, or agenda changed while the LLM provider was working. Nothing was replaced; run the custom recap again."
+                    .into(),
+            );
+        }
+        after_validation();
+        let saved = Self::write_custom_recap(&tx, &prepared)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(saved)
+    }
+
+    pub fn update_segment_text(
+        &self,
+        session_id: &str,
+        segment_id: &str,
+        text: &str,
+    ) -> Result<(), String> {
         let (nonce, ct) = self.crypto.encrypt(text.trim().as_bytes());
         let changed = self
             .conn
             .lock()
             .map_err(|_| "lock poisoned".to_string())?
             .execute(
-                "UPDATE segments SET text_nonce=?1, text_ct=?2 WHERE id=?3",
-                params![nonce, ct, segment_id],
+                "UPDATE segments SET text_nonce=?1, text_ct=?2 WHERE id=?3 AND session_id=?4",
+                params![nonce, ct, segment_id, session_id],
             )
             .map_err(|e| e.to_string())?;
         if changed == 0 {
@@ -3098,31 +4209,118 @@ impl Db {
 
     pub fn assign_segment_speaker(
         &self,
+        session_id: &str,
         segment_id: &str,
         speaker_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
+        let tx = conn.transaction().map_err(|error| error.to_string())?;
         let label: Option<String> = match speaker_id {
-            Some(id) => conn
-                .query_row(
-                    "SELECT label FROM speakers WHERE id=?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|e| e.to_string())?
-                .flatten(),
+            Some(id) => {
+                let speaker = tx
+                    .query_row(
+                        "SELECT label FROM speakers WHERE id=?1",
+                        params![id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()
+                    .map_err(|e| e.to_string())?;
+                speaker.ok_or_else(|| "Person or voice not found".to_string())?
+            }
             None => None,
         };
-        let changed = conn
+        let voice_group_id = tx
+            .query_row(
+                "SELECT voice_group_id FROM segments WHERE id=?1 AND session_id=?2",
+                params![segment_id, session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "Transcript intervention not found".to_string())?;
+        let changed = tx
             .execute(
-                "UPDATE segments SET speaker_id=?1, speaker_label=?2 WHERE id=?3",
-                params![speaker_id, label, segment_id],
+                "UPDATE segments SET speaker_id=?1, speaker_label=?2 WHERE id=?3 AND session_id=?4",
+                params![speaker_id, label, segment_id, session_id],
             )
             .map_err(|e| e.to_string())?;
         if changed == 0 {
             return Err("Transcript intervention not found".into());
         }
+        if speaker_id.is_some() {
+            if let Some(voice_group_id) = voice_group_id.as_deref() {
+                Self::delete_voice_group_sample_if_fully_assigned_in_transaction(
+                    &tx,
+                    voice_group_id,
+                )?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn delete_voice_group_sample_if_fully_assigned_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        voice_group_id: &str,
+    ) -> Result<bool, String> {
+        let changed = tx
+            .execute(
+                "DELETE FROM voice_group_samples
+                  WHERE voice_group_id=?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM segments
+                         WHERE voice_group_id=?1 AND speaker_id IS NULL
+                    )",
+                params![voice_group_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(changed > 0)
+    }
+
+    fn finalize_fully_assigned_voice_groups_for_session_in_transaction(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        target_speaker_id: &str,
+    ) -> Result<(), String> {
+        tx.execute(
+            "UPDATE session_voice_groups
+                SET resulting_speaker_id=?1
+              WHERE session_id=?2
+                AND resulting_speaker_id IS NULL
+                AND EXISTS (
+                    SELECT 1 FROM segments sg
+                     WHERE sg.voice_group_id=session_voice_groups.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM segments sg
+                     WHERE sg.voice_group_id=session_voice_groups.id
+                       AND (
+                            sg.speaker_id IS NULL
+                            OR sg.speaker_id<>?1
+                       )
+                )",
+            params![target_speaker_id, session_id],
+        )
+        .map_err(|error| error.to_string())?;
+        tx.execute(
+            "DELETE FROM voice_group_samples
+              WHERE voice_group_id IN (
+                    SELECT g.id
+                      FROM session_voice_groups g
+                     WHERE g.session_id=?1
+                       AND EXISTS (
+                           SELECT 1 FROM segments sg
+                            WHERE sg.voice_group_id=g.id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM segments sg
+                            WHERE sg.voice_group_id=g.id
+                              AND sg.speaker_id IS NULL
+                       )
+              )",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -3240,6 +4438,20 @@ impl Db {
         if changed == 0 {
             return Err("This conversation has no unknown interventions".into());
         }
+        tx.execute(
+            "DELETE FROM voice_group_samples
+              WHERE voice_group_id IN (
+                    SELECT g.id
+                      FROM session_voice_groups g
+                     WHERE g.session_id=?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM segments sg
+                            WHERE sg.voice_group_id=g.id AND sg.speaker_id IS NULL
+                       )
+              )",
+            params![session_id],
+        )
+        .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok((id, label, changed))
     }
@@ -3665,6 +4877,7 @@ impl Db {
                 key: UnassignedIdentityKey {
                     session_id,
                     speaker_label,
+                    voice_group_id: None,
                 },
                 generic: is_generic_speaker_label(&display_label),
                 display_label,
@@ -3844,7 +5057,20 @@ impl Db {
     ) -> Result<Option<UnassignedIdentityRow>, String> {
         let row = conn
             .query_row(
-                "SELECT COALESCE(NULLIF(TRIM(sg.speaker_label), ''), 'Unknown speaker'),
+                "SELECT COALESCE(
+                            NULLIF(
+                                TRIM(
+                                    COALESCE(
+                                        (SELECT vg.provider_speaker_label
+                                           FROM session_voice_groups vg
+                                          WHERE vg.id=?3 AND vg.session_id=?1),
+                                        MIN(sg.speaker_label)
+                                    )
+                                ),
+                                ''
+                            ),
+                            'Unknown speaker'
+                        ),
                         COALESCE(se.title, ''),
                         se.created_at,
                         COUNT(1),
@@ -3855,11 +5081,27 @@ impl Db {
                   WHERE sg.session_id=?1
                     AND sg.speaker_id IS NULL
                     AND (
-                         (?2 IS NULL AND sg.speaker_label IS NULL)
-                         OR sg.speaker_label=?2
+                         (
+                            ?3 IS NOT NULL
+                            AND sg.voice_group_id=?3
+                            AND EXISTS(
+                                SELECT 1
+                                  FROM session_voice_groups vg
+                                 WHERE vg.id=?3
+                                   AND vg.session_id=?1
+                                   AND vg.resulting_speaker_id IS NULL
+                            )
+                         )
+                         OR (
+                            ?3 IS NULL
+                            AND (
+                                (?2 IS NULL AND sg.speaker_label IS NULL)
+                                OR sg.speaker_label=?2
+                            )
+                         )
                     )
-                  GROUP BY sg.session_id, sg.speaker_label",
-                params![key.session_id, key.speaker_label],
+                  GROUP BY sg.session_id",
+                params![key.session_id, key.speaker_label, key.voice_group_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -4060,14 +5302,16 @@ impl Db {
 
         let mut stale_recap_count = 0usize;
         for session_id in &affected_session_ids {
-            let exists: bool = conn
+            let count: i64 = conn
                 .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_recaps WHERE session_id=?1)",
+                    "SELECT
+                        CAST(EXISTS(SELECT 1 FROM session_recaps WHERE session_id=?1) AS INTEGER)
+                        + (SELECT COUNT(1) FROM session_custom_recaps WHERE session_id=?1)",
                     params![session_id],
                     |row| row.get(0),
                 )
                 .map_err(|error| error.to_string())?;
-            stale_recap_count += usize::from(exists);
+            stale_recap_count += count.max(0) as usize;
         }
         let active_voiceprint_count = source_profiles
             .iter()
@@ -4119,7 +5363,7 @@ impl Db {
                     .into(),
             );
         }
-        Ok(IdentityConsolidationPreview {
+        let mut preview = IdentityConsolidationPreview {
             target_speaker_id: target_speaker_id.map(str::to_string),
             target_label: final_label,
             source_profiles,
@@ -4134,7 +5378,43 @@ impl Db {
             creates_new_person: target_speaker_id.is_none(),
             affected_session_ids,
             warnings,
-        })
+            impact_revision: String::new(),
+        };
+        preview.impact_revision = Self::identity_consolidation_impact_revision(request, &preview)?;
+        Ok(preview)
+    }
+
+    fn identity_consolidation_impact_revision(
+        request: &IdentityConsolidationRequest,
+        preview: &IdentityConsolidationPreview,
+    ) -> Result<String, String> {
+        let mut profile_ids = request
+            .profile_ids
+            .iter()
+            .map(|value| value.trim().to_string())
+            .collect::<Vec<_>>();
+        profile_ids.sort();
+        let mut unassigned_groups = request.unassigned_groups.clone();
+        unassigned_groups.sort_by(|left, right| {
+            left.session_id
+                .cmp(&right.session_id)
+                .then_with(|| left.speaker_label.cmp(&right.speaker_label))
+                .then_with(|| left.voice_group_id.cmp(&right.voice_group_id))
+        });
+        let canonical_request = (
+            profile_ids,
+            unassigned_groups,
+            request
+                .target_speaker_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            display_person_name(&request.final_label),
+        );
+        let encoded = serde_json::to_vec(&(canonical_request, preview))
+            .map_err(|error| format!("Could not protect the identity impact preview: {error}"))?;
+        let digest = Sha256::digest(encoded);
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
     }
 
     pub fn preview_identity_consolidation(
@@ -4229,11 +5509,14 @@ impl Db {
         &self,
         request: &IdentityConsolidationRequest,
         expected_affected_session_ids: &[String],
+        expected_impact_revision: &str,
     ) -> Result<IdentityConsolidationResult, String> {
         let initial_preview = self.preview_identity_consolidation(request)?;
-        if initial_preview.affected_session_ids != expected_affected_session_ids {
+        if initial_preview.affected_session_ids != expected_affected_session_ids
+            || initial_preview.impact_revision != expected_impact_revision
+        {
             return Err(
-                "The affected conversations changed after the impact preview. Review the operation again."
+                "The people, voices, recaps, or affected conversations changed after the impact preview. Review the operation again."
                     .into(),
             );
         }
@@ -4241,9 +5524,11 @@ impl Db {
         let mut conn = self.conn.lock().map_err(|_| "lock poisoned".to_string())?;
         let tx = conn.transaction().map_err(|error| error.to_string())?;
         let preview = Self::identity_consolidation_preview_with_connection(&tx, request)?;
-        if preview.affected_session_ids != expected_affected_session_ids {
+        if preview.affected_session_ids != expected_affected_session_ids
+            || preview.impact_revision != expected_impact_revision
+        {
             return Err(
-                "The affected conversations changed after the impact preview. Review the operation again."
+                "The people, voices, recaps, or affected conversations changed after the impact preview. Review the operation again."
                     .into(),
             );
         }
@@ -4441,14 +5726,24 @@ impl Db {
                       WHERE session_id=?3
                         AND speaker_id IS NULL
                         AND (
-                             (?4 IS NULL AND speaker_label IS NULL)
-                             OR speaker_label=?4
+                             (
+                                ?5 IS NOT NULL
+                                AND voice_group_id=?5
+                             )
+                             OR (
+                                ?5 IS NULL
+                                AND (
+                                    (?4 IS NULL AND speaker_label IS NULL)
+                                    OR speaker_label=?4
+                                )
+                             )
                         )",
                     params![
                         target_speaker_id,
                         preview.target_label,
                         group.session_id,
-                        group.speaker_label
+                        group.speaker_label,
+                        group.voice_group_id
                     ],
                 )
                 .map_err(|error| error.to_string())?;
@@ -4458,6 +5753,36 @@ impl Db {
                     group.speaker_label.as_deref().unwrap_or("Unknown speaker"),
                     group.session_id
                 ));
+            }
+            if let Some(voice_group_id) = group.voice_group_id.as_deref() {
+                tx.execute(
+                    "UPDATE session_voice_groups
+                        SET resulting_speaker_id=?1
+                      WHERE id=?2
+                        AND session_id=?3
+                        AND resulting_speaker_id IS NULL
+                        AND NOT EXISTS(
+                            SELECT 1
+                              FROM segments sg
+                             WHERE sg.voice_group_id=?2
+                               AND (
+                                    sg.speaker_id IS NULL
+                                    OR sg.speaker_id<>?1
+                               )
+                        )",
+                    params![target_speaker_id, voice_group_id, group.session_id],
+                )
+                .map_err(|error| error.to_string())?;
+                Self::delete_voice_group_sample_if_fully_assigned_in_transaction(
+                    &tx,
+                    voice_group_id,
+                )?;
+            } else {
+                Self::finalize_fully_assigned_voice_groups_for_session_in_transaction(
+                    &tx,
+                    &group.session_id,
+                    &target_speaker_id,
+                )?;
             }
         }
         tx.execute(
@@ -4553,6 +5878,106 @@ impl Db {
         Ok(id)
     }
 
+    pub fn upsert_voice_group_sample(
+        &self,
+        voice_group_id: &str,
+        sample_b64: &str,
+        sample_rate: u32,
+    ) -> Result<(), String> {
+        if sample_b64.trim().is_empty() {
+            return Err("Meeting-local voice preview cannot be empty".into());
+        }
+        if sample_rate == 0 {
+            return Err("Meeting-local voice preview sample rate must be greater than zero".into());
+        }
+        let now: DateTime<Utc> = SystemTime::now().into();
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "INSERT INTO voice_group_samples(
+                    voice_group_id, sample_b64, sample_rate, created_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4
+                  WHERE EXISTS (
+                        SELECT 1
+                          FROM session_voice_groups g
+                         WHERE g.id=?1
+                           AND g.resulting_speaker_id IS NULL
+                           AND EXISTS (
+                               SELECT 1 FROM segments sg
+                                WHERE sg.voice_group_id=g.id AND sg.speaker_id IS NULL
+                           )
+                  )
+                 ON CONFLICT(voice_group_id) DO UPDATE SET
+                    sample_b64=excluded.sample_b64,
+                    sample_rate=excluded.sample_rate,
+                    created_at=excluded.created_at",
+                params![
+                    voice_group_id,
+                    sample_b64,
+                    i64::from(sample_rate),
+                    now.to_rfc3339()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        if changed == 0 {
+            return Err("Meeting voice group not found or is already fully assigned".into());
+        }
+        Ok(())
+    }
+
+    pub fn get_voice_group_sample(
+        &self,
+        voice_group_id: &str,
+    ) -> Result<Option<VoiceGroupSample>, String> {
+        let stored = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .query_row(
+                "SELECT sample_b64, sample_rate, created_at
+                   FROM voice_group_samples WHERE voice_group_id=?1",
+                params![voice_group_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some((sample_b64, sample_rate, created_at)) = stored else {
+            return Ok(None);
+        };
+        let created_at = DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|error| error.to_string())?
+            .with_timezone(&Utc);
+        Ok(Some(VoiceGroupSample {
+            voice_group_id: voice_group_id.to_string(),
+            sample_b64,
+            sample_rate: sample_rate.clamp(0, i64::from(u32::MAX)) as u32,
+            created_at,
+        }))
+    }
+
+    #[cfg(test)]
+    pub fn delete_voice_group_sample(&self, voice_group_id: &str) -> Result<bool, String> {
+        let changed = self
+            .conn
+            .lock()
+            .map_err(|_| "lock poisoned".to_string())?
+            .execute(
+                "DELETE FROM voice_group_samples WHERE voice_group_id=?1",
+                params![voice_group_id],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(changed > 0)
+    }
+
     pub fn insert_voice_observation(
         &self,
         observation: &VoiceObservationSave<'_>,
@@ -4627,7 +6052,11 @@ impl Db {
                         g.split_clusters_json,
                         (SELECT COUNT(*) FROM segments sg WHERE sg.voice_group_id=g.id),
                         (SELECT COUNT(DISTINCT vo.segment_id)
-                           FROM voice_observations vo WHERE vo.voice_group_id=g.id)
+                           FROM voice_observations vo WHERE vo.voice_group_id=g.id),
+                        EXISTS(
+                            SELECT 1 FROM voice_group_samples sample
+                             WHERE sample.voice_group_id=g.id
+                        )
                    FROM session_voice_groups g
                    LEFT JOIN speakers s ON s.id=g.resulting_speaker_id
                   WHERE g.session_id=?1
@@ -4652,6 +6081,7 @@ impl Db {
                     row.get::<_, String>(12)?,
                     row.get::<_, i64>(13)?,
                     row.get::<_, i64>(14)?,
+                    row.get::<_, bool>(15)?,
                 ))
             })
             .map_err(|error| error.to_string())?;
@@ -4673,6 +6103,7 @@ impl Db {
                 split_clusters_json,
                 intervention_count,
                 voice_observation_count,
+                has_preview_sample,
             ) = row.map_err(|error| error.to_string())?;
             groups.push(SessionVoiceGroup {
                 id,
@@ -4690,6 +6121,7 @@ impl Db {
                 split_clusters: serde_json::from_str(&split_clusters_json).unwrap_or_default(),
                 intervention_count: intervention_count.max(0) as usize,
                 voice_observation_count: voice_observation_count.max(0) as usize,
+                has_preview_sample,
             });
         }
         Ok(groups)
@@ -5029,7 +6461,16 @@ impl Db {
                 .map_err(|error| error.to_string())?;
             }
         }
-        Self::rebuild_session_transcripts_in_transaction(&tx, &self.crypto, &[session_id.clone()])?;
+        tx.execute(
+            "DELETE FROM voice_group_samples WHERE voice_group_id=?1",
+            params![voice_group_id],
+        )
+        .map_err(|error| error.to_string())?;
+        Self::rebuild_session_transcripts_in_transaction(
+            &tx,
+            &self.crypto,
+            std::slice::from_ref(&session_id),
+        )?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(VoiceGroupSplitResult {
             session_id,
@@ -5084,7 +6525,10 @@ impl Db {
         };
         Ok(VoiceRecognitionResetPreview {
             voiceprints: count("SELECT COUNT(*) FROM embeddings")?,
-            temporary_samples: count("SELECT COUNT(*) FROM speaker_samples")?,
+            temporary_samples: count(
+                "SELECT (SELECT COUNT(*) FROM speaker_samples)
+                      + (SELECT COUNT(*) FROM voice_group_samples)",
+            )?,
             match_decisions: count("SELECT COUNT(*) FROM voice_match_decisions")?,
             meeting_voice_groups: count("SELECT COUNT(*) FROM session_voice_groups")?,
             voice_observations: count("SELECT COUNT(*) FROM voice_observations")?,
@@ -5137,6 +6581,7 @@ impl Db {
             .map_err(|error| error.to_string())?;
         for table in [
             "voice_observations",
+            "voice_group_samples",
             "session_voice_groups",
             "voice_match_decisions",
             "speaker_samples",
@@ -6262,6 +7707,304 @@ mod tests {
     }
 
     #[test]
+    fn meeting_local_voice_group_sample_round_trips_without_exposing_audio_in_group_views() {
+        let db = memory_db();
+        let session = db
+            .insert_session("Meeting-local preview", "", 2_000)
+            .unwrap();
+        let group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        db.insert_segment_with_provenance(
+            &session,
+            0,
+            2_000,
+            None,
+            Some("speaker_2"),
+            Some("speaker_2"),
+            Some(&group),
+            "Meeting-local turn",
+        )
+        .unwrap();
+
+        let before = db.list_session_voice_groups(&session).unwrap().remove(0);
+        assert!(!before.has_preview_sample);
+        assert!(db.get_voice_group_sample(&group).unwrap().is_none());
+
+        db.upsert_voice_group_sample(&group, "UklGRlBST01QVF9PTkU=", 48_000)
+            .unwrap();
+        let stored = db.get_voice_group_sample(&group).unwrap().unwrap();
+        assert_eq!(stored.voice_group_id, group);
+        assert_eq!(stored.sample_b64, "UklGRlBST01QVF9PTkU=");
+        assert_eq!(stored.sample_rate, 48_000);
+        let view = db.list_session_voice_groups(&session).unwrap().remove(0);
+        assert!(view.has_preview_sample);
+        let serialized_view = serde_json::to_string(&view).unwrap();
+        assert!(!serialized_view.contains("UklGRlBST01QVF9PTkU="));
+
+        db.upsert_voice_group_sample(&group, "UklGRlBST01QVF9UV08=", 16_000)
+            .unwrap();
+        let replaced = db.get_voice_group_sample(&group).unwrap().unwrap();
+        assert_eq!(replaced.sample_b64, "UklGRlBST01QVF9UV08=");
+        assert_eq!(replaced.sample_rate, 16_000);
+        assert!(db.delete_voice_group_sample(&group).unwrap());
+        assert!(!db.delete_voice_group_sample(&group).unwrap());
+        assert!(db.get_voice_group_sample(&group).unwrap().is_none());
+        assert!(!db.list_session_voice_groups(&session).unwrap()[0].has_preview_sample);
+    }
+
+    #[test]
+    fn meeting_local_voice_group_sample_is_removed_after_assignment_and_session_cleanup() {
+        let db = memory_db();
+        let session = db.insert_session("Assignment cleanup", "", 2_000).unwrap();
+        let group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_3",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        let first = db
+            .insert_segment_with_provenance(
+                &session,
+                0,
+                1_000,
+                None,
+                Some("speaker_3"),
+                Some("speaker_3"),
+                Some(&group),
+                "First turn",
+            )
+            .unwrap();
+        let second = db
+            .insert_segment_with_provenance(
+                &session,
+                1_000,
+                2_000,
+                None,
+                Some("speaker_3"),
+                Some("speaker_3"),
+                Some(&group),
+                "Second turn",
+            )
+            .unwrap();
+        db.upsert_voice_group_sample(&group, "UklGRkFTU0lHTg==", 48_000)
+            .unwrap();
+        let speaker = db.insert_speaker(Some("Alice")).unwrap();
+
+        db.assign_segment_speaker(&session, &first, Some(&speaker))
+            .unwrap();
+        assert!(db.get_voice_group_sample(&group).unwrap().is_some());
+        db.assign_segment_speaker(&session, &second, Some(&speaker))
+            .unwrap();
+        assert!(db.get_voice_group_sample(&group).unwrap().is_none());
+        assert!(!db.list_session_voice_groups(&session).unwrap()[0].has_preview_sample);
+        assert!(db
+            .upsert_voice_group_sample(&group, "UklGRkFTU0lHTg==", 48_000)
+            .unwrap_err()
+            .contains("fully assigned"));
+
+        let processing_session = db.insert_session("Processing cleanup", "", 1_000).unwrap();
+        let processing_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &processing_session,
+                provider_speaker_label: "speaker_4",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        db.insert_segment_with_provenance(
+            &processing_session,
+            0,
+            1_000,
+            None,
+            Some("speaker_4"),
+            Some("speaker_4"),
+            Some(&processing_group),
+            "Retry this turn",
+        )
+        .unwrap();
+        db.upsert_voice_group_sample(&processing_group, "UklGRlJFVFJZ", 48_000)
+            .unwrap();
+        {
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            Db::clear_processing_artifacts_in_transaction(&tx, &processing_session).unwrap();
+            tx.commit().unwrap();
+        }
+        assert!(db
+            .get_voice_group_sample(&processing_group)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .list_session_voice_groups(&processing_session)
+            .unwrap()
+            .is_empty());
+
+        let deleted_session = db.insert_session("Delete cleanup", "", 1_000).unwrap();
+        let deleted_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &deleted_session,
+                provider_speaker_label: "speaker_5",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        db.insert_segment_with_provenance(
+            &deleted_session,
+            0,
+            1_000,
+            None,
+            Some("speaker_5"),
+            Some("speaker_5"),
+            Some(&deleted_group),
+            "Delete this turn",
+        )
+        .unwrap();
+        db.upsert_voice_group_sample(&deleted_group, "UklGRkRFTEVURQ==", 48_000)
+            .unwrap();
+        db.delete_session(&deleted_session).unwrap();
+        assert!(db.get_voice_group_sample(&deleted_group).unwrap().is_none());
+    }
+
+    #[test]
+    fn voice_group_sample_migration_replaces_invalid_fixed_backup_and_persists_data() {
+        let root = std::env::temp_dir().join(format!(
+            "recall-voice-group-sample-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("recall.db");
+        let backup = Db::voice_group_samples_migration_backup_path(&path);
+        let session;
+        let group;
+        {
+            let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+            session = db.insert_session("Before previews", "", 1_000).unwrap();
+            group = db
+                .insert_session_voice_group(&SessionVoiceGroupSave {
+                    session_id: &session,
+                    provider_speaker_label: "speaker_6",
+                    cluster_index: 0,
+                    resulting_speaker_id: None,
+                    status: "meeting_local_no_safe_speech",
+                    centroid: None,
+                    selected_duration_ms: 0,
+                    selected_window_count: 0,
+                    consistency_score: None,
+                    model_version: Some(crate::embedding::EMBEDDING_VERSION),
+                })
+                .unwrap();
+            db.insert_segment_with_provenance(
+                &session,
+                0,
+                1_000,
+                None,
+                Some("speaker_6"),
+                Some("speaker_6"),
+                Some(&group),
+                "Existing turn",
+            )
+            .unwrap();
+        }
+        Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE voice_group_samples", [])
+            .unwrap();
+
+        std::fs::File::create(&backup).unwrap();
+        let migrated = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let preserved_invalid = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("recall.pre-voice-group-samples-v1.replaced-")
+                            && name.ends_with(".db")
+                    })
+            })
+            .expect("the interrupted fixed-name backup should be preserved");
+        assert_eq!(std::fs::metadata(&preserved_invalid).unwrap().len(), 0);
+        assert_eq!(
+            backup.file_name().and_then(|value| value.to_str()),
+            Some("recall.pre-voice-group-samples-v1.db")
+        );
+        assert!(backup.is_file());
+        {
+            let backup_conn = Connection::open(&backup).unwrap();
+            let integrity: String = backup_conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            assert!(!Db::table_exists(&backup_conn, "voice_group_samples").unwrap());
+            let preserved_groups: i64 = backup_conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_voice_groups WHERE id=?1 AND session_id=?2",
+                    params![group, session],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(preserved_groups, 1);
+        }
+        assert!(Db::table_exists(&migrated.conn.lock().unwrap(), "voice_group_samples").unwrap());
+        migrated
+            .upsert_voice_group_sample(&group, "UklGRlBFUlNJU1Q=", 48_000)
+            .unwrap();
+        drop(migrated);
+
+        let reopened = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let persisted = reopened.get_voice_group_sample(&group).unwrap().unwrap();
+        assert_eq!(persisted.sample_b64, "UklGRlBFUlNJU1Q=");
+        assert_eq!(persisted.sample_rate, 48_000);
+        let backup_conn = Connection::open(&backup).unwrap();
+        assert!(!Db::table_exists(&backup_conn, "voice_group_samples").unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(backup_conn);
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn voice_labels_are_monotonic() {
         let db = memory_db();
         db.insert_speaker(Some("Alice")).unwrap();
@@ -6816,6 +8559,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let backup = Db::voice_match_migration_backup_path(&path);
+        let voice_group_samples_backup = Db::voice_group_samples_migration_backup_path(&path);
         let recap_backup = Db::recap_migration_backup_path(&path);
         let processing_backup = Db::processing_migration_backup_path(&path);
         {
@@ -6890,6 +8634,7 @@ mod tests {
         }
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(backup).unwrap();
+        std::fs::remove_file(voice_group_samples_backup).unwrap();
         std::fs::remove_file(recap_backup).unwrap();
         std::fs::remove_file(processing_backup).unwrap();
     }
@@ -7367,6 +9112,703 @@ mod tests {
     }
 
     #[test]
+    fn recap_types_migration_creates_verified_backup_and_preserves_standard_recaps() {
+        let root = std::env::temp_dir().join(format!(
+            "recall-recap-types-migration-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("recall.db");
+        let backup = Db::recap_types_migration_backup_path(&path);
+        let session_id;
+        {
+            let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+            session_id = db
+                .insert_session("Before recap types", "Alice: Existing transcript", 1_000)
+                .unwrap();
+            db.save_recap_and_title(RecapSave {
+                session_id: &session_id,
+                title: "Existing standard recap",
+                model: "test-model",
+                prompt_version: crate::recap::PROMPT_VERSION,
+                schema_version: crate::recap::SCHEMA_VERSION,
+                source_fingerprint: "existing-fingerprint",
+                payload: &test_recap_payload(),
+                input_tokens: 12,
+                output_tokens: 34,
+            })
+            .unwrap();
+        }
+        let raw_before = {
+            let conn = Connection::open(&path).unwrap();
+            let raw = conn
+                .query_row(
+                    "SELECT generated_at, model, prompt_version, schema_version,
+                            source_fingerprint, payload_nonce, payload_ct,
+                            input_tokens, output_tokens
+                       FROM session_recaps WHERE session_id=?1",
+                    params![session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, i64>(7)?,
+                            row.get::<_, i64>(8)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            conn.execute("DROP TABLE session_custom_recaps", [])
+                .unwrap();
+            conn.execute("DROP TABLE recap_types", []).unwrap();
+            raw
+        };
+
+        let migrated = Db::open(&path, Crypto::new(None, None)).unwrap();
+
+        assert_eq!(
+            backup.file_name().and_then(|value| value.to_str()),
+            Some("recall.pre-recap-types-v1.db")
+        );
+        assert!(backup.is_file());
+        let backup_conn = Connection::open(&backup).unwrap();
+        let integrity: String = backup_conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let raw_backup = backup_conn
+            .query_row(
+                "SELECT generated_at, model, prompt_version, schema_version,
+                        source_fingerprint, payload_nonce, payload_ct,
+                        input_tokens, output_tokens
+                   FROM session_recaps WHERE session_id=?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(raw_backup, raw_before);
+        assert!(!Db::table_exists(&backup_conn, "recap_types").unwrap());
+        let standard = migrated.load_recap(&session_id).unwrap().unwrap();
+        assert_eq!(standard.source_fingerprint, "existing-fingerprint");
+        assert_eq!(standard.payload, test_recap_payload());
+        let builtins = migrated.list_recap_types().unwrap();
+        assert_eq!(builtins.len(), 3);
+        assert_eq!(builtins[0].id, BUILTIN_EXECUTIVE_SUMMARY_ID);
+        assert_eq!(builtins[1].id, BUILTIN_FULL_SUMMARY_ID);
+        assert_eq!(builtins[2].id, BUILTIN_ACTIONS_ID);
+        migrated
+            .update_recap_type(
+                BUILTIN_EXECUTIVE_SUMMARY_ID,
+                "Executive summary",
+                "A locally edited executive-summary prompt",
+            )
+            .unwrap();
+        drop(backup_conn);
+        drop(migrated);
+
+        let reopened = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let reopened_types = reopened.list_recap_types().unwrap();
+        assert_eq!(reopened_types.len(), 3);
+        assert_eq!(
+            reopened_types[0].prompt,
+            "A locally edited executive-summary prompt"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recap_types_migration_replaces_same_count_stale_backup_and_preserves_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "recall-recap-types-stale-backup-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("recall.db");
+        let backup = Db::recap_types_migration_backup_path(&path);
+        let session_id;
+        {
+            let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+            session_id = db
+                .insert_session("Stale title", "Alice: Existing transcript", 1_000)
+                .unwrap();
+        }
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE session_custom_recaps;
+                 DROP TABLE recap_types;",
+            )
+            .unwrap();
+            conn.execute(
+                "VACUUM INTO ?1",
+                params![backup.to_string_lossy().to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET title='Current title' WHERE id=?1",
+                params![session_id],
+            )
+            .unwrap();
+        }
+
+        let migrated = Db::open(&path, Crypto::new(None, None)).unwrap();
+        assert_eq!(
+            migrated.get_session(&session_id).unwrap().unwrap().title,
+            "Current title"
+        );
+        let replacement = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("recall.pre-recap-types-v1.replaced-")
+                            && name.ends_with(".db")
+                    })
+            })
+            .expect("the stale fixed-name backup should be preserved");
+
+        let current_backup = Connection::open(&backup).unwrap();
+        let preserved_stale = Connection::open(&replacement).unwrap();
+        for database in [&current_backup, &preserved_stale] {
+            let integrity: String = database
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+            let session_count: i64 = database
+                .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(session_count, 1);
+            assert!(!Db::table_exists(database, "recap_types").unwrap());
+            assert!(!Db::table_exists(database, "session_custom_recaps").unwrap());
+        }
+        let current_title: String = current_backup
+            .query_row(
+                "SELECT title FROM sessions WHERE id=?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_title: String = preserved_stale
+            .query_row(
+                "SELECT title FROM sessions WHERE id=?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_title, "Current title");
+        assert_eq!(stale_title, "Stale title");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for artifact in [&backup, &replacement] {
+                assert_eq!(
+                    std::fs::metadata(artifact).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+
+        drop(preserved_stale);
+        drop(current_backup);
+        drop(migrated);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recap_type_crud_protects_builtins_and_allows_normalized_duplicate_custom_names() {
+        let db = memory_db();
+        let builtins = db.list_recap_types().unwrap();
+        assert_eq!(
+            builtins
+                .iter()
+                .map(|value| value.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Executive summary", "Full summary", "Actions"]
+        );
+        assert!(builtins
+            .iter()
+            .all(|value| value.kind == RECAP_TYPE_KIND_BUILTIN));
+
+        assert!(db
+            .update_recap_type(
+                BUILTIN_EXECUTIVE_SUMMARY_ID,
+                "Renamed built-in",
+                "Still a valid prompt"
+            )
+            .unwrap_err()
+            .contains("cannot be changed"));
+        assert!(db
+            .delete_recap_type(BUILTIN_EXECUTIVE_SUMMARY_ID)
+            .unwrap_err()
+            .contains("cannot be deleted"));
+        let edited = db
+            .update_recap_type(
+                BUILTIN_EXECUTIVE_SUMMARY_ID,
+                " Executive   summary ",
+                "  Use a locally edited prompt.  ",
+            )
+            .unwrap();
+        assert_eq!(edited.name, "Executive summary");
+        assert_eq!(edited.prompt, "Use a locally edited prompt.");
+        let restored = db
+            .restore_recap_type_default(BUILTIN_EXECUTIVE_SUMMARY_ID)
+            .unwrap();
+        assert_eq!(restored.prompt, DEFAULT_EXECUTIVE_SUMMARY_PROMPT);
+
+        let zeta = db
+            .create_recap_type("  Zeta\n  review  ", " Review zeta. ")
+            .unwrap();
+        assert_eq!(zeta.name, "Zeta review");
+        let duplicate_builtin = db
+            .create_recap_type("Executive summary", "A custom duplicate name")
+            .unwrap();
+        let duplicate_custom = db
+            .create_recap_type("Executive summary", "Another custom duplicate")
+            .unwrap();
+        assert_ne!(duplicate_builtin.id, duplicate_custom.id);
+        let alpha = db.create_recap_type("alpha", "Review alpha").unwrap();
+        let twenty_unicode = "🧪".repeat(20);
+        assert!(db
+            .create_recap_type(&twenty_unicode, "Review Unicode")
+            .is_ok());
+        assert!(db
+            .create_recap_type(&"🧪".repeat(21), "Review Unicode")
+            .unwrap_err()
+            .contains("20 characters"));
+        assert!(db.create_recap_type(" \n\t ", "Prompt").is_err());
+        assert!(db.create_recap_type("Valid", " \n ").is_err());
+
+        let custom_names = db
+            .list_recap_types()
+            .unwrap()
+            .into_iter()
+            .filter(|value| value.kind == RECAP_TYPE_KIND_CUSTOM)
+            .map(|value| value.name)
+            .collect::<Vec<_>>();
+        assert_eq!(custom_names[0], "alpha");
+        assert_eq!(
+            custom_names
+                .iter()
+                .filter(|name| name.as_str() == "Executive summary")
+                .count(),
+            2
+        );
+        assert!(custom_names.iter().any(|name| name == "Zeta review"));
+
+        let renamed = db
+            .update_recap_type(&alpha.id, "  Risk   review ", " Updated prompt ")
+            .unwrap();
+        assert_eq!(renamed.name, "Risk review");
+        assert_eq!(renamed.prompt, "Updated prompt");
+        assert!(db.restore_recap_type_default(&alpha.id).is_err());
+        db.delete_recap_type(&zeta.id).unwrap();
+        assert!(db.load_recap_type(&zeta.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn recap_type_prompts_and_custom_result_content_use_encrypted_storage() {
+        let db = Db::open(
+            ":memory:",
+            Crypto::new(Some("recap types test password"), None),
+        )
+        .unwrap();
+        let recap_type = db
+            .create_recap_type("Risk review", "Find private project risks")
+            .unwrap();
+        let session_id = db
+            .insert_session("Private meeting", "Alice: Private transcript", 1_000)
+            .unwrap();
+        db.save_custom_recap(CustomRecapSave {
+            session_id: &session_id,
+            recap_type_id: &recap_type.id,
+            name_snapshot: &recap_type.name,
+            prompt_snapshot: &recap_type.prompt,
+            content_markdown: "# Private risks\n\n- Secret dependency",
+            target_language: "en",
+            model: "test-model",
+            source_fingerprint: "source-fingerprint",
+            input_tokens: 10,
+            output_tokens: 20,
+        })
+        .unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let (type_nonce, type_ciphertext): (String, String) = conn
+            .query_row(
+                "SELECT prompt_nonce, prompt_ct FROM recap_types WHERE id=?1",
+                params![recap_type.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (prompt_nonce, prompt_ciphertext, content_nonce, content_ciphertext): (
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT prompt_snapshot_nonce, prompt_snapshot_ct,
+                        content_markdown_nonce, content_markdown_ct
+                   FROM session_custom_recaps
+                  WHERE session_id=?1 AND recap_type_id=?2",
+                params![session_id, recap_type.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(!type_nonce.is_empty());
+        assert!(!prompt_nonce.is_empty());
+        assert!(!content_nonce.is_empty());
+        assert_ne!(
+            general_purpose::STANDARD.decode(type_ciphertext).unwrap(),
+            b"Find private project risks"
+        );
+        assert_ne!(
+            general_purpose::STANDARD.decode(prompt_ciphertext).unwrap(),
+            b"Find private project risks"
+        );
+        assert_ne!(
+            general_purpose::STANDARD
+                .decode(content_ciphertext)
+                .unwrap(),
+            b"# Private risks\n\n- Secret dependency"
+        );
+        drop(conn);
+
+        let loaded_type = db.load_recap_type(&recap_type.id).unwrap().unwrap();
+        assert_eq!(loaded_type.prompt, "Find private project risks");
+        let loaded = db
+            .load_custom_recap(&session_id, &recap_type.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.prompt_snapshot, "Find private project risks");
+        assert_eq!(
+            loaded.content_markdown,
+            "# Private risks\n\n- Secret dependency"
+        );
+        assert!(!serde_json::to_string(&loaded)
+            .unwrap()
+            .contains("Find private project risks"));
+    }
+
+    #[test]
+    fn custom_recap_snapshots_survive_type_changes_and_failed_regeneration_until_session_delete() {
+        let db = memory_db();
+        let session_id = db
+            .insert_session("Original title", "Alice: Transcript", 1_000)
+            .unwrap();
+        let recap_type = db
+            .create_recap_type("Risk review", "Original prompt")
+            .unwrap();
+        db.save_custom_recap(CustomRecapSave {
+            session_id: &session_id,
+            recap_type_id: &recap_type.id,
+            name_snapshot: &recap_type.name,
+            prompt_snapshot: &recap_type.prompt,
+            content_markdown: "# Original result",
+            target_language: "en",
+            model: "test-model",
+            source_fingerprint: "fingerprint-one",
+            input_tokens: 1,
+            output_tokens: 2,
+        })
+        .unwrap();
+        db.update_recap_type(&recap_type.id, "Threat scan", "Changed prompt")
+            .unwrap();
+        let snapshot = db
+            .load_custom_recap(&session_id, &recap_type.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.name_snapshot, "Risk review");
+        assert_eq!(snapshot.prompt_snapshot, "Original prompt");
+        assert_eq!(snapshot.content_markdown, "# Original result");
+
+        db.delete_recap_type(&recap_type.id).unwrap();
+        assert!(db.load_recap_type(&recap_type.id).unwrap().is_none());
+        assert!(db
+            .save_custom_recap(CustomRecapSave {
+                session_id: &session_id,
+                recap_type_id: &recap_type.id,
+                name_snapshot: "Risk review",
+                prompt_snapshot: "Original prompt",
+                content_markdown: "  ",
+                target_language: "en",
+                model: "test-model",
+                source_fingerprint: "fingerprint-two",
+                input_tokens: 3,
+                output_tokens: 4,
+            })
+            .is_err());
+        let preserved = db
+            .load_custom_recap(&session_id, &recap_type.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.content_markdown, "# Original result");
+        assert_eq!(preserved.source_fingerprint, "fingerprint-one");
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().title,
+            "Original title"
+        );
+
+        let regenerated = db
+            .save_custom_recap(CustomRecapSave {
+                session_id: &session_id,
+                recap_type_id: &recap_type.id,
+                name_snapshot: "Risk review",
+                prompt_snapshot: "Original prompt",
+                content_markdown: "# Replacement result\n",
+                target_language: "de",
+                model: "replacement-model",
+                source_fingerprint: "fingerprint-two",
+                input_tokens: 30,
+                output_tokens: 40,
+            })
+            .unwrap();
+        assert_eq!(regenerated.content_markdown, "# Replacement result\n");
+        assert_eq!(db.load_custom_recaps(&session_id).unwrap().len(), 1);
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().title,
+            "Original title"
+        );
+
+        db.delete_session(&session_id).unwrap();
+        assert!(db.load_custom_recaps(&session_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_change_rejects_standard_recap_replacement_and_preserves_title() {
+        let db = memory_db();
+        let session_id = db
+            .insert_session("Original title", "Alice: Original transcript", 1_000)
+            .unwrap();
+        let original_source = db.recap_source_snapshot(&session_id).unwrap();
+        let original_payload = test_recap_payload();
+        db.save_recap_and_title(RecapSave {
+            session_id: &session_id,
+            title: "Previous recap title",
+            model: "test-model",
+            prompt_version: crate::recap::PROMPT_VERSION,
+            schema_version: crate::recap::SCHEMA_VERSION,
+            source_fingerprint: &original_source.source_fingerprint,
+            payload: &original_payload,
+            input_tokens: 1,
+            output_tokens: 2,
+        })
+        .unwrap();
+        db.update_session_transcript(&session_id, "Alice: Changed transcript")
+            .unwrap();
+
+        let replacement_payload = test_recap_payload();
+        let error = db
+            .save_recap_and_title_if_source_matches(RecapSave {
+                session_id: &session_id,
+                title: "Replacement title",
+                model: "replacement-model",
+                prompt_version: crate::recap::PROMPT_VERSION,
+                schema_version: crate::recap::SCHEMA_VERSION,
+                source_fingerprint: &original_source.source_fingerprint,
+                payload: &replacement_payload,
+                input_tokens: 3,
+                output_tokens: 4,
+            })
+            .unwrap_err();
+
+        assert!(error.contains("changed while the LLM provider was working"));
+        assert_eq!(
+            db.get_session(&session_id).unwrap().unwrap().title,
+            "Previous recap title"
+        );
+        let preserved = db.load_recap(&session_id).unwrap().unwrap();
+        assert_eq!(preserved.model, "test-model");
+        assert_eq!(
+            preserved.source_fingerprint,
+            original_source.source_fingerprint
+        );
+    }
+
+    #[test]
+    fn source_change_rejects_custom_recap_replacement() {
+        let db = memory_db();
+        let session_id = db
+            .insert_session("Original title", "Alice: Original transcript", 1_000)
+            .unwrap();
+        let recap_type = db
+            .create_recap_type("Risk review", "Find material risks")
+            .unwrap();
+        let original_source = db.recap_source_snapshot(&session_id).unwrap();
+        db.save_custom_recap(CustomRecapSave {
+            session_id: &session_id,
+            recap_type_id: &recap_type.id,
+            name_snapshot: &recap_type.name,
+            prompt_snapshot: &recap_type.prompt,
+            content_markdown: "# Previous result",
+            target_language: "en",
+            model: "test-model",
+            source_fingerprint: &original_source.source_fingerprint,
+            input_tokens: 1,
+            output_tokens: 2,
+        })
+        .unwrap();
+        db.update_session_transcript(&session_id, "Alice: Changed transcript")
+            .unwrap();
+
+        let error = db
+            .save_custom_recap_if_source_matches(CustomRecapSave {
+                session_id: &session_id,
+                recap_type_id: &recap_type.id,
+                name_snapshot: &recap_type.name,
+                prompt_snapshot: &recap_type.prompt,
+                content_markdown: "# Replacement result",
+                target_language: "en",
+                model: "replacement-model",
+                source_fingerprint: &original_source.source_fingerprint,
+                input_tokens: 3,
+                output_tokens: 4,
+            })
+            .unwrap_err();
+
+        assert!(error.contains("changed while the LLM provider was working"));
+        let preserved = db
+            .load_custom_recap(&session_id, &recap_type.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.content_markdown, "# Previous result");
+        assert_eq!(preserved.model, "test-model");
+    }
+
+    #[test]
+    fn custom_recap_validation_and_replacement_share_one_database_critical_section() {
+        use std::{
+            sync::{mpsc, Arc},
+            time::Duration,
+        };
+
+        let db = Arc::new(memory_db());
+        let session_id = db
+            .insert_session("Original title", "Alice: Original transcript", 1_000)
+            .unwrap();
+        let recap_type = db
+            .create_recap_type("Risk review", "Find material risks")
+            .unwrap();
+        let source_fingerprint = db
+            .recap_source_snapshot(&session_id)
+            .unwrap()
+            .source_fingerprint;
+        let (validated_tx, validated_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let save_db = Arc::clone(&db);
+        let save_session_id = session_id.clone();
+        let save_type = recap_type.clone();
+        let saver = std::thread::spawn(move || {
+            save_db.save_custom_recap_if_source_matches_with_hook(
+                CustomRecapSave {
+                    session_id: &save_session_id,
+                    recap_type_id: &save_type.id,
+                    name_snapshot: &save_type.name,
+                    prompt_snapshot: &save_type.prompt,
+                    content_markdown: "# Atomic result",
+                    target_language: "en",
+                    model: "test-model",
+                    source_fingerprint: &source_fingerprint,
+                    input_tokens: 1,
+                    output_tokens: 2,
+                },
+                || {
+                    validated_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        validated_rx.recv().unwrap();
+
+        let (update_started_tx, update_started_rx) = mpsc::channel();
+        let (updated_tx, updated_rx) = mpsc::channel();
+        let update_db = Arc::clone(&db);
+        let update_session_id = session_id.clone();
+        let updater = std::thread::spawn(move || {
+            update_started_tx.send(()).unwrap();
+            update_db
+                .update_session_transcript(&update_session_id, "Alice: Changed transcript")
+                .unwrap();
+            updated_tx.send(()).unwrap();
+        });
+        update_started_rx.recv().unwrap();
+        assert!(updated_rx.recv_timeout(Duration::from_millis(100)).is_err());
+
+        release_tx.send(()).unwrap();
+        let saved = saver.join().unwrap().unwrap();
+        updater.join().unwrap();
+        assert_eq!(saved.content_markdown, "# Atomic result");
+        assert_ne!(
+            saved.source_fingerprint,
+            db.recap_source_snapshot(&session_id)
+                .unwrap()
+                .source_fingerprint
+        );
+    }
+
+    #[test]
+    fn segment_mutations_require_the_segments_owning_conversation() {
+        let db = memory_db();
+        let first = db.insert_session("First", "", 1_000).unwrap();
+        let second = db.insert_session("Second", "", 1_000).unwrap();
+        let segment = db
+            .insert_segment(&first, 0, 1_000, None, Some("Unknown speaker"), "Original")
+            .unwrap();
+        let speaker = db.insert_speaker(Some("Alice")).unwrap();
+
+        assert!(db
+            .update_segment_text(&second, &segment, "Wrong conversation")
+            .is_err());
+        assert!(db
+            .assign_segment_speaker(&second, &segment, Some(&speaker))
+            .is_err());
+        assert!(db
+            .assign_segment_speaker(&first, &segment, Some("missing-speaker"))
+            .unwrap_err()
+            .contains("not found"));
+        let unchanged = db.list_segments(&first).unwrap().remove(0);
+        assert_eq!(unchanged.text, "Original");
+        assert!(unchanged.speaker_id.is_none());
+
+        db.update_segment_text(&first, &segment, "Updated").unwrap();
+        db.assign_segment_speaker(&first, &segment, Some(&speaker))
+            .unwrap();
+        let updated = db.list_segments(&first).unwrap().remove(0);
+        assert_eq!(updated.text, "Updated");
+        assert_eq!(updated.speaker_id.as_deref(), Some(speaker.as_str()));
+        assert_eq!(updated.speaker_label.as_deref(), Some("Alice"));
+    }
+
+    #[test]
     fn deleting_a_conversation_removes_its_orphan_provisional_voice() {
         let db = memory_db();
         let session = db.insert_session("Test", "", 1_000).unwrap();
@@ -7499,6 +9941,7 @@ mod tests {
     fn opening_a_legacy_database_adds_columns_without_losing_transcript() {
         let path = std::env::temp_dir().join(format!("recall-db-test-{}.sqlite", Uuid::new_v4()));
         let backup = Db::migration_backup_path(&path);
+        let voice_group_samples_backup = Db::voice_group_samples_migration_backup_path(&path);
         let recap_backup = Db::recap_migration_backup_path(&path);
         let processing_backup = Db::processing_migration_backup_path(&path);
         let voice_match_backup = Db::voice_match_migration_backup_path(&path);
@@ -7568,6 +10011,7 @@ mod tests {
         }
         std::fs::remove_file(path).unwrap();
         std::fs::remove_file(backup).unwrap();
+        std::fs::remove_file(voice_group_samples_backup).unwrap();
         std::fs::remove_file(recap_backup).unwrap();
         std::fs::remove_file(processing_backup).unwrap();
         std::fs::remove_file(voice_match_backup).unwrap();
@@ -7777,11 +10221,26 @@ mod tests {
             output_tokens: 5,
         })
         .unwrap();
+        let custom_type = db.create_recap_type("Risk review", "Review risks").unwrap();
+        db.save_custom_recap(CustomRecapSave {
+            session_id: &source_session,
+            recap_type_id: &custom_type.id,
+            name_snapshot: &custom_type.name,
+            prompt_snapshot: &custom_type.prompt,
+            content_markdown: "# Saved risk review",
+            target_language: "en",
+            model: "test-model",
+            source_fingerprint: "custom-before-identity-change",
+            input_tokens: 4,
+            output_tokens: 3,
+        })
+        .unwrap();
         let request = IdentityConsolidationRequest {
             profile_ids: vec![target.clone(), source.clone()],
             unassigned_groups: vec![UnassignedIdentityKey {
                 session_id: unassigned_session.clone(),
                 speaker_label: Some("Speaker 1".into()),
+                voice_group_id: None,
             }],
             target_speaker_id: Some(target.clone()),
             final_label: "Alice Example".into(),
@@ -7790,10 +10249,14 @@ mod tests {
         let preview = db.preview_identity_consolidation(&request).unwrap();
         assert_eq!(preview.affected_conversation_count, 3);
         assert_eq!(preview.affected_intervention_count, 3);
-        assert_eq!(preview.stale_recap_count, 1);
+        assert_eq!(preview.stale_recap_count, 2);
         assert_eq!(preview.samples_to_delete, 1);
         let result = db
-            .consolidate_identities(&request, &preview.affected_session_ids)
+            .consolidate_identities(
+                &request,
+                &preview.affected_session_ids,
+                &preview.impact_revision,
+            )
             .unwrap();
 
         assert_eq!(result.target_speaker_id, target);
@@ -7832,6 +10295,13 @@ mod tests {
                 .unwrap()
                 .source_fingerprint,
             "before-identity-change"
+        );
+        assert_eq!(
+            db.load_custom_recap(&source_session, &custom_type.id)
+                .unwrap()
+                .unwrap()
+                .source_fingerprint,
+            "custom-before-identity-change"
         );
         let conn = db.conn.lock().unwrap();
         let active: i64 = conn
@@ -7941,6 +10411,7 @@ mod tests {
             unassigned_groups: vec![UnassignedIdentityKey {
                 session_id: local_session,
                 speaker_label: Some("Speaker 1".into()),
+                voice_group_id: None,
             }],
             target_speaker_id: Some(target.clone()),
             final_label: "Alice".into(),
@@ -7948,7 +10419,11 @@ mod tests {
         let preview = db.preview_identity_consolidation(&request).unwrap();
         assert_eq!(preview.imported_source_profile_count, 1);
         let result = db
-            .consolidate_identities(&request, &preview.affected_session_ids)
+            .consolidate_identities(
+                &request,
+                &preview.affected_session_ids,
+                &preview.impact_revision,
+            )
             .unwrap();
 
         let owner_count: i64 = db
@@ -7985,6 +10460,7 @@ mod tests {
             unassigned_groups: vec![UnassignedIdentityKey {
                 session_id: selected_session.clone(),
                 speaker_label: Some("Speaker 1".into()),
+                voice_group_id: None,
             }],
             target_speaker_id: None,
             final_label: "New Person".into(),
@@ -7992,7 +10468,11 @@ mod tests {
         let preview = db.preview_identity_consolidation(&request).unwrap();
         assert!(preview.creates_new_person);
         let result = db
-            .consolidate_identities(&request, &preview.affected_session_ids)
+            .consolidate_identities(
+                &request,
+                &preview.affected_session_ids,
+                &preview.impact_revision,
+            )
             .unwrap();
 
         let selected = db.list_segments(&selected_session).unwrap();
@@ -8011,6 +10491,382 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(result.backup_path);
+    }
+
+    #[test]
+    fn label_based_identity_assignment_finalizes_only_fully_assigned_voice_groups() {
+        let path = std::env::temp_dir().join(format!(
+            "recall-identity-label-voice-group-cleanup-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let session = db
+            .insert_session("Label-scoped voice groups", "", 4_000)
+            .unwrap();
+        let target = db.insert_speaker(Some("Alice")).unwrap();
+        let complete_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: None,
+            })
+            .unwrap();
+        let partial_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 1,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: None,
+            })
+            .unwrap();
+        let complete_first = db
+            .insert_segment_with_provenance(
+                &session,
+                0,
+                1_000,
+                None,
+                Some("speaker_2"),
+                Some("speaker_2"),
+                Some(&complete_group),
+                "Complete one",
+            )
+            .unwrap();
+        let complete_second = db
+            .insert_segment_with_provenance(
+                &session,
+                1_000,
+                2_000,
+                None,
+                Some("speaker_2"),
+                Some("speaker_2"),
+                Some(&complete_group),
+                "Complete two",
+            )
+            .unwrap();
+        let partial_selected = db
+            .insert_segment_with_provenance(
+                &session,
+                2_000,
+                3_000,
+                None,
+                Some("speaker_2"),
+                Some("speaker_2"),
+                Some(&partial_group),
+                "Assign this part",
+            )
+            .unwrap();
+        let partial_unresolved = db
+            .insert_segment_with_provenance(
+                &session,
+                3_000,
+                4_000,
+                None,
+                Some("speaker_3"),
+                Some("speaker_2"),
+                Some(&partial_group),
+                "Keep this part unresolved",
+            )
+            .unwrap();
+        db.upsert_voice_group_sample(&complete_group, "UklGRkNPTVBMRVRF", 48_000)
+            .unwrap();
+        db.upsert_voice_group_sample(&partial_group, "UklGRlBBUlRJQUw=", 48_000)
+            .unwrap();
+        let request = IdentityConsolidationRequest {
+            profile_ids: Vec::new(),
+            unassigned_groups: vec![UnassignedIdentityKey {
+                session_id: session.clone(),
+                speaker_label: Some("speaker_2".into()),
+                voice_group_id: None,
+            }],
+            target_speaker_id: Some(target.clone()),
+            final_label: "Alice".into(),
+        };
+
+        let preview = db.preview_identity_consolidation(&request).unwrap();
+        assert_eq!(preview.affected_intervention_count, 3);
+        let result = db
+            .consolidate_identities(
+                &request,
+                &preview.affected_session_ids,
+                &preview.impact_revision,
+            )
+            .unwrap();
+
+        let segments = db.list_segments(&session).unwrap();
+        let segment = |id: &str| segments.iter().find(|segment| segment.id == id).unwrap();
+        for assigned in [&complete_first, &complete_second, &partial_selected] {
+            assert_eq!(
+                segment(assigned).speaker_id.as_deref(),
+                Some(target.as_str())
+            );
+            assert_eq!(segment(assigned).speaker_label.as_deref(), Some("Alice"));
+        }
+        assert!(segment(&partial_unresolved).speaker_id.is_none());
+        assert_eq!(
+            segment(&partial_unresolved).speaker_label.as_deref(),
+            Some("speaker_3")
+        );
+        let groups = db.list_session_voice_groups(&session).unwrap();
+        let complete = groups
+            .iter()
+            .find(|group| group.id == complete_group)
+            .unwrap();
+        assert_eq!(
+            complete.resulting_speaker_id.as_deref(),
+            Some(target.as_str())
+        );
+        assert!(!complete.has_preview_sample);
+        let partial = groups
+            .iter()
+            .find(|group| group.id == partial_group)
+            .unwrap();
+        assert!(partial.resulting_speaker_id.is_none());
+        assert!(partial.has_preview_sample);
+        assert!(db
+            .get_voice_group_sample(&complete_group)
+            .unwrap()
+            .is_none());
+        assert!(db.get_voice_group_sample(&partial_group).unwrap().is_some());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(result.backup_path);
+    }
+
+    #[test]
+    fn exact_unassigned_voice_group_assignment_preserves_other_turns_and_creates_no_voiceprint() {
+        let path = std::env::temp_dir().join(format!(
+            "recall-identity-exact-voice-group-test-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let session = db
+            .insert_session("Provider-only speaker labels", "", 4_000)
+            .unwrap();
+        let bob = db.insert_speaker(Some("Bob")).unwrap();
+        let selected_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: None,
+            })
+            .unwrap();
+        let sibling_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_2",
+                cluster_index: 1,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: None,
+            })
+            .unwrap();
+        let selected_unassigned = db
+            .insert_segment_with_provenance(
+                &session,
+                0,
+                1_000,
+                None,
+                Some("speaker_2"),
+                Some("speaker_2"),
+                Some(&selected_group),
+                "Assign this turn",
+            )
+            .unwrap();
+        let selected_preassigned = db
+            .insert_segment_with_provenance(
+                &session,
+                1_000,
+                2_000,
+                Some(&bob),
+                Some("Bob"),
+                Some("speaker_2"),
+                Some(&selected_group),
+                "Keep this turn",
+            )
+            .unwrap();
+        let sibling_unassigned = db
+            .insert_segment_with_provenance(
+                &session,
+                2_000,
+                3_000,
+                None,
+                Some("speaker_2"),
+                Some("speaker_2"),
+                Some(&sibling_group),
+                "Leave the sibling group alone",
+            )
+            .unwrap();
+        let legacy_unassigned = db
+            .insert_segment_with_provenance(
+                &session,
+                3_000,
+                4_000,
+                None,
+                Some("speaker_2"),
+                Some("speaker_2"),
+                None,
+                "Leave the broad-label turn alone",
+            )
+            .unwrap();
+        db.upsert_voice_group_sample(&selected_group, "UklGRlNFTEVDVEVE", 48_000)
+            .unwrap();
+        db.upsert_voice_group_sample(&sibling_group, "UklGRlNJQkxJTkc=", 48_000)
+            .unwrap();
+        let request = IdentityConsolidationRequest {
+            profile_ids: Vec::new(),
+            unassigned_groups: vec![UnassignedIdentityKey {
+                session_id: session.clone(),
+                speaker_label: Some("speaker_2".into()),
+                voice_group_id: Some(selected_group.clone()),
+            }],
+            target_speaker_id: None,
+            final_label: "New Person".into(),
+        };
+
+        let preview = db.preview_identity_consolidation(&request).unwrap();
+        assert!(preview.creates_new_person);
+        assert_eq!(preview.affected_intervention_count, 1);
+        assert_eq!(preview.unassigned_groups[0].intervention_count, 1);
+        let result = db
+            .consolidate_identities(
+                &request,
+                &preview.affected_session_ids,
+                &preview.impact_revision,
+            )
+            .unwrap();
+
+        let segments = db.list_segments(&session).unwrap();
+        let segment = |id: &str| segments.iter().find(|segment| segment.id == id).unwrap();
+        assert_eq!(
+            segment(&selected_unassigned).speaker_id.as_deref(),
+            Some(result.target_speaker_id.as_str())
+        );
+        assert_eq!(
+            segment(&selected_unassigned).speaker_label.as_deref(),
+            Some("New Person")
+        );
+        assert_eq!(
+            segment(&selected_preassigned).speaker_id.as_deref(),
+            Some(bob.as_str())
+        );
+        assert_eq!(
+            segment(&selected_preassigned).speaker_label.as_deref(),
+            Some("Bob")
+        );
+        for untouched in [&sibling_unassigned, &legacy_unassigned] {
+            assert!(segment(untouched).speaker_id.is_none());
+            assert_eq!(
+                segment(untouched).speaker_label.as_deref(),
+                Some("speaker_2")
+            );
+        }
+        let groups = db.list_session_voice_groups(&session).unwrap();
+        let selected = groups
+            .iter()
+            .find(|group| group.id == selected_group)
+            .unwrap();
+        assert!(selected.resulting_speaker_id.is_none());
+        assert!(!selected.has_preview_sample);
+        let sibling_group_view = groups
+            .iter()
+            .find(|group| group.id == sibling_group)
+            .unwrap();
+        assert!(sibling_group_view.resulting_speaker_id.is_none());
+        assert!(sibling_group_view.has_preview_sample);
+        assert!(db
+            .list_embeddings(crate::embedding::EMBEDDING_VERSION)
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_samples(&result.target_speaker_id)
+            .unwrap()
+            .is_empty());
+
+        let sibling_request = IdentityConsolidationRequest {
+            profile_ids: Vec::new(),
+            unassigned_groups: vec![UnassignedIdentityKey {
+                session_id: session.clone(),
+                speaker_label: Some("speaker_2".into()),
+                voice_group_id: Some(sibling_group.clone()),
+            }],
+            target_speaker_id: Some(result.target_speaker_id.clone()),
+            final_label: "New Person".into(),
+        };
+        let sibling_preview = db.preview_identity_consolidation(&sibling_request).unwrap();
+        let sibling_result = db
+            .consolidate_identities(
+                &sibling_request,
+                &sibling_preview.affected_session_ids,
+                &sibling_preview.impact_revision,
+            )
+            .unwrap();
+        let segments = db.list_segments(&session).unwrap();
+        let sibling = segments
+            .iter()
+            .find(|segment| segment.id == sibling_unassigned)
+            .unwrap();
+        assert_eq!(
+            sibling.speaker_id.as_deref(),
+            Some(result.target_speaker_id.as_str())
+        );
+        let legacy = segments
+            .iter()
+            .find(|segment| segment.id == legacy_unassigned)
+            .unwrap();
+        assert!(legacy.speaker_id.is_none());
+        let groups = db.list_session_voice_groups(&session).unwrap();
+        assert_eq!(
+            groups
+                .iter()
+                .find(|group| group.id == sibling_group)
+                .unwrap()
+                .resulting_speaker_id
+                .as_deref(),
+            Some(result.target_speaker_id.as_str())
+        );
+        assert!(
+            !groups
+                .iter()
+                .find(|group| group.id == sibling_group)
+                .unwrap()
+                .has_preview_sample
+        );
+        assert!(groups
+            .iter()
+            .find(|group| group.id == selected_group)
+            .unwrap()
+            .resulting_speaker_id
+            .is_none());
+
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(result.backup_path);
+        let _ = std::fs::remove_file(sibling_result.backup_path);
     }
 
     #[test]
@@ -8047,7 +10903,7 @@ mod tests {
         let mut changed_scope = preview.affected_session_ids.clone();
         changed_scope.push("another-session".into());
         let error = db
-            .consolidate_identities(&valid, &changed_scope)
+            .consolidate_identities(&valid, &changed_scope, &preview.impact_revision)
             .unwrap_err();
         assert!(error.contains("impact preview"));
         assert!(db
@@ -8062,6 +10918,117 @@ mod tests {
             .any(|speaker| speaker.id == alice));
         drop(db);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn identity_consolidation_rejects_same_scope_impact_changes_before_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "recall-identity-impact-revision-test-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("recall.db");
+        let db = Db::open(&path, Crypto::new(None, None)).unwrap();
+        let target = db.insert_speaker(Some("Alice")).unwrap();
+        let source = db.insert_speaker(Some("VOICE2")).unwrap();
+        let session = db.insert_session("Meeting", "", 2_000).unwrap();
+        db.insert_segment(&session, 0, 1_000, Some(&source), Some("VOICE2"), "First")
+            .unwrap();
+        let request = IdentityConsolidationRequest {
+            profile_ids: vec![target.clone(), source.clone()],
+            unassigned_groups: Vec::new(),
+            target_speaker_id: Some(target),
+            final_label: "Alice".into(),
+        };
+        let displayed = db.preview_identity_consolidation(&request).unwrap();
+
+        db.insert_segment(
+            &session,
+            1_000,
+            2_000,
+            Some(&source),
+            Some("VOICE2"),
+            "Second",
+        )
+        .unwrap();
+        let with_more_content = db.preview_identity_consolidation(&request).unwrap();
+        assert_eq!(
+            displayed.affected_session_ids,
+            with_more_content.affected_session_ids
+        );
+        assert_ne!(
+            displayed.affected_intervention_count,
+            with_more_content.affected_intervention_count
+        );
+        assert_ne!(displayed.impact_revision, with_more_content.impact_revision);
+
+        db.save_recap_and_title(RecapSave {
+            session_id: &session,
+            title: "Meeting",
+            model: "test-model",
+            prompt_version: crate::recap::PROMPT_VERSION,
+            schema_version: crate::recap::SCHEMA_VERSION,
+            source_fingerprint: "before-identity-change",
+            payload: &test_recap_payload(),
+            input_tokens: 1,
+            output_tokens: 1,
+        })
+        .unwrap();
+        let with_recap = db.preview_identity_consolidation(&request).unwrap();
+        assert_eq!(
+            with_more_content.affected_session_ids,
+            with_recap.affected_session_ids
+        );
+        assert_ne!(
+            with_more_content.stale_recap_count,
+            with_recap.stale_recap_count
+        );
+        assert_ne!(
+            with_more_content.impact_revision,
+            with_recap.impact_revision
+        );
+
+        db.insert_embedding(
+            &source,
+            &session,
+            &[1.0, 0.0],
+            crate::embedding::EMBEDDING_VERSION,
+        )
+        .unwrap();
+        let with_voiceprint = db.preview_identity_consolidation(&request).unwrap();
+        assert_eq!(
+            with_recap.affected_session_ids,
+            with_voiceprint.affected_session_ids
+        );
+        assert_ne!(
+            with_recap.active_voiceprint_count,
+            with_voiceprint.active_voiceprint_count
+        );
+        assert_ne!(with_recap.impact_revision, with_voiceprint.impact_revision);
+
+        let error = db
+            .consolidate_identities(
+                &request,
+                &displayed.affected_session_ids,
+                &displayed.impact_revision,
+            )
+            .unwrap_err();
+        assert!(error.contains("impact preview"));
+        assert!(db
+            .list_speakers()
+            .unwrap()
+            .iter()
+            .any(|speaker| speaker.id == source));
+        assert!(!std::fs::read_dir(&root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("pre-identity-merge")
+        }));
+
+        drop(db);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8174,6 +11141,17 @@ mod tests {
             .unwrap();
             segment_ids.push(segment);
         }
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO voice_group_samples(
+                    voice_group_id, sample_b64, sample_rate, created_at
+                 ) VALUES(?1, 'UklGRlNQTElU', 48000, ?2)",
+                params![group, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        assert!(db.list_session_voice_groups(&session).unwrap()[0].has_preview_sample);
         db.set_voice_group_split_suggestion(
             &group,
             &[segment_ids[..2].to_vec(), segment_ids[2..].to_vec()],
@@ -8186,6 +11164,7 @@ mod tests {
         assert!(Path::new(&result.backup_path).is_file());
         assert_eq!(result.moved_interventions, 2);
         assert_eq!(result.remaining_interventions, 2);
+        assert!(db.get_voice_group_sample(&group).unwrap().is_none());
         let segments = db.list_segments(&session).unwrap();
         assert!(segments[..2]
             .iter()
@@ -8254,6 +11233,34 @@ mod tests {
                 "Provisional turn",
             )
             .unwrap();
+        let local_group = db
+            .insert_session_voice_group(&SessionVoiceGroupSave {
+                session_id: &session,
+                provider_speaker_label: "speaker_3",
+                cluster_index: 0,
+                resulting_speaker_id: None,
+                status: "meeting_local_no_safe_speech",
+                centroid: None,
+                selected_duration_ms: 0,
+                selected_window_count: 0,
+                consistency_score: None,
+                model_version: Some(crate::embedding::EMBEDDING_VERSION),
+            })
+            .unwrap();
+        let local_segment = db
+            .insert_segment_with_provenance(
+                &session,
+                8_000,
+                9_000,
+                None,
+                Some("speaker_3"),
+                Some("speaker_3"),
+                Some(&local_group),
+                "Meeting-local turn",
+            )
+            .unwrap();
+        db.upsert_voice_group_sample(&local_group, "UklGRlJFU0VU", 48_000)
+            .unwrap();
         for speaker in [&named, &provisional] {
             db.insert_embedding(
                 speaker,
@@ -8297,7 +11304,7 @@ mod tests {
 
         let preview = db.preview_voice_recognition_reset().unwrap();
         assert_eq!(preview.voiceprints, 2);
-        assert_eq!(preview.temporary_samples, 2);
+        assert_eq!(preview.temporary_samples, 3);
         assert_eq!(preview.provisional_profiles, 1);
         assert_eq!(preview.named_profiles_preserved, 1);
         let first = db.reset_voice_recognition_data().unwrap();
@@ -8320,6 +11327,13 @@ mod tests {
         assert!(provisional_after.speaker_id.is_none());
         assert_eq!(provisional_after.speaker_label.as_deref(), Some("VOICE41"));
         assert!(provisional_after.voice_group_id.is_none());
+        let local_after = segments
+            .iter()
+            .find(|segment| segment.id == local_segment)
+            .unwrap();
+        assert!(local_after.speaker_id.is_none());
+        assert!(local_after.voice_group_id.is_none());
+        assert!(db.get_voice_group_sample(&local_group).unwrap().is_none());
         assert!(db
             .list_embeddings(crate::embedding::EMBEDDING_VERSION)
             .unwrap()
@@ -8402,7 +11416,11 @@ mod tests {
         let preview = db.preview_identity_consolidation(&request).unwrap();
         let started = std::time::Instant::now();
         let result = db
-            .consolidate_identities(&request, &preview.affected_session_ids)
+            .consolidate_identities(
+                &request,
+                &preview.affected_session_ids,
+                &preview.impact_revision,
+            )
             .unwrap();
         let merge_elapsed = started.elapsed();
         println!(

@@ -3,8 +3,33 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
-pub const PROMPT_VERSION: &str = "recall-recap-v5";
+pub const PROMPT_VERSION: &str = "recall-recap-v6";
 pub const SCHEMA_VERSION: &str = "recall-recap-schema-v5";
+
+pub const BUILTIN_EXECUTIVE_SUMMARY_ID: &str = "builtin-executive-summary";
+pub const BUILTIN_FULL_SUMMARY_ID: &str = "builtin-full-summary";
+pub const BUILTIN_ACTIONS_ID: &str = "builtin-actions";
+
+pub const DEFAULT_EXECUTIVE_SUMMARY_PROMPT: &str = "Write a concise account of the meeting's purpose, conclusions, decisions, material risks, disagreements, and open questions.";
+pub const DEFAULT_FULL_SUMMARY_PROMPT: &str = "Write a detailed, sectioned account of the topics discussed, arguments, rationale, decisions, dependencies, risks, and next steps.";
+pub const DEFAULT_ACTIONS_PROMPT: &str = "Capture explicit future commitments and actions reported as already completed. Include the participant, stated timing, and uncertainty. Exclude suggestions and possibilities.";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StandardRecapPrompts {
+    pub executive_summary: String,
+    pub full_summary: String,
+    pub actions: String,
+}
+
+impl Default for StandardRecapPrompts {
+    fn default() -> Self {
+        Self {
+            executive_summary: DEFAULT_EXECUTIVE_SUMMARY_PROMPT.to_string(),
+            full_summary: DEFAULT_FULL_SUMMARY_PROMPT.to_string(),
+            actions: DEFAULT_ACTIONS_PROMPT.to_string(),
+        }
+    }
+}
 
 fn default_target_language() -> String {
     "en".to_string()
@@ -64,6 +89,12 @@ pub struct RecapPayload {
     pub agenda_present: bool,
     pub agenda_coverage: Vec<AgendaCoverageItem>,
     pub translations: Vec<TranslationAnnotation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomRecapPayload {
+    pub target_language: String,
+    pub content_markdown: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,6 +271,22 @@ pub fn validate_payload(
     Ok(())
 }
 
+pub fn validate_custom_recap_payload(
+    payload: &CustomRecapPayload,
+    target_language: &str,
+) -> Result<(), String> {
+    if payload.target_language != target_language {
+        return Err(format!(
+            "The LLM provider returned target language {} instead of {}",
+            payload.target_language, target_language
+        ));
+    }
+    if payload.content_markdown.trim().is_empty() {
+        return Err("The LLM provider returned an empty custom recap".into());
+    }
+    Ok(())
+}
+
 fn validate_localized(value: &LocalizedText, field: &str) -> Result<(), String> {
     if value.original.trim().is_empty() || value.translated.trim().is_empty() {
         Err(format!("The LLM provider returned an incomplete {field}"))
@@ -400,6 +447,18 @@ pub fn translation_response_schema(valid_segment_ids: &[String]) -> Value {
     })
 }
 
+pub fn custom_recap_response_schema(target_language: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "target_language": { "type": "string", "enum": [target_language] },
+            "content_markdown": { "type": "string" }
+        },
+        "required": ["target_language", "content_markdown"]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +502,26 @@ mod tests {
     }
 
     #[test]
+    fn shipped_recap_types_have_stable_distinct_ids_and_default_prompts() {
+        let ids = HashSet::from([
+            BUILTIN_EXECUTIVE_SUMMARY_ID,
+            BUILTIN_FULL_SUMMARY_ID,
+            BUILTIN_ACTIONS_ID,
+        ]);
+        assert_eq!(ids.len(), 3);
+
+        let prompts = StandardRecapPrompts::default();
+        assert_eq!(prompts.executive_summary, DEFAULT_EXECUTIVE_SUMMARY_PROMPT);
+        assert_eq!(prompts.full_summary, DEFAULT_FULL_SUMMARY_PROMPT);
+        assert_eq!(prompts.actions, DEFAULT_ACTIONS_PROMPT);
+        assert!(prompts.executive_summary.contains("material risks"));
+        assert!(prompts.full_summary.contains("dependencies"));
+        assert!(prompts
+            .actions
+            .contains("Exclude suggestions and possibilities"));
+    }
+
+    #[test]
     fn strict_schema_closes_every_object_shape() {
         fn inspect(value: &Value) {
             if value.get("type") == Some(&Value::String("object".into())) {
@@ -466,6 +545,46 @@ mod tests {
         let ids = ["segment-1".into()];
         inspect(&analysis_response_schema(&ids, "de"));
         inspect(&translation_response_schema(&ids));
+        inspect(&custom_recap_response_schema("de"));
+    }
+
+    #[test]
+    fn custom_recap_schema_and_validation_require_language_and_markdown() {
+        let schema = custom_recap_response_schema("de");
+        assert_eq!(
+            schema.pointer("/properties/target_language/enum"),
+            Some(&json!(["de"]))
+        );
+        assert_eq!(
+            schema.pointer("/required"),
+            Some(&json!(["target_language", "content_markdown"]))
+        );
+        assert!(validate_custom_recap_payload(
+            &CustomRecapPayload {
+                target_language: "de".into(),
+                content_markdown: "# Risikoanalyse".into(),
+            },
+            "de"
+        )
+        .is_ok());
+        assert!(validate_custom_recap_payload(
+            &CustomRecapPayload {
+                target_language: "en".into(),
+                content_markdown: "# Risks".into(),
+            },
+            "de"
+        )
+        .unwrap_err()
+        .contains("instead of de"));
+        assert!(validate_custom_recap_payload(
+            &CustomRecapPayload {
+                target_language: "de".into(),
+                content_markdown: "\n".into(),
+            },
+            "de"
+        )
+        .unwrap_err()
+        .contains("empty custom recap"));
     }
 
     #[test]

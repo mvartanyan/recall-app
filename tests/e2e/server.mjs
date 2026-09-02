@@ -4,6 +4,11 @@ import { extname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const sourceRoot = resolve(fileURLToPath(new URL("../../src", import.meta.url)));
+const requestedPort = Number.parseInt(process.env.RECALL_E2E_PORT || "4173", 10);
+const port =
+  Number.isInteger(requestedPort) && requestedPort >= 1 && requestedPort <= 65_535
+    ? requestedPort
+    : 4173;
 const contentTypes = {
   ".css": "text/css; charset=utf-8",
   ".html": "text/html; charset=utf-8",
@@ -30,4 +35,4 @@ createServer(async (request, response) => {
   } catch {
     response.writeHead(404).end("Not found");
   }
-}).listen(4173, "127.0.0.1");
+}).listen(port, "127.0.0.1");

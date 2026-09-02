@@ -337,7 +337,9 @@ test("unknown interventions remain reviewable without inventing a voiceprint", (
   assert.match(javascript, /invoke\("create_profile_for_unknown_segments"/);
   assert.match(rustMain, /fn create_profile_for_unknown_segments/);
   assert.match(rustDb, /create_speaker_for_unattributed_segments/);
-  assert.match(rustMain, /no global VOICE profile or preview was created/);
+  assert.match(rustMain, /no global VOICE profile was created/);
+  assert.match(rustMain, /meeting_local_previews/);
+  assert.match(rustMain, /upsert_voice_group_sample/);
   assert.match(rustMain, /meeting_local_no_safe_speech/);
 });
 
@@ -440,7 +442,7 @@ test("People & Voices is paginated, conversation-scoped, previewed, and atomic",
     "identityNextPage",
     "identityMergeButton",
     "identityMergeDialog",
-    "identityPreviewButton",
+    "identityPreviewRetryButton",
     "identityConfirmButton",
   ]) {
     assert.match(html, new RegExp(`id="${id}"`));
@@ -453,17 +455,35 @@ test("People & Voices is paginated, conversation-scoped, previewed, and atomic",
   assert.match(javascript, /"list_identity_profiles"/);
   assert.match(javascript, /"list_unassigned_identities"/);
   assert.match(javascript, /invoke\("preview_identity_consolidation"/);
+  assert.match(javascript, /if \(!preview\?\.impact_revision\)/);
+  assert.doesNotMatch(html, /Review impact/);
+  assert.doesNotMatch(html, /id="identityPreviewButton"/);
+  assert.match(javascript, /function scheduleIdentityPreview/);
+  assert.match(javascript, /identityTarget\.addEventListener\("change"/);
+  assert.match(javascript, /sequence !== state\.identityPreviewSequence/);
+  assert.match(javascript, /if \(Number\(preview\.active_voiceprint_count \|\| 0\) > 0\)/);
+  assert.doesNotMatch(javascript, /No additional warnings/);
   assert.match(javascript, /invoke\("consolidate_identities"/);
+  assert.match(
+    javascript,
+    /expectedAffectedSessionIds:\s*\[\.\.\.\(preview\.affected_session_ids \|\| \[\]\)\]/,
+  );
+  assert.match(javascript, /expectedImpactRevision:\s*preview\.impact_revision/);
   const consolidationUi = javascript.slice(
     javascript.indexOf("async function confirmIdentityConsolidation"),
     javascript.indexOf("function actionButton"),
   );
   assert.doesNotMatch(consolidationUi, /loadSessions\(/);
+  assert.match(
+    consolidationUi,
+    /for \(const sessionId of affectedSessionIds\)[\s\S]*invalidateConversationCache/,
+  );
   assert.match(consolidationUi, /identityOperationBadge\.hidden = false/);
   assert.match(rustMain, /tokio::task::spawn_blocking/);
   assert.match(rustMain, /claim_identity_sessions/);
   assert.match(rustDb, /verified_runtime_backup\("pre-identity-merge"\)/);
-  assert.match(rustDb, /The affected conversations changed after the impact preview/);
+  assert.match(rustDb, /changed after the impact preview/);
+  assert.match(rustDb, /impact_revision/);
   assert.match(rustDb, /rebuild_session_transcripts_in_transaction/);
   assert.match(rustDb, /segments_speaker_session_idx/);
   assert.match(rustDb, /embeddings_speaker_model_reference_idx/);
@@ -541,7 +561,43 @@ test("provider speaker provenance stays reviewable and mixed voices split only a
   assert.match(html, /id="voiceSplitList"/);
   assert.match(html, /Nothing is split automatically/);
   assert.match(javascript, /No safe voiceprint/);
-  assert.match(javascript, /did not find enough clean speech to create a reusable VOICE profile/);
+  assert.match(javascript, /Assign or name…/);
+  assert.match(javascript, /function openMeetingLocalVoiceAssignment/);
+  assert.match(
+    javascript,
+    /Assign every unresolved turn to an existing person, create a name-only person/,
+  );
+  assert.match(javascript, /selectedUnassignedGroups\.set/);
+  assert.match(javascript, /voice_group_id: group\.id/);
+  assert.match(javascript, /const unassignedSegments = .*\.filter\(/s);
+  assert.match(javascript, /function finishDirectIdentityAssignment/);
+  assert.match(javascript, /identityMergeDialog\.addEventListener\(\s*"close"/s);
+
+  const meetingLocalCard = javascript.slice(
+    javascript.indexOf("function buildMeetingLocalVoiceGroupCard"),
+    javascript.indexOf("function meetingLocalUnassignedGroup"),
+  );
+  assert.match(meetingLocalCard, /const hasPreviewSample = Boolean\(group\.has_preview_sample\)/);
+  assert.match(
+    meetingLocalCard,
+    /if \(hasPreviewSample\)[\s\S]*actionButton\(\s*"Preview",\s*\(\) =>\s*previewMeetingLocalVoiceGroup\(group\)/,
+  );
+  assert.match(meetingLocalCard, /preview\.disabled = state\.recording/);
+  assert.match(meetingLocalCard, /retained meeting-local excerpt/);
+
+  const meetingLocalPreview = javascript.slice(
+    javascript.indexOf("async function previewMeetingLocalVoiceGroup"),
+    javascript.indexOf("function stopVoicePreview"),
+  );
+  assert.match(
+    meetingLocalPreview,
+    /invoke\("get_voice_group_sample", \{ voiceGroupId: group\.id \}\)/,
+  );
+  assert.match(meetingLocalPreview, /if \(!sample \|\| !String\(sample\.sample_b64/);
+  assert.match(meetingLocalPreview, /stopVoicePreview\(\)/);
+  assert.match(meetingLocalPreview, /state\.previewAudio = audio/);
+  assert.match(meetingLocalPreview, /addActivity\("Could not play meeting-local preview:/);
+  assert.match(meetingLocalPreview, /showToast\(message, "error"\)/);
 });
 
 test("voice recognition reset is explicit, backed up, and preserves historical labels", () => {
@@ -580,7 +636,7 @@ test("OpenAI recaps are explicit native Responses API calls with strict stateles
   assert.match(rustOpenAI, /"tools": \[\]/);
   assert.match(rustOpenAI, /"type": "json_schema"/);
   assert.match(rustOpenAI, /"strict": true/);
-  assert.match(javascript, /async function requestRecap\(\)/);
+  assert.match(javascript, /async function requestRecap\(recapType = null\)/);
   assert.match(javascript, /invoke\("generate_recap"/);
   assert.match(rustOpenAI, /translation_chunks\(request\.segments\)/);
   assert.match(rustOpenAI, /TRANSLATION_CHUNK_MAX_CHARACTERS/);
@@ -643,6 +699,61 @@ test("recap UI exposes participant review, agenda, result tabs, translations, an
   assert.match(javascript, /state\.recapJobs\.set\(sessionId/);
   assert.match(html, /id="recapStatusDismiss"[^>]*hidden/);
   assert.doesNotMatch(html, /id="recapProgressDialog"/);
+});
+
+test("recap types have a protected editor, split action, and snapshot result path", () => {
+  const peopleIndex = html.indexOf('id="peopleVoicesButton"');
+  const recapTypesIndex = html.indexOf('id="recapTypesButton"');
+  const settingsIndex = html.indexOf('id="settingsButton"');
+  assert(peopleIndex >= 0 && peopleIndex < recapTypesIndex && recapTypesIndex < settingsIndex);
+  assert.match(html, /id="recapTypesDialog"/);
+  assert.match(html, /id="recapTypePrompt"/);
+  assert.match(html, /supplies the complete attributed transcript and any saved agenda automatically/);
+  assert.match(html, /id="recapPromptVariables"[^>]*aria-label="Prompt variables"/);
+  assert.match(html, /selected conversation's saved date and time automatically/);
+  assert.match(javascript, /Recaps already generated for meetings keep their saved names and content/);
+  assert.match(html, /id="recapAction"[^>]*hidden/);
+  assert.match(html, /id="recapMenuButton"[^>]*aria-haspopup="menu"[^>]*hidden/);
+  assert.match(javascript, /invoke\("list_recap_types", \{ includePrompts \}\)/);
+  assert.match(javascript, /invoke\("list_recap_prompt_variables"\)/);
+  for (const command of [
+    "create_recap_type",
+    "update_recap_type",
+    "delete_recap_type",
+    "restore_recap_type_default",
+    "generate_custom_recap",
+  ]) {
+    assert.match(javascript, new RegExp(`invoke\\("${command}"`));
+  }
+  assert.match(javascript, /state\.pendingRecapRequest/);
+  assert.match(javascript, /customRecapTabId\(custom\.id\)/);
+  assert.match(javascript, /persistedState\?\.custom_recaps/);
+  assert.match(javascript, /progress\.recap_type_name/);
+  const variableRenderer = javascript.slice(
+    javascript.indexOf("function renderRecapPromptVariables"),
+    javascript.indexOf("function selectedRecapType"),
+  );
+  assert.match(variableRenderer, /state\.recapPromptVariables\.entries\(\)/);
+  assert.match(variableRenderer, /document\.createElement\("button"\)/);
+  assert.match(variableRenderer, /token\.textContent = variable\.token/);
+  assert.match(variableRenderer, /insertPromptVariable\(variable\)/);
+  assert.match(variableRenderer, /variable\.description/);
+  assert.match(variableRenderer, /variable\.example/);
+  assert.doesNotMatch(variableRenderer, /\{\{meeting_(?:date|time|datetime)\}\}/);
+  assert.match(javascript, /Variables are unavailable\. You can still edit and save the prompt\./);
+});
+
+test("custom recap Markdown is rendered through a DOM-built allowlist", () => {
+  const renderer = javascript.slice(
+    javascript.indexOf("function appendSafeMarkdownInline"),
+    javascript.indexOf("function renderGeneratedTab"),
+  );
+  assert.match(renderer, /document\.createTextNode/);
+  assert.match(renderer, /document\.createElement/);
+  assert.doesNotMatch(renderer, /innerHTML|insertAdjacentHTML|DOMParser/);
+  assert.match(javascript, /return markdown \? source : safeMarkdownPlainText\(source\)/);
+  assert.match(stylesheet, /\.custom-recap-markdown blockquote/);
+  assert.match(stylesheet, /\.custom-recap-markdown pre/);
 });
 
 test("recap and final transcription status are scoped without taking over unrelated work", () => {

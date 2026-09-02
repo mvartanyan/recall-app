@@ -21,12 +21,20 @@ import {
   normalizeLiveCaptionTurns,
   liveCaptionTurnsFromPassages,
   normalizePreferredLanguage,
+  normalizeRecapPromptVariables,
+  normalizeRecapTypeName,
   parseLanguageHints,
   parseNoTranslationLanguages,
+  parseSafeMarkdown,
   processingRunIds,
   recapTabAvailability,
+  recapTypeNameLength,
+  insertRecapPromptVariable,
+  safeMarkdownPlainText,
   setCachedConversation,
   shouldShowOnboarding,
+  sortCustomRecaps,
+  sortRecapTypes,
   transcriptFromSegments,
   translatedSegmentText,
 } from "./ui-helpers.mjs";
@@ -37,6 +45,8 @@ const JAMIE_IMPORT_UI_ENABLED = window.__RECALL_ENABLE_JAMIE_IMPORT__ === true;
 const CONVERSATION_CACHE_LIMIT = 5;
 const SEGMENT_RENDER_BATCH = 100;
 const RECORDING_STATUS_POLL_MS = 2_000;
+const CUSTOM_RECAP_TAB_PREFIX = "custom:";
+const RECAP_TYPE_NAME_MAX_CHARACTERS = 20;
 
 const elements = {
   recordButton: document.getElementById("recordButton"),
@@ -61,7 +71,10 @@ const elements = {
   conversationTitle: document.getElementById("conversationTitle"),
   conversationMeta: document.getElementById("conversationMeta"),
   agendaButton: document.getElementById("agendaButton"),
+  recapAction: document.getElementById("recapAction"),
   recapButton: document.getElementById("recapButton"),
+  recapMenuButton: document.getElementById("recapMenuButton"),
+  recapTypeMenu: document.getElementById("recapTypeMenu"),
   deleteSessionButton: document.getElementById("deleteSessionButton"),
   serviceBadge: document.getElementById("serviceBadge"),
   openaiServiceBadge: document.getElementById("openaiServiceBadge"),
@@ -76,6 +89,8 @@ const elements = {
   retryProcessingButton: document.getElementById("retryProcessingButton"),
   discardRetainedAudioButton: document.getElementById("discardRetainedAudioButton"),
   recapStaleBanner: document.getElementById("recapStaleBanner"),
+  recapStaleTitle: document.getElementById("recapStaleTitle"),
+  recapStaleDetail: document.getElementById("recapStaleDetail"),
   staleRegenerateButton: document.getElementById("staleRegenerateButton"),
   recapStatusBanner: document.getElementById("recapStatusBanner"),
   recapStatusSpinner: document.getElementById("recapStatusSpinner"),
@@ -127,15 +142,36 @@ const elements = {
   identityClearSelection: document.getElementById("identityClearSelection"),
   identityMergeButton: document.getElementById("identityMergeButton"),
   identityMergeDialog: document.getElementById("identityMergeDialog"),
+  identityMergeTitle: document.getElementById("identityMergeTitle"),
   identityMergeSelection: document.getElementById("identityMergeSelection"),
   identityTarget: document.getElementById("identityTarget"),
+  identityTargetLabel: document.getElementById("identityTargetLabel"),
+  identityFinalLabelField: document.getElementById("identityFinalLabelField"),
+  identityFinalLabelLabel: document.getElementById("identityFinalLabelLabel"),
   identityFinalLabel: document.getElementById("identityFinalLabel"),
-  identityPreviewButton: document.getElementById("identityPreviewButton"),
+  identityPreviewRetryButton: document.getElementById("identityPreviewRetryButton"),
   identityImpact: document.getElementById("identityImpact"),
   identityImpactStats: document.getElementById("identityImpactStats"),
   identityImpactWarnings: document.getElementById("identityImpactWarnings"),
   identityMergeFeedback: document.getElementById("identityMergeFeedback"),
   identityConfirmButton: document.getElementById("identityConfirmButton"),
+  recapTypesButton: document.getElementById("recapTypesButton"),
+  recapTypesDialog: document.getElementById("recapTypesDialog"),
+  closeRecapTypesButton: document.getElementById("closeRecapTypesButton"),
+  createRecapTypeButton: document.getElementById("createRecapTypeButton"),
+  recapTypesList: document.getElementById("recapTypesList"),
+  recapTypeForm: document.getElementById("recapTypeForm"),
+  recapTypeKind: document.getElementById("recapTypeKind"),
+  recapTypeEditorTitle: document.getElementById("recapTypeEditorTitle"),
+  recapTypeName: document.getElementById("recapTypeName"),
+  recapTypeNameCount: document.getElementById("recapTypeNameCount"),
+  recapTypePrompt: document.getElementById("recapTypePrompt"),
+  recapPromptVariables: document.getElementById("recapPromptVariables"),
+  recapPromptVariablesStatus: document.getElementById("recapPromptVariablesStatus"),
+  recapTypeFeedback: document.getElementById("recapTypeFeedback"),
+  deleteRecapTypeButton: document.getElementById("deleteRecapTypeButton"),
+  restoreRecapTypeButton: document.getElementById("restoreRecapTypeButton"),
+  saveRecapTypeButton: document.getElementById("saveRecapTypeButton"),
   confirmationDialog: document.getElementById("confirmationDialog"),
   confirmationForm: document.getElementById("confirmationForm"),
   confirmationTitle: document.getElementById("confirmationTitle"),
@@ -274,6 +310,7 @@ const state = {
   activityOpen: false,
   unseenActivity: 0,
   previewAudio: null,
+  voicePreviewSequence: 0,
   voiceSplitGroupId: null,
   voiceResetRunning: false,
   voiceResetReadiness: null,
@@ -309,6 +346,13 @@ const state = {
   activeRecapTab: "transcript",
   generatedLanguage: "original",
   recapJobs: new Map(),
+  recapTypes: [],
+  recapPromptVariables: [],
+  recapTypeEditorBusy: false,
+  recapTypeEditorId: null,
+  recapTypeEditorOriginal: null,
+  recapTypeCreating: false,
+  pendingRecapRequest: null,
   translationWarnings: new Set(),
   onboardingAcknowledgedThisLaunch: false,
   translationLanguages: [],
@@ -329,7 +373,10 @@ const state = {
   selectedUnassignedGroups: new Map(),
   identityPreview: null,
   identityPreviewSignature: null,
+  identityPreviewTimer: null,
+  identityPreviewSequence: 0,
   identityOperationRunning: false,
+  identityDirectAssignment: false,
 };
 
 function errorText(error) {
@@ -460,6 +507,407 @@ function settleConfirmation(confirmed) {
   if (resolve) resolve(Boolean(confirmed));
 }
 
+function recapTypeIsCustom(recapType) {
+  if (!recapType) return false;
+  if (typeof recapType.is_builtin === "boolean") return !recapType.is_builtin;
+  return String(recapType.kind || "").toLowerCase() === "custom";
+}
+
+function customRecapTypes() {
+  return sortRecapTypes(state.recapTypes).filter(recapTypeIsCustom);
+}
+
+function insertPromptVariable(variable) {
+  if (elements.recapTypePrompt.disabled) return;
+  const insertion = insertRecapPromptVariable(
+    elements.recapTypePrompt.value,
+    variable.token,
+    elements.recapTypePrompt.selectionStart,
+    elements.recapTypePrompt.selectionEnd,
+  );
+  elements.recapTypePrompt.value = insertion.value;
+  elements.recapTypePrompt.focus({ preventScroll: true });
+  elements.recapTypePrompt.setSelectionRange(
+    insertion.selectionStart,
+    insertion.selectionEnd,
+  );
+  elements.recapTypePrompt.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function renderRecapPromptVariables() {
+  elements.recapPromptVariables.replaceChildren();
+  elements.recapPromptVariables.setAttribute("aria-busy", "false");
+  for (const [index, variable] of state.recapPromptVariables.entries()) {
+    const item = document.createElement("span");
+    item.role = "listitem";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "recap-prompt-variable";
+    button.disabled = state.recapTypeEditorBusy;
+    button.setAttribute(
+      "aria-label",
+      "Insert " + variable.label + " variable " + variable.token,
+    );
+    const detail = [
+      variable.description,
+      variable.example ? "Example: " + variable.example : "",
+    ].filter(Boolean).join("\n");
+    if (detail) button.title = detail;
+    const token = document.createElement("code");
+    token.textContent = variable.token;
+    button.append(token);
+    if (detail) {
+      const description = document.createElement("span");
+      description.id = "recapPromptVariableDescription" + index;
+      description.className = "recap-prompt-variable-description";
+      description.textContent = detail;
+      button.setAttribute("aria-describedby", description.id);
+      item.append(button, description);
+    } else {
+      item.append(button);
+    }
+    button.addEventListener("click", () => insertPromptVariable(variable));
+    elements.recapPromptVariables.append(item);
+  }
+  elements.recapPromptVariablesStatus.textContent = state.recapPromptVariables.length
+    ? ""
+    : "No prompt variables are available.";
+}
+
+async function loadRecapPromptVariables() {
+  elements.recapPromptVariables.setAttribute("aria-busy", "true");
+  elements.recapPromptVariablesStatus.textContent = "Loading variables…";
+  try {
+    state.recapPromptVariables = normalizeRecapPromptVariables(
+      await invoke("list_recap_prompt_variables"),
+    );
+    renderRecapPromptVariables();
+  } catch (_error) {
+    state.recapPromptVariables = [];
+    elements.recapPromptVariables.replaceChildren();
+    elements.recapPromptVariables.setAttribute("aria-busy", "false");
+    elements.recapPromptVariablesStatus.textContent =
+      "Variables are unavailable. You can still edit and save the prompt.";
+  }
+}
+
+function selectedRecapType() {
+  return state.recapTypes.find((recapType) => recapType.id === state.recapTypeEditorId) || null;
+}
+
+function setRecapTypeMenuOpen(open) {
+  const shouldOpen = Boolean(open && customRecapTypes().length);
+  elements.recapTypeMenu.hidden = !shouldOpen;
+  elements.recapMenuButton.setAttribute("aria-expanded", String(shouldOpen));
+}
+
+function renderRecapTypeMenu() {
+  const recapTypes = customRecapTypes();
+  elements.recapTypeMenu.replaceChildren();
+  elements.recapMenuButton.hidden = !recapTypes.length;
+  elements.recapAction.classList.toggle("has-custom", Boolean(recapTypes.length));
+  if (!recapTypes.length) {
+    setRecapTypeMenuOpen(false);
+    if (state.recapState) renderRecapStaleState();
+    return;
+  }
+  for (const recapType of recapTypes) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.role = "menuitem";
+    button.dataset.recapTypeId = recapType.id;
+    button.textContent = recapType.name;
+    button.addEventListener("click", () => {
+      setRecapTypeMenuOpen(false);
+      void requestRecap({ id: recapType.id, name: recapType.name });
+    });
+    elements.recapTypeMenu.append(button);
+  }
+  if (state.recapState) renderRecapStaleState();
+}
+
+function recapTypeEditorDraft() {
+  return {
+    name: normalizeRecapTypeName(elements.recapTypeName.value),
+    prompt: elements.recapTypePrompt.value,
+  };
+}
+
+function recapTypeEditorIsDirty() {
+  const original = state.recapTypeEditorOriginal;
+  if (!original) return false;
+  const draft = recapTypeEditorDraft();
+  return draft.name !== original.name || draft.prompt !== original.prompt;
+}
+
+function updateRecapTypeNameStatus() {
+  const length = recapTypeNameLength(elements.recapTypeName.value);
+  elements.recapTypeNameCount.textContent =
+    length + " / " + RECAP_TYPE_NAME_MAX_CHARACTERS;
+  elements.recapTypeNameCount.classList.toggle(
+    "invalid",
+    length > RECAP_TYPE_NAME_MAX_CHARACTERS,
+  );
+  if (state.recapTypeCreating || recapTypeIsCustom(selectedRecapType())) {
+    elements.recapTypeEditorTitle.textContent =
+      normalizeRecapTypeName(elements.recapTypeName.value) || "New custom type";
+  }
+}
+
+function renderRecapTypesList() {
+  elements.recapTypesList.replaceChildren();
+  for (const recapType of sortRecapTypes(state.recapTypes)) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className =
+      "recap-type-option" +
+      (!state.recapTypeCreating && recapType.id === state.recapTypeEditorId
+        ? " selected"
+        : "");
+    button.role = "option";
+    button.setAttribute(
+      "aria-selected",
+      String(!state.recapTypeCreating && recapType.id === state.recapTypeEditorId),
+    );
+    const name = document.createElement("strong");
+    name.textContent = recapType.name;
+    const kind = document.createElement("span");
+    kind.textContent = recapTypeIsCustom(recapType) ? "Custom" : "Built-in";
+    button.append(name, kind);
+    button.addEventListener("click", () => void chooseRecapTypeForEditor(recapType.id));
+    elements.recapTypesList.append(button);
+  }
+}
+
+function showRecapTypeInEditor(recapType) {
+  state.recapTypeCreating = false;
+  state.recapTypeEditorId = recapType?.id || null;
+  const name = String(recapType?.name || "");
+  const prompt = String(recapType?.prompt || "");
+  state.recapTypeEditorOriginal = { name, prompt };
+  elements.recapTypeKind.textContent = recapTypeIsCustom(recapType)
+    ? "Custom type"
+    : "Built-in type";
+  elements.recapTypeEditorTitle.textContent = name || "Recap type";
+  elements.recapTypeName.value = name;
+  elements.recapTypeName.disabled = !recapTypeIsCustom(recapType);
+  elements.recapTypePrompt.value = prompt;
+  elements.deleteRecapTypeButton.hidden = !recapTypeIsCustom(recapType);
+  elements.restoreRecapTypeButton.hidden = recapTypeIsCustom(recapType);
+  elements.recapTypeFeedback.textContent = "";
+  updateRecapTypeNameStatus();
+  renderRecapTypesList();
+}
+
+function showNewRecapTypeEditor() {
+  state.recapTypeCreating = true;
+  state.recapTypeEditorId = null;
+  state.recapTypeEditorOriginal = { name: "", prompt: "" };
+  elements.recapTypeKind.textContent = "Custom type";
+  elements.recapTypeEditorTitle.textContent = "New custom type";
+  elements.recapTypeName.disabled = false;
+  elements.recapTypeName.value = "";
+  elements.recapTypePrompt.value = "";
+  elements.deleteRecapTypeButton.hidden = true;
+  elements.restoreRecapTypeButton.hidden = true;
+  elements.recapTypeFeedback.textContent = "";
+  updateRecapTypeNameStatus();
+  renderRecapTypesList();
+  elements.recapTypeName.focus();
+}
+
+async function confirmDiscardRecapTypeChanges() {
+  if (!recapTypeEditorIsDirty()) return true;
+  return requestRecapTypeConfirmation({
+    title: "Discard unsaved changes?",
+    message: "The current recap type has changes that have not been saved.",
+    acceptLabel: "Discard changes",
+  });
+}
+
+async function requestRecapTypeConfirmation(options) {
+  const managerWasOpen = elements.recapTypesDialog.open;
+  if (managerWasOpen) elements.recapTypesDialog.close();
+  const confirmed = await requestConfirmation(options);
+  if (managerWasOpen && !elements.recapTypesDialog.open) {
+    elements.recapTypesDialog.showModal();
+  }
+  return confirmed;
+}
+
+async function chooseRecapTypeForEditor(recapTypeId) {
+  if (!state.recapTypeCreating && recapTypeId === state.recapTypeEditorId) return;
+  if (!(await confirmDiscardRecapTypeChanges())) return;
+  const recapType = state.recapTypes.find((candidate) => candidate.id === recapTypeId);
+  if (recapType) showRecapTypeInEditor(recapType);
+}
+
+async function loadRecapTypes({ includePrompts = false, selectedId = null } = {}) {
+  try {
+    const recapTypes = await invoke("list_recap_types", { includePrompts });
+    state.recapTypes = sortRecapTypes(recapTypes);
+    renderRecapTypeMenu();
+    if (includePrompts) {
+      const preferredId =
+        selectedId || (!state.recapTypeCreating ? state.recapTypeEditorId : null);
+      const selected =
+        state.recapTypes.find((recapType) => recapType.id === preferredId) ||
+        state.recapTypes[0] ||
+        null;
+      if (selected) showRecapTypeInEditor(selected);
+    }
+    return true;
+  } catch (error) {
+    const message = errorText(error);
+    addActivity("Could not load recap types: " + message, "error");
+    if (includePrompts) elements.recapTypeFeedback.textContent = message;
+    return false;
+  }
+}
+
+async function openRecapTypes() {
+  setRecapTypeMenuOpen(false);
+  elements.recapTypeFeedback.textContent = "Loading…";
+  if (!elements.recapTypesDialog.open) elements.recapTypesDialog.showModal();
+  await Promise.all([
+    loadRecapTypes({ includePrompts: true }),
+    loadRecapPromptVariables(),
+  ]);
+}
+
+async function closeRecapTypes() {
+  if (!(await confirmDiscardRecapTypeChanges())) return;
+  if (elements.recapTypesDialog.open) elements.recapTypesDialog.close();
+  state.recapTypeEditorId = null;
+  state.recapTypeEditorOriginal = null;
+  state.recapTypeCreating = false;
+  elements.recapTypeName.value = "";
+  elements.recapTypePrompt.value = "";
+  await loadRecapTypes({ includePrompts: false });
+}
+
+async function beginCreateRecapType() {
+  if (!(await confirmDiscardRecapTypeChanges())) return;
+  showNewRecapTypeEditor();
+}
+
+function setRecapTypeEditorBusy(busy) {
+  state.recapTypeEditorBusy = Boolean(busy);
+  elements.createRecapTypeButton.disabled = busy;
+  elements.recapTypeName.disabled = busy || !state.recapTypeCreating && !recapTypeIsCustom(selectedRecapType());
+  elements.recapTypePrompt.disabled = busy;
+  elements.deleteRecapTypeButton.disabled = busy;
+  elements.restoreRecapTypeButton.disabled = busy;
+  elements.saveRecapTypeButton.disabled = busy;
+  for (const button of elements.recapPromptVariables.querySelectorAll("button")) {
+    button.disabled = busy;
+  }
+}
+
+async function saveRecapType(event) {
+  event.preventDefault();
+  const selected = selectedRecapType();
+  if (!state.recapTypeCreating && !selected) return;
+  const draft = recapTypeEditorDraft();
+  const custom = state.recapTypeCreating || recapTypeIsCustom(selected);
+  if (custom && !draft.name) {
+    elements.recapTypeFeedback.textContent = "Enter a name for the custom recap type.";
+    elements.recapTypeName.focus();
+    return;
+  }
+  if (custom && recapTypeNameLength(draft.name) > RECAP_TYPE_NAME_MAX_CHARACTERS) {
+    elements.recapTypeFeedback.textContent = "Custom recap type names are limited to 20 characters.";
+    elements.recapTypeName.focus();
+    return;
+  }
+  if (!draft.prompt.trim()) {
+    elements.recapTypeFeedback.textContent = "Enter instructions for this recap type.";
+    elements.recapTypePrompt.focus();
+    return;
+  }
+  setRecapTypeEditorBusy(true);
+  elements.recapTypeFeedback.textContent = "Saving…";
+  try {
+    let saved;
+    if (state.recapTypeCreating) {
+      saved = await invoke("create_recap_type", {
+        name: draft.name,
+        prompt: draft.prompt,
+      });
+    } else {
+      saved = await invoke("update_recap_type", {
+        recapTypeId: selected.id,
+        name: custom ? draft.name : selected.name,
+        prompt: draft.prompt,
+      });
+    }
+    const selectedId = saved?.id || selected?.id || null;
+    await loadRecapTypes({ includePrompts: true, selectedId });
+    elements.recapTypeFeedback.textContent = "Saved.";
+    addActivity("Recap type saved: " + (saved?.name || draft.name || selected?.name), "success");
+    showToast("Recap type saved.");
+  } catch (error) {
+    const message = errorText(error);
+    elements.recapTypeFeedback.textContent = message;
+    addActivity("Could not save recap type: " + message, "error");
+  } finally {
+    setRecapTypeEditorBusy(false);
+  }
+}
+
+async function deleteRecapType() {
+  const recapType = selectedRecapType();
+  if (!recapTypeIsCustom(recapType)) return;
+  const confirmed = await requestRecapTypeConfirmation({
+    title: "Delete this recap type?",
+    message:
+      "The custom type \"" +
+      recapType.name +
+      "\" will be removed. Recaps already generated for meetings keep their saved names and content.",
+    acceptLabel: "Delete type",
+  });
+  if (!confirmed) return;
+  setRecapTypeEditorBusy(true);
+  try {
+    await invoke("delete_recap_type", { recapTypeId: recapType.id });
+    await loadRecapTypes({ includePrompts: true });
+    addActivity("Custom recap type deleted: " + recapType.name, "success");
+    showToast("Recap type deleted. Existing meeting recaps were kept.");
+  } catch (error) {
+    const message = errorText(error);
+    elements.recapTypeFeedback.textContent = message;
+    addActivity("Could not delete recap type: " + message, "error");
+  } finally {
+    setRecapTypeEditorBusy(false);
+  }
+}
+
+async function restoreRecapTypeDefault() {
+  const recapType = selectedRecapType();
+  if (!recapType || recapTypeIsCustom(recapType)) return;
+  const confirmed = await requestRecapTypeConfirmation({
+    title: "Restore the shipped prompt?",
+    message:
+      "The current instructions for \"" + recapType.name + "\" will be replaced with Recall's default.",
+    acceptLabel: "Restore default",
+  });
+  if (!confirmed) return;
+  setRecapTypeEditorBusy(true);
+  elements.recapTypeFeedback.textContent = "Restoring…";
+  try {
+    await invoke("restore_recap_type_default", { recapTypeId: recapType.id });
+    await loadRecapTypes({ includePrompts: true, selectedId: recapType.id });
+    elements.recapTypeFeedback.textContent = "Default restored.";
+    addActivity("Default recap prompt restored: " + recapType.name, "success");
+  } catch (error) {
+    const message = errorText(error);
+    elements.recapTypeFeedback.textContent = message;
+    addActivity("Could not restore the default recap prompt: " + message, "error");
+  } finally {
+    setRecapTypeEditorBusy(false);
+  }
+}
+
 function setServiceStatus(configured) {
   state.status = Object.assign({}, state.status || {}, {
     soniox_key_configured: configured,
@@ -486,7 +934,12 @@ function setOpenAIStatus(configured) {
   elements.deleteOpenAIKeyButton.disabled = !configured;
 }
 
-function recapProgressTitle(stage) {
+function recapProgressTitle(stage, job = null) {
+  if (job?.recapTypeName) {
+    if (stage === "error") return job.recapTypeName + " failed";
+    if (stage === "complete") return job.recapTypeName + " ready";
+    return "Creating " + job.recapTypeName;
+  }
   const titles = {
     prepare: "Preparing conversation",
     llm: "Waiting for the LLM provider",
@@ -544,7 +997,7 @@ function renderSelectedRecapStatus() {
   elements.recapStatusBanner.classList.toggle("failed", failed);
   elements.recapStatusSpinner.hidden = failed;
   elements.recapStatusDismiss.hidden = !failed;
-  elements.recapStatusTitle.textContent = recapProgressTitle(failed ? "error" : stage);
+  elements.recapStatusTitle.textContent = recapProgressTitle(failed ? "error" : stage, job);
   elements.recapStatusDetail.textContent =
     job?.detail ||
     (nativeInFlight
@@ -620,7 +1073,8 @@ function updateContentVisibility() {
       state.recordingSource || "Listening to the selected audio input";
     elements.deleteSessionButton.hidden = true;
     elements.agendaButton.hidden = true;
-    elements.recapButton.hidden = true;
+    elements.recapAction.hidden = true;
+    setRecapTypeMenuOpen(false);
     renderSelectedRecapStatus();
   } else if (mode === "processing") {
     elements.conversationTitle.disabled = true;
@@ -629,7 +1083,8 @@ function updateContentVisibility() {
     elements.conversationMeta.textContent = state.processingDetail;
     elements.deleteSessionButton.hidden = true;
     elements.agendaButton.hidden = true;
-    elements.recapButton.hidden = true;
+    elements.recapAction.hidden = true;
+    setRecapTypeMenuOpen(false);
     renderSelectedRecapStatus();
   } else if (mode === "conversation") {
     const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
@@ -646,7 +1101,7 @@ function updateContentVisibility() {
       elements.deleteSessionButton.hidden = isSessionProcessing(session);
       elements.deleteSessionButton.disabled = recapInFlight;
       elements.agendaButton.hidden = finalTranscriptPending;
-      elements.recapButton.hidden = finalTranscriptPending;
+      elements.recapAction.hidden = finalTranscriptPending;
       const hasRecap = Boolean(state.recapState && state.recapState.recap);
       elements.agendaButton.textContent =
         state.recapState && state.recapState.agenda ? "Edit agenda" : "Add agenda";
@@ -656,6 +1111,8 @@ function updateContentVisibility() {
           ? "Regenerate recap"
           : "Recap";
       elements.recapButton.disabled = recapInFlight;
+      elements.recapMenuButton.disabled = recapInFlight;
+      if (recapInFlight) setRecapTypeMenuOpen(false);
       elements.agendaButton.disabled = recapInFlight;
       elements.staleRegenerateButton.disabled = recapInFlight;
       renderProcessingRecovery(session);
@@ -667,7 +1124,8 @@ function updateContentVisibility() {
     elements.conversationMeta.textContent = "Record a conversation to begin";
     elements.deleteSessionButton.hidden = true;
     elements.agendaButton.hidden = true;
-    elements.recapButton.hidden = true;
+    elements.recapAction.hidden = true;
+    setRecapTypeMenuOpen(false);
     renderProcessingRecovery(null);
     renderSelectedRecapStatus();
   }
@@ -1698,8 +2156,20 @@ function renderSessions() {
     if (session.duration_ms > 0) parts.push(formatDuration(session.duration_ms));
     if (session.processing_status === "failed") parts.push("Final transcript needs retry");
     if (session.processing_status === "cleanup_failed") parts.push("Audio cleanup needed");
-    if (sessionRecapJob?.status === "running") parts.push("Recap in progress");
-    if (sessionRecapJob?.status === "error") parts.push("Recap failed");
+    if (sessionRecapJob?.status === "running") {
+      parts.push(
+        sessionRecapJob.recapTypeName
+          ? sessionRecapJob.recapTypeName + " in progress"
+          : "Recap in progress",
+      );
+    }
+    if (sessionRecapJob?.status === "error") {
+      parts.push(
+        sessionRecapJob.recapTypeName
+          ? sessionRecapJob.recapTypeName + " failed"
+          : "Recap failed",
+      );
+    }
     meta.textContent = parts.filter(Boolean).join(" · ");
     button.append(title, meta);
     button.addEventListener("click", () => selectSession(session.id));
@@ -1839,6 +2309,64 @@ async function refreshRecapState({ rerenderTranscript = true } = {}) {
   }
 }
 
+function customRecapTabId(recapTypeId) {
+  return CUSTOM_RECAP_TAB_PREFIX + recapTypeId;
+}
+
+function customRecapForTab(tab = state.activeRecapTab) {
+  if (!String(tab || "").startsWith(CUSTOM_RECAP_TAB_PREFIX)) return null;
+  const recapTypeId = String(tab).slice(CUSTOM_RECAP_TAB_PREFIX.length);
+  return (state.recapState?.custom_recaps || []).find(
+    (recap) => recap.recap_type_id === recapTypeId,
+  ) || null;
+}
+
+function renderCustomRecapTabs() {
+  for (const button of elements.recapTabs.querySelectorAll("[data-custom-recap-tab]")) {
+    button.remove();
+  }
+  for (const recap of sortCustomRecaps(state.recapState?.custom_recaps)) {
+    if (!recap?.recap_type_id) continue;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "recap-tab";
+    button.role = "tab";
+    button.setAttribute("aria-selected", "false");
+    button.dataset.customRecapTab = "true";
+    button.dataset.recapTab = customRecapTabId(recap.recap_type_id);
+    button.textContent = recap.name || "Custom recap";
+    button.addEventListener("click", () => selectRecapTab(button.dataset.recapTab));
+    elements.recapTabs.insertBefore(button, elements.importedExecutiveTab);
+  }
+}
+
+function renderRecapStaleState() {
+  const customRecap = customRecapForTab();
+  const imported = state.activeRecapTab.startsWith("imported-");
+  let stale = false;
+  let canRegenerate = false;
+  if (customRecap) {
+    stale = Boolean(customRecap.stale);
+    canRegenerate = state.recapTypes.some(
+      (recapType) =>
+        recapType.id === customRecap.recap_type_id && recapTypeIsCustom(recapType),
+    );
+    elements.recapStaleTitle.textContent = "This custom recap is out of date.";
+    elements.recapStaleDetail.textContent = canRegenerate
+      ? "The transcript, participants, or agenda changed after it was generated. Run this type again to replace it."
+      : "The transcript, participants, or agenda changed after it was generated. Its recap type has since been deleted.";
+  } else {
+    stale = Boolean(!imported && state.recapState?.recap && state.recapState?.stale);
+    canRegenerate = stale;
+    elements.recapStaleTitle.textContent = "This recap is out of date.";
+    elements.recapStaleDetail.textContent =
+      "The transcript, participants, or agenda changed after it was generated.";
+  }
+  elements.recapStaleBanner.hidden = !stale;
+  elements.staleRegenerateButton.hidden = !canRegenerate;
+  elements.staleRegenerateButton.disabled = recapIsRunning(state.selectedSessionId);
+}
+
 function renderRecapShell() {
   const availableTabs = new Set(recapTabAvailability(state.recapState));
   const hasRecap = availableTabs.has("executive");
@@ -1848,6 +2376,7 @@ function renderRecapShell() {
   );
   const importedFull = Boolean(state.importedArtifact?.full_summary?.trim());
   const importedTasks = Boolean(state.importedArtifact?.tasks?.trim());
+  renderCustomRecapTabs();
   elements.executiveTab.hidden = !availableTabs.has("executive");
   elements.fullSummaryTab.hidden = !availableTabs.has("full");
   elements.actionsTab.hidden = !availableTabs.has("actions");
@@ -1855,13 +2384,17 @@ function renderRecapShell() {
   elements.importedExecutiveTab.hidden = !importedExecutive;
   elements.importedFullSummaryTab.hidden = !importedFull;
   elements.importedTasksTab.hidden = !importedTasks;
-  elements.recapStaleBanner.hidden = !(
-    hasRecap && state.recapState && state.recapState.stale
-  );
   if (
     !hasRecap &&
     state.activeRecapTab !== "transcript" &&
-    !state.activeRecapTab.startsWith("imported-")
+    !state.activeRecapTab.startsWith("imported-") &&
+    !availableTabs.has(state.activeRecapTab)
+  ) {
+    state.activeRecapTab = "transcript";
+  }
+  if (
+    state.activeRecapTab.startsWith(CUSTOM_RECAP_TAB_PREFIX) &&
+    !availableTabs.has(state.activeRecapTab)
   ) {
     state.activeRecapTab = "transcript";
   }
@@ -1883,14 +2416,21 @@ function renderRecapShell() {
 
 function selectRecapTab(tab) {
   const recapRecord = state.recapState && state.recapState.recap;
+  const customRecap = customRecapForTab(tab);
+  const standardTabs = new Set(["executive", "full", "actions", "agenda"]);
   const importedTabs = new Set([
     "imported-executive",
     "imported-full",
     "imported-tasks",
   ]);
-  if (tab !== "transcript" && !importedTabs.has(tab) && !recapRecord) {
+  if (
+    tab !== "transcript" &&
+    standardTabs.has(tab) &&
+    !recapRecord
+  ) {
     tab = "transcript";
   }
+  if (String(tab).startsWith(CUSTOM_RECAP_TAB_PREFIX) && !customRecap) tab = "transcript";
   if (importedTabs.has(tab) && !state.importedArtifact) tab = "transcript";
   if (tab === "agenda" && !recapRecord?.payload?.agenda_present) tab = "transcript";
   state.activeRecapTab = tab;
@@ -1906,6 +2446,7 @@ function selectRecapTab(tab) {
   } else {
     renderGeneratedTab();
   }
+  renderRecapStaleState();
 }
 
 function localized(value) {
@@ -1938,13 +2479,94 @@ function appendEmptyGeneratedState(copy) {
   elements.generatedContent.append(empty);
 }
 
+function appendSafeMarkdownInline(container, tokens) {
+  for (const token of tokens || []) {
+    if (token.type === "text") {
+      container.append(document.createTextNode(token.text || ""));
+      continue;
+    }
+    if (token.type === "code") {
+      const code = document.createElement("code");
+      code.textContent = token.text || "";
+      container.append(code);
+      continue;
+    }
+    if (token.type === "strong" || token.type === "emphasis") {
+      const emphasis = document.createElement(token.type === "strong" ? "strong" : "em");
+      appendSafeMarkdownInline(emphasis, token.children);
+      container.append(emphasis);
+    }
+  }
+}
+
+function appendSafeMarkdownBlocks(container, blocks) {
+  for (const block of blocks || []) {
+    if (block.type === "heading") {
+      const heading = document.createElement("h" + Math.max(1, Math.min(6, block.level || 1)));
+      appendSafeMarkdownInline(heading, block.children);
+      container.append(heading);
+      continue;
+    }
+    if (block.type === "paragraph") {
+      const paragraph = document.createElement("p");
+      appendSafeMarkdownInline(paragraph, block.children);
+      container.append(paragraph);
+      continue;
+    }
+    if (block.type === "list") {
+      const list = document.createElement(block.ordered ? "ol" : "ul");
+      for (const item of block.items || []) {
+        const row = document.createElement("li");
+        appendSafeMarkdownInline(row, item.children);
+        list.append(row);
+      }
+      container.append(list);
+      continue;
+    }
+    if (block.type === "blockquote") {
+      const quote = document.createElement("blockquote");
+      appendSafeMarkdownBlocks(quote, block.blocks);
+      container.append(quote);
+      continue;
+    }
+    if (block.type === "code_block") {
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = block.text || "";
+      if (block.language) code.dataset.language = block.language;
+      pre.append(code);
+      container.append(pre);
+    }
+  }
+}
+
+function renderCustomRecapTab(recap) {
+  elements.generatedContent.replaceChildren();
+  elements.generatedContent.classList.add("custom-recap-markdown");
+  elements.generatedLanguageToggle.hidden = true;
+  elements.generatedEyebrow.textContent = "Custom recap";
+  elements.generatedTitle.textContent = recap.name || "Custom recap";
+  const blocks = parseSafeMarkdown(recap.content_markdown || "");
+  if (!blocks.length) {
+    appendEmptyGeneratedState("This custom recap has no content.");
+    return;
+  }
+  appendSafeMarkdownBlocks(elements.generatedContent, blocks);
+}
+
 function renderGeneratedTab() {
+  const customRecap = customRecapForTab();
+  if (customRecap) {
+    renderCustomRecapTab(customRecap);
+    return;
+  }
   if (state.activeRecapTab.startsWith("imported-")) {
     renderImportedArtifactTab();
     return;
   }
   const payload = state.recapState?.recap?.payload;
   elements.generatedContent.replaceChildren();
+  elements.generatedContent.classList.remove("custom-recap-markdown");
   if (!payload) return;
   elements.generatedLanguageToggle.hidden = false;
   const tab = state.activeRecapTab;
@@ -2018,6 +2640,7 @@ function renderGeneratedTab() {
 function renderImportedArtifactTab() {
   const artifact = state.importedArtifact;
   elements.generatedContent.replaceChildren();
+  elements.generatedContent.classList.remove("custom-recap-markdown");
   elements.generatedLanguageToggle.hidden = true;
   if (!artifact) return;
   const contentByTab = {
@@ -2731,8 +3354,11 @@ function renderSpeakers() {
     elements.speakersList.append(buildUnknownSpeakerCard(unknownSegments));
   }
   for (const group of meetingLocalGroups) {
+    const unassignedSegments = (segmentsByVoiceGroup.get(group.id) || []).filter(
+      (segment) => !segment.speaker_id,
+    );
     elements.speakersList.append(
-      buildMeetingLocalVoiceGroupCard(group, segmentsByVoiceGroup.get(group.id) || []),
+      buildMeetingLocalVoiceGroupCard(group, unassignedSegments),
     );
   }
   for (const speaker of currentSpeakers) {
@@ -2754,6 +3380,9 @@ function identityGroupKey(key) {
     key?.speaker_label === null || key?.speaker_label === undefined
       ? null
       : String(key.speaker_label),
+    key?.voice_group_id === null || key?.voice_group_id === undefined
+      ? null
+      : String(key.voice_group_id),
   ]);
 }
 
@@ -3104,6 +3733,7 @@ async function loadIdentityManagerPage() {
 }
 
 function buildMeetingLocalVoiceGroupCard(group, segments) {
+  const hasPreviewSample = Boolean(group.has_preview_sample);
   const card = document.createElement("article");
   card.className = "speaker-card meeting-local-voice";
   const header = document.createElement("div");
@@ -3155,12 +3785,33 @@ function buildMeetingLocalVoiceGroupCard(group, segments) {
   explanation.className = "speaker-card-explanation";
   explanation.textContent =
     group.split_status === "suggested"
-      ? "Recall found two internally consistent local voice clusters inside this provider label. Review the interventions before deciding whether to split them; no global profile is created automatically."
-      : "The STT provider separated these turns, but Recall did not find enough clean speech to create a reusable VOICE profile or preview. Assign the turns from the transcript if you know the person.";
+      ? "Recall found two internally consistent local voice clusters inside this provider label. Review the possible split before assigning the whole group to one person; no global profile is created automatically."
+      : hasPreviewSample
+        ? "The STT provider separated these turns, but Recall did not find sufficiently consistent speech for a reusable VOICE profile. Preview the retained meeting-local excerpt, then assign every unresolved turn to an existing person, create a name-only person, or review turns individually."
+        : "The STT provider separated these turns, but Recall did not find enough clean speech for a reusable VOICE profile or preview. Assign every unresolved turn to an existing person, create a name-only person, or review turns individually.";
   card.append(explanation);
 
   const actions = document.createElement("div");
   actions.className = "speaker-actions";
+  if (hasPreviewSample) {
+    const preview = actionButton("Preview", () =>
+      previewMeetingLocalVoiceGroup(group),
+    );
+    preview.disabled = state.recording;
+    preview.title = state.recording
+      ? "Voice preview is unavailable during recording"
+      : "Play the retained meeting-local excerpt";
+    actions.append(preview);
+  }
+  if (group.split_status !== "suggested") {
+    actions.append(
+      actionButton(
+        "Assign or name…",
+        () => void openMeetingLocalVoiceAssignment(group, segments),
+        "primary-mini",
+      ),
+    );
+  }
   actions.append(actionButton("Review turns", () => reviewInterventions(segments)));
   if (
     Number(group.intervention_count || 0) >= 2 &&
@@ -3176,6 +3827,54 @@ function buildMeetingLocalVoiceGroupCard(group, segments) {
   }
   card.append(actions);
   return card;
+}
+
+function meetingLocalUnassignedGroup(group, segments) {
+  const session = state.sessions.find((candidate) => candidate.id === group.session_id);
+  const ordered = [...segments].sort(
+    (left, right) => Number(left.start_ms || 0) - Number(right.start_ms || 0),
+  );
+  return {
+    key: {
+      session_id: group.session_id,
+      speaker_label: group.provider_speaker_label || null,
+      voice_group_id: group.id,
+    },
+    display_label: group.provider_speaker_label || "Unknown speaker",
+    session_title: session ? sessionTitle(session) : "This conversation",
+    session_created_at: session?.created_at || new Date().toISOString(),
+    intervention_count: ordered.length,
+    first_start_ms: Number(ordered[0]?.start_ms || 0),
+    last_end_ms: Number(ordered[ordered.length - 1]?.end_ms || 0),
+    generic: true,
+  };
+}
+
+async function openMeetingLocalVoiceAssignment(group, segments) {
+  if (
+    !group ||
+    !segments.length ||
+    state.identityOperationRunning ||
+    recapIsRunning(group.session_id)
+  ) {
+    return;
+  }
+  try {
+    await loadSpeakers();
+    clearIdentitySelection();
+    const unassignedGroup = meetingLocalUnassignedGroup(group, segments);
+    state.selectedUnassignedGroups.set(
+      identityGroupKey(unassignedGroup.key),
+      unassignedGroup,
+    );
+    renderIdentitySelection();
+    await openIdentityMergeDialog({ directGroup: unassignedGroup });
+  } catch (error) {
+    finishDirectIdentityAssignment();
+    const message = errorText(error);
+    addActivity("Could not open speaker assignment: " + message, "error");
+    showToast(message, "error");
+  }
 }
 
 function buildUnknownSpeakerCard(segments) {
@@ -3750,8 +4449,7 @@ function scheduleIdentitySearch() {
 function clearIdentitySelection() {
   state.selectedIdentityProfiles.clear();
   state.selectedUnassignedGroups.clear();
-  state.identityPreview = null;
-  state.identityPreviewSignature = null;
+  invalidateIdentityPreview();
   renderIdentityManager();
 }
 
@@ -3766,7 +4464,12 @@ function selectedIdentityProfiles() {
 
 function namedIdentityTargets() {
   return state.speakers
-    .filter((speaker) => !isProvisionalLabel(speaker.label))
+    .filter(
+      (speaker) =>
+        String(speaker.label || "").trim() &&
+        !isProvisionalLabel(speaker.label) &&
+        !String(speaker.label).trim().toLocaleLowerCase().startsWith("unknown speaker"),
+    )
     .sort((left, right) =>
       String(left.label || "").localeCompare(String(right.label || ""), undefined, {
         sensitivity: "base",
@@ -3775,19 +4478,34 @@ function namedIdentityTargets() {
     );
 }
 
-function invalidateIdentityPreview() {
+function cancelIdentityPreviewTimer() {
+  if (state.identityPreviewTimer === null) return;
+  window.clearTimeout(state.identityPreviewTimer);
+  state.identityPreviewTimer = null;
+}
+
+function setIdentityPreviewStatus(message, status = "idle") {
+  elements.identityMergeFeedback.textContent = message;
+  elements.identityMergeFeedback.dataset.state = status;
+  elements.identityPreviewRetryButton.hidden = status !== "error";
+}
+
+function invalidateIdentityPreview(message = "") {
+  cancelIdentityPreviewTimer();
+  state.identityPreviewSequence += 1;
   state.identityPreview = null;
   state.identityPreviewSignature = null;
   elements.identityImpact.hidden = true;
   elements.identityImpactStats.replaceChildren();
   elements.identityImpactWarnings.replaceChildren();
+  elements.identityImpactWarnings.hidden = true;
   elements.identityConfirmButton.disabled = true;
-  elements.identityMergeFeedback.textContent = "";
+  setIdentityPreviewStatus(message);
 }
 
-function setIdentityTargetOptions() {
+function setIdentityTargetOptions(preservePrevious = true) {
   const profiles = selectedIdentityProfiles();
-  const previous = elements.identityTarget.value;
+  const previous = preservePrevious ? elements.identityTarget.value : "";
   elements.identityTarget.replaceChildren();
   if (profiles.length) {
     for (const profile of profiles) {
@@ -3843,6 +4561,7 @@ function syncIdentityFinalLabelToTarget(force = false) {
   const targetLabel = identityTargetLabel();
   if (
     force ||
+    state.identityDirectAssignment ||
     !elements.identityFinalLabel.value.trim() ||
     elements.identityFinalLabel.value === previousAutomatic
   ) {
@@ -3852,30 +4571,63 @@ function syncIdentityFinalLabelToTarget(force = false) {
   }
   elements.identityFinalLabel.dataset.automaticValue =
     elements.identityFinalLabel.value;
+  const createsNewPerson = elements.identityTarget.value === "__new__";
+  elements.identityTargetLabel.textContent = state.identityDirectAssignment
+    ? "Assign to"
+    : "Person to keep";
+  elements.identityFinalLabelLabel.textContent = state.identityDirectAssignment
+    ? "New person's name"
+    : "Final display name";
+  elements.identityFinalLabelField.hidden =
+    state.identityDirectAssignment && !createsNewPerson;
   invalidateIdentityPreview();
 }
 
-async function openIdentityMergeDialog() {
+async function openIdentityMergeDialog(options = {}) {
   if (!canConsolidateIdentitySelection()) return;
+  const directGroup = options?.directGroup || null;
+  state.identityDirectAssignment = Boolean(directGroup);
   const { profiles, groups } = identitySelectionCounts();
-  elements.identityMergeSelection.textContent =
-    profiles.toLocaleString() +
-    " profile" +
-    (profiles === 1 ? "" : "s") +
-    " and " +
-    groups.toLocaleString() +
-    " unassigned group" +
-    (groups === 1 ? "" : "s") +
-    " will be reviewed together. Choose the person whose identity should remain.";
-  setIdentityTargetOptions();
-  invalidateIdentityPreview();
+  elements.identityMergeTitle.textContent = directGroup
+    ? "Assign or name speaker"
+    : "Merge or assign selected";
+  elements.identityMergeSelection.textContent = directGroup
+    ? "Assign " +
+      Number(directGroup.intervention_count || 0).toLocaleString() +
+      " unresolved intervention" +
+      (Number(directGroup.intervention_count) === 1 ? "" : "s") +
+      " labelled " +
+      directGroup.display_label +
+      " in this conversation to a person."
+    : profiles.toLocaleString() +
+      " profile" +
+      (profiles === 1 ? "" : "s") +
+      " and " +
+      groups.toLocaleString() +
+      " unassigned group" +
+      (groups === 1 ? "" : "s") +
+      " selected. Choose the person to keep.";
+  setIdentityTargetOptions(!directGroup);
   if (!elements.identityMergeDialog.open) {
     elements.identityMergeDialog.showModal();
   }
+  scheduleIdentityPreview({ immediate: true });
   window.setTimeout(() => {
-    if (elements.identityFinalLabel.value) elements.identityFinalLabel.select();
-    else elements.identityFinalLabel.focus();
+    if (elements.identityFinalLabelField.hidden) {
+      elements.identityTarget.focus();
+    } else if (elements.identityFinalLabel.value) {
+      elements.identityFinalLabel.select();
+    } else {
+      elements.identityFinalLabel.focus();
+    }
   }, 0);
+}
+
+function finishDirectIdentityAssignment() {
+  if (!state.identityDirectAssignment) return;
+  state.identityDirectAssignment = false;
+  elements.identityMergeTitle.textContent = "Merge or assign selected";
+  clearIdentitySelection();
 }
 
 function identityConsolidationRequest() {
@@ -3916,21 +4668,20 @@ function identityImpactStat(value, label) {
 }
 
 function renderIdentityImpact(preview) {
-  elements.identityImpactStats.replaceChildren(
+  const stats = [
     identityImpactStat(preview.affected_conversation_count, "conversations"),
     identityImpactStat(preview.affected_intervention_count, "interventions"),
-    identityImpactStat(preview.stale_recap_count, "recaps made out of date"),
-    identityImpactStat(preview.active_voiceprint_count, "current voiceprints reviewed"),
-    identityImpactStat(preview.inactive_voiceprint_count, "inactive voiceprints kept"),
-    identityImpactStat(preview.samples_to_delete, "temporary samples deleted"),
-  );
+  ];
+  if (Number(preview.active_voiceprint_count || 0) > 0) {
+    stats.push(
+      identityImpactStat(preview.active_voiceprint_count, "voiceprints reviewed"),
+    );
+  }
+  elements.identityImpactStats.replaceChildren(...stats);
   elements.identityImpactWarnings.replaceChildren();
   const warnings = preview.warnings || [];
-  if (!warnings.length) {
-    const item = document.createElement("li");
-    item.textContent = "No additional warnings.";
-    elements.identityImpactWarnings.append(item);
-  } else {
+  elements.identityImpactWarnings.hidden = !warnings.length;
+  if (warnings.length) {
     for (const warning of warnings) {
       const item = document.createElement("li");
       item.textContent = warning;
@@ -3940,33 +4691,70 @@ function renderIdentityImpact(preview) {
   elements.identityImpact.hidden = false;
 }
 
-async function previewIdentityConsolidation() {
+function scheduleIdentityPreview({ immediate = false } = {}) {
   const request = identityConsolidationRequest();
+  invalidateIdentityPreview();
+  if (!elements.identityMergeDialog.open) return;
   if (!request.final_label) {
-    elements.identityMergeFeedback.textContent = "Enter the final display name.";
-    elements.identityFinalLabel.focus();
+    setIdentityPreviewStatus(
+      state.identityDirectAssignment
+        ? "Choose a person or enter a new person's name."
+        : "Enter the final display name.",
+    );
     return;
   }
-  elements.identityPreviewButton.disabled = true;
-  elements.identityMergeFeedback.textContent = "Calculating the exact impact…";
-  invalidateIdentityPreview();
-  elements.identityMergeFeedback.textContent = "Calculating the exact impact…";
+  setIdentityPreviewStatus("Calculating…", "loading");
+  state.identityPreviewTimer = window.setTimeout(() => {
+    state.identityPreviewTimer = null;
+    void previewIdentityConsolidation();
+  }, immediate ? 0 : 280);
+}
+
+async function previewIdentityConsolidation() {
+  cancelIdentityPreviewTimer();
+  if (!elements.identityMergeDialog.open) return;
+  const request = identityConsolidationRequest();
+  if (!request.final_label) {
+    invalidateIdentityPreview("Enter the final display name.");
+    return;
+  }
+  const signature = identityRequestSignature(request);
+  const sequence = ++state.identityPreviewSequence;
+  state.identityPreview = null;
+  state.identityPreviewSignature = null;
+  elements.identityImpact.hidden = true;
+  elements.identityConfirmButton.disabled = true;
+  setIdentityPreviewStatus("Calculating…", "loading");
   try {
     const preview = await invoke("preview_identity_consolidation", {
       request: serializableCopy(request),
     });
+    if (!preview?.impact_revision) {
+      throw new Error("Recall could not bind this impact preview to a safe confirmation.");
+    }
+    if (
+      !elements.identityMergeDialog.open ||
+      sequence !== state.identityPreviewSequence ||
+      signature !== identityRequestSignature(identityConsolidationRequest())
+    ) {
+      return;
+    }
     state.identityPreview = preview;
-    state.identityPreviewSignature = identityRequestSignature(request);
+    state.identityPreviewSignature = signature;
     renderIdentityImpact(preview);
-    elements.identityMergeFeedback.textContent =
-      "Review the impact below before confirming.";
+    setIdentityPreviewStatus("Ready to confirm.", "ready");
     elements.identityConfirmButton.disabled = false;
   } catch (error) {
+    if (
+      !elements.identityMergeDialog.open ||
+      sequence !== state.identityPreviewSequence ||
+      signature !== identityRequestSignature(identityConsolidationRequest())
+    ) {
+      return;
+    }
     const message = errorText(error);
-    elements.identityMergeFeedback.textContent = message;
+    setIdentityPreviewStatus(message, "error");
     addActivity("Could not preview the people and voices change: " + message, "error");
-  } finally {
-    elements.identityPreviewButton.disabled = false;
   }
 }
 
@@ -3976,9 +4764,7 @@ async function confirmIdentityConsolidation() {
     !state.identityPreview ||
     state.identityPreviewSignature !== identityRequestSignature(request)
   ) {
-    invalidateIdentityPreview();
-    elements.identityMergeFeedback.textContent =
-      "The selection or final name changed. Review the impact again.";
+    scheduleIdentityPreview({ immediate: true });
     return;
   }
   const preview = state.identityPreview;
@@ -3999,6 +4785,8 @@ async function confirmIdentityConsolidation() {
   try {
     const result = await invoke("consolidate_identities", {
       request: serializableCopy(request),
+      expectedAffectedSessionIds: [...(preview.affected_session_ids || [])],
+      expectedImpactRevision: preview.impact_revision,
     });
     const elapsedSeconds = (performance.now() - startedAt) / 1000;
     addActivity(
@@ -4014,6 +4802,9 @@ async function confirmIdentityConsolidation() {
     );
     showToast(result.target_label + " and the selected history were updated.");
     clearIdentitySelection();
+    for (const sessionId of affectedSessionIds) {
+      invalidateConversationCache(state.conversationCache, sessionId);
+    }
     await loadSpeakers();
     if (
       state.selectedSessionId &&
@@ -4047,39 +4838,84 @@ async function previewSpeaker(speaker) {
     showToast("Voice preview is unavailable during recording.", "error");
     return;
   }
+  stopVoicePreview();
+  const previewSequence = state.voicePreviewSequence;
   addActivity("Loading preview for " + speaker.label);
   try {
     const samples = await invoke("get_speaker_samples", { speakerId: speaker.id });
-    if (state.recording) return;
+    if (state.recording || previewSequence !== state.voicePreviewSequence) return;
     if (!samples.length) {
       showToast("No sample is retained for this profile.", "error");
       addActivity("No preview is retained for " + speaker.label, "error");
       await loadSpeakers();
       return;
     }
-    if (state.previewAudio) state.previewAudio.pause();
-    state.previewAudio = new Audio("data:audio/wav;base64," + samples[0].sample_b64);
-    if (state.recording) {
-      state.previewAudio = null;
-      return;
-    }
-    await state.previewAudio.play();
-    if (state.recording) {
-      stopVoicePreview();
+    const audio = new Audio("data:audio/wav;base64," + samples[0].sample_b64);
+    state.previewAudio = audio;
+    await audio.play();
+    if (
+      state.recording ||
+      previewSequence !== state.voicePreviewSequence ||
+      state.previewAudio !== audio
+    ) {
+      if (state.previewAudio === audio) stopVoicePreview();
       return;
     }
     addActivity("Playing voice preview for " + speaker.label, "success");
   } catch (error) {
+    if (previewSequence !== state.voicePreviewSequence) return;
+    stopVoicePreview();
     addActivity("Could not play voice preview: " + errorText(error), "error");
     showToast(errorText(error), "error");
   }
 }
 
+async function previewMeetingLocalVoiceGroup(group) {
+  const label = group.provider_speaker_label || "provider speaker";
+  if (state.recording) {
+    showToast("Voice preview is unavailable during recording.", "error");
+    return;
+  }
+  stopVoicePreview();
+  const previewSequence = state.voicePreviewSequence;
+  addActivity("Loading meeting-local preview for " + label);
+  try {
+    const sample = await invoke("get_voice_group_sample", { voiceGroupId: group.id });
+    if (state.recording || previewSequence !== state.voicePreviewSequence) return;
+    if (!sample || !String(sample.sample_b64 || "").trim()) {
+      const message = "No retained preview is available for " + label + ".";
+      addActivity(message, "error");
+      showToast(message, "error");
+      return;
+    }
+    const audio = new Audio("data:audio/wav;base64," + sample.sample_b64);
+    state.previewAudio = audio;
+    await audio.play();
+    if (
+      state.recording ||
+      previewSequence !== state.voicePreviewSequence ||
+      state.previewAudio !== audio
+    ) {
+      if (state.previewAudio === audio) stopVoicePreview();
+      return;
+    }
+    addActivity("Playing meeting-local preview for " + label, "success");
+  } catch (error) {
+    if (previewSequence !== state.voicePreviewSequence) return;
+    stopVoicePreview();
+    const message = errorText(error);
+    addActivity("Could not play meeting-local preview: " + message, "error");
+    showToast(message, "error");
+  }
+}
+
 function stopVoicePreview() {
-  if (!state.previewAudio) return;
-  state.previewAudio.pause();
-  state.previewAudio.currentTime = 0;
+  state.voicePreviewSequence += 1;
+  const audio = state.previewAudio;
   state.previewAudio = null;
+  if (!audio) return;
+  audio.pause();
+  audio.currentTime = 0;
 }
 
 function openNameDialog(speaker) {
@@ -4292,6 +5128,11 @@ function transcriptExport(markdown) {
 function generatedExport(markdown) {
   const session = state.sessions.find((candidate) => candidate.id === state.selectedSessionId);
   if (!session) return "";
+  const customRecap = customRecapForTab();
+  if (customRecap) {
+    const source = String(customRecap.content_markdown || "");
+    return markdown ? source : safeMarkdownPlainText(source);
+  }
   const lines = [markdown ? "# " + sessionTitle(session) : sessionTitle(session), ""];
   const heading = (value, level = 2) =>
     markdown ? "#".repeat(level) + " " + value : value.toUpperCase();
@@ -4485,8 +5326,12 @@ async function removeAgenda() {
   }
 }
 
-async function requestRecap() {
+async function requestRecap(recapType = null) {
   if (!state.selectedSessionId || recapIsRunning(state.selectedSessionId)) return;
+  const customType =
+    recapType && typeof recapType.id === "string"
+      ? { id: recapType.id, name: String(recapType.name || "Custom recap") }
+      : null;
   if (!state.status?.openai_key_configured || !String(state.preferences?.openai_model || "").trim()) {
     await openSettings();
     elements.settingsFeedback.textContent =
@@ -4495,6 +5340,10 @@ async function requestRecap() {
   }
   const unresolved = state.recapState?.unresolved_profiles || [];
   if (unresolved.length) {
+    state.pendingRecapRequest = {
+      sessionId: state.selectedSessionId,
+      recapType: customType,
+    };
     elements.unresolvedList.replaceChildren();
     for (const label of unresolved) {
       const item = document.createElement("li");
@@ -4504,10 +5353,13 @@ async function requestRecap() {
     elements.unresolvedDialog.showModal();
     return;
   }
-  void runRecap(false);
+  state.pendingRecapRequest = null;
+  void runRecap(false, customType, state.selectedSessionId);
 }
 
 function reviewUnresolvedParticipants() {
+  const pendingTypeName = state.pendingRecapRequest?.recapType?.name || null;
+  state.pendingRecapRequest = null;
   elements.unresolvedDialog.close();
   selectRecapTab("transcript");
   const unresolved = new Set(state.recapState?.unresolved_profiles || []);
@@ -4532,18 +5384,39 @@ function reviewUnresolvedParticipants() {
       }, 250);
     }
   }
-  showToast("Assign or name the highlighted participant, then click Recap again.");
+  showToast(
+    "Assign or name the highlighted participant, then " +
+      (pendingTypeName ? "choose " + pendingTypeName + " again." : "click Recap again."),
+  );
 }
 
-async function runRecap(allowUnresolved) {
-  const sessionId = state.selectedSessionId;
+function requestActiveStaleRecap() {
+  const customRecap = customRecapForTab();
+  if (customRecap) {
+    const recapType = state.recapTypes.find(
+      (candidate) => candidate.id === customRecap.recap_type_id,
+    );
+    if (recapTypeIsCustom(recapType)) {
+      void requestRecap({ id: recapType.id, name: recapType.name });
+    }
+    return;
+  }
+  void requestRecap();
+}
+
+async function runRecap(allowUnresolved, recapType = null, requestedSessionId = null) {
+  const sessionId = requestedSessionId || state.selectedSessionId;
   if (!sessionId || recapIsRunning(sessionId)) return;
   const session = state.sessions.find((candidate) => candidate.id === sessionId);
   const label = sessionTitle(session);
+  const custom = recapType && typeof recapType.id === "string" ? recapType : null;
+  const activityKind = custom ? custom.name : "recap";
   state.recapJobs.set(sessionId, {
     status: "running",
     stage: "prepare",
     detail: "Preparing transcript and agenda…",
+    recapTypeId: custom?.id || null,
+    recapTypeName: custom?.name || null,
   });
   if (state.selectedSessionId === sessionId && state.recapState) {
     state.recapState.in_flight = true;
@@ -4551,21 +5424,33 @@ async function runRecap(allowUnresolved) {
   renderSessions();
   updateContentVisibility();
   renderTranscript(session);
-  addActivity("[recap · " + label + "] Starting on-demand LLM recap");
+  addActivity("[" + activityKind + " · " + label + "] Starting on-demand LLM recap");
   try {
-    const commandState = await invoke("generate_recap", { sessionId, allowUnresolved });
+    const commandState = custom
+      ? await invoke("generate_custom_recap", {
+          sessionId,
+          recapTypeId: custom.id,
+          allowUnresolved,
+        })
+      : await invoke("generate_recap", { sessionId, allowUnresolved });
     await loadSessions();
+    invalidateConversationCache(state.conversationCache, sessionId);
+    let persistedResult = null;
     if (state.selectedSessionId === sessionId) {
       const persistedState = await invoke("get_recap_state", { sessionId });
-      if (!persistedState?.recap?.payload) {
+      persistedResult = custom
+        ? (persistedState?.custom_recaps || []).find(
+            (recap) => recap.recap_type_id === custom.id,
+          )
+        : persistedState?.recap;
+      if (custom ? !persistedResult : !persistedResult?.payload) {
         throw new Error("The LLM provider finished, but Recall could not load the saved recap.");
       }
       state.recapState = persistedState;
       state.translationIndex = indexTranslations(
         state.recapState?.recap?.payload?.translations || [],
       );
-      invalidateConversationCache(state.conversationCache, sessionId);
-      state.activeRecapTab = "executive";
+      state.activeRecapTab = custom ? customRecapTabId(custom.id) : "executive";
       const session = state.sessions.find((candidate) => candidate.id === sessionId);
       renderRecapShell();
       renderTranscript(session);
@@ -4574,24 +5459,30 @@ async function runRecap(allowUnresolved) {
       ).filter((button) => !button.hidden).length;
       addActivity("Recap interface ready with " + visibleTabs + " tabs", "success");
     }
-    const usage = commandState.recap;
+    const usage = custom
+      ? (commandState?.custom_recaps || []).find(
+          (recap) => recap.recap_type_id === custom.id,
+        ) || commandState?.custom_recap || persistedResult
+      : commandState?.recap;
     addActivity(
-      "[recap · " + label + "] LLM recap saved locally" +
+      "[" + activityKind + " · " + label + "] LLM recap saved locally" +
         (usage
           ? " (" + usage.input_tokens + " input / " + usage.output_tokens + " output tokens)"
           : ""),
       "success",
     );
     state.recapJobs.delete(sessionId);
-    showToast("Recap ready for “" + label + "”.");
+    showToast((custom ? custom.name : "Recap") + " ready for \"" + label + "\".");
   } catch (error) {
     const message = errorText(error);
     state.recapJobs.set(sessionId, {
       status: "error",
       stage: "error",
       detail: message,
+      recapTypeId: custom?.id || null,
+      recapTypeName: custom?.name || null,
     });
-    addActivity("[recap · " + label + "] LLM recap failed: " + message, "error");
+    addActivity("[" + activityKind + " · " + label + "] LLM recap failed: " + message, "error");
     showToast(message, "error");
     if (state.selectedSessionId === sessionId) {
       try {
@@ -5722,7 +6613,7 @@ async function unlockDatabase(event) {
     await invoke("unlock_db", { password });
     elements.databasePassword.value = "";
     await loadSettingsData();
-    await Promise.all([loadSpeakers(), loadSessions()]);
+    await Promise.all([loadSpeakers(), loadSessions(), loadRecapTypes()]);
     if (state.sessions.length) await selectSession(state.sessions[0].id);
     elements.unlockDialog.close();
     elements.unlockFeedback.textContent = "";
@@ -5754,8 +6645,11 @@ async function registerListeners() {
     const kind = progress.stage === "error" ? "error" : progress.stage === "complete" ? "success" : "";
     const session = state.sessions.find((candidate) => candidate.id === progress.session_id);
     const label = session ? sessionTitle(session) : String(progress.session_id || "").slice(0, 8);
+    const previousJob = recapJob(progress.session_id);
+    const recapTypeId = progress.recap_type_id || previousJob?.recapTypeId || null;
+    const recapTypeName = progress.recap_type_name || previousJob?.recapTypeName || null;
     addActivity(
-      "[recap · " + label + "] " + progress.stage + ": " + (progress.detail || "Working…"),
+      "[" + (recapTypeName || "recap") + " · " + label + "] " + progress.stage + ": " + (progress.detail || "Working…"),
       kind,
     );
     if (progress.session_id) {
@@ -5763,6 +6657,8 @@ async function registerListeners() {
         status: progress.stage === "error" ? "error" : "running",
         stage: progress.stage,
         detail: progress.detail || "Working…",
+        recapTypeId,
+        recapTypeName,
       });
       renderSessions();
       updateContentVisibility();
@@ -5864,6 +6760,19 @@ function bindInterface() {
   elements.applyLiveContextButton.addEventListener("click", applyLiveContext);
   elements.voiceLibraryButton.addEventListener("click", openVoiceLibrary);
   elements.peopleVoicesButton.addEventListener("click", openVoiceLibrary);
+  elements.recapTypesButton.addEventListener("click", () => void openRecapTypes());
+  elements.closeRecapTypesButton.addEventListener("click", () => void closeRecapTypes());
+  elements.createRecapTypeButton.addEventListener("click", () => void beginCreateRecapType());
+  elements.recapTypeForm.addEventListener("submit", saveRecapType);
+  elements.recapTypeName.addEventListener("input", updateRecapTypeNameStatus);
+  elements.deleteRecapTypeButton.addEventListener("click", () => void deleteRecapType());
+  elements.restoreRecapTypeButton.addEventListener("click", () =>
+    void restoreRecapTypeDefault(),
+  );
+  elements.recapTypesDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    void closeRecapTypes();
+  });
   elements.identityProfilesTab.addEventListener("click", () =>
     setIdentityManagerView("profiles"),
   );
@@ -5896,21 +6805,41 @@ function bindInterface() {
   });
   elements.identityClearSelection.addEventListener("click", clearIdentitySelection);
   elements.identityMergeButton.addEventListener("click", openIdentityMergeDialog);
-  elements.identityTarget.addEventListener("change", () =>
-    syncIdentityFinalLabelToTarget(false),
+  elements.identityTarget.addEventListener("change", () => {
+    syncIdentityFinalLabelToTarget(false);
+    scheduleIdentityPreview({ immediate: true });
+    if (!elements.identityFinalLabelField.hidden && !elements.identityFinalLabel.value) {
+      elements.identityFinalLabel.focus();
+    }
+  });
+  elements.identityFinalLabel.addEventListener("input", () =>
+    scheduleIdentityPreview(),
   );
-  elements.identityFinalLabel.addEventListener("input", invalidateIdentityPreview);
-  elements.identityPreviewButton.addEventListener(
-    "click",
-    previewIdentityConsolidation,
+  elements.identityFinalLabel.addEventListener("blur", () => {
+    if (state.identityPreviewTimer !== null) {
+      scheduleIdentityPreview({ immediate: true });
+    }
+  });
+  elements.identityPreviewRetryButton.addEventListener("click", () =>
+    scheduleIdentityPreview({ immediate: true }),
   );
   elements.identityConfirmButton.addEventListener(
     "click",
     confirmIdentityConsolidation,
   );
+  elements.identityMergeDialog.addEventListener("close", () => {
+    invalidateIdentityPreview();
+    finishDirectIdentityAssignment();
+  });
   elements.agendaButton.addEventListener("click", openAgendaDialog);
-  elements.recapButton.addEventListener("click", requestRecap);
-  elements.staleRegenerateButton.addEventListener("click", requestRecap);
+  elements.recapButton.addEventListener("click", () => void requestRecap());
+  elements.recapMenuButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setRecapTypeMenuOpen(elements.recapTypeMenu.hidden);
+  });
+  elements.staleRegenerateButton.addEventListener("click", () =>
+    requestActiveStaleRecap(),
+  );
   elements.retryProcessingButton.addEventListener("click", retrySelectedProcessing);
   elements.discardRetainedAudioButton.addEventListener(
     "click",
@@ -6002,13 +6931,20 @@ function bindInterface() {
   elements.agendaForm.addEventListener("submit", saveAgendaText);
   elements.attachAgendaButton.addEventListener("click", chooseAgendaFile);
   elements.removeAgendaButton.addEventListener("click", removeAgenda);
-  elements.cancelUnresolvedButton.addEventListener("click", () =>
-    elements.unresolvedDialog.close(),
-  );
+  elements.cancelUnresolvedButton.addEventListener("click", () => {
+    state.pendingRecapRequest = null;
+    elements.unresolvedDialog.close();
+  });
   elements.reviewUnresolvedButton.addEventListener("click", reviewUnresolvedParticipants);
   elements.recapAnywayButton.addEventListener("click", () => {
+    const pending = state.pendingRecapRequest;
+    state.pendingRecapRequest = null;
     elements.unresolvedDialog.close();
-    void runRecap(true);
+    void runRecap(
+      true,
+      pending?.recapType || null,
+      pending?.sessionId || state.selectedSessionId,
+    );
   });
   elements.recapStatusDismiss.addEventListener("click", () => {
     const job = recapJob(state.selectedSessionId);
@@ -6041,10 +6977,19 @@ function bindInterface() {
   window.addEventListener("resize", scheduleTranscriptResize);
   window.addEventListener("resize", scheduleConversationTitleResize);
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !elements.recapTypeMenu.hidden) {
+      event.preventDefault();
+      setRecapTypeMenuOpen(false);
+      elements.recapMenuButton.focus();
+      return;
+    }
     if (event.key === "Escape" && !elements.confirmationDialog.hidden) {
       event.preventDefault();
       settleConfirmation(false);
     }
+  });
+  document.addEventListener("click", (event) => {
+    if (!elements.recapAction.contains(event.target)) setRecapTypeMenuOpen(false);
   });
 }
 
@@ -6061,7 +7006,7 @@ async function initialize() {
       updateContentVisibility();
       return;
     }
-    await Promise.all([loadSpeakers(), loadSessions()]);
+    await Promise.all([loadSpeakers(), loadSessions(), loadRecapTypes()]);
     if (state.sessions.length && !state.recording) await selectSession(state.sessions[0].id);
     updateContentVisibility();
     addActivity("Recall is ready", "success");

@@ -98,8 +98,18 @@ Recall stores its archive locally. During transcription, it sends audio directly
   VOICE1, VOICE2, and so on.
 - Preserve the STT provider label and its exact intervention provenance even
   when no safe global profile can be made. Such a label remains scoped to that
-  conversation, with no `VOICE<n>`, preview, or reusable voiceprint.
+  conversation, with no `VOICE<n>` or reusable voiceprint. When at least one
+  VAD-confirmed candidate exists, retain one meeting-local preview for manual
+  identification without promoting it into the voice database.
+- Make each **No safe voiceprint** card actionable. **Assign or name** sends
+  every still-unresolved turn in that voice group through the existing impact
+  review, where it can be assigned to a named person or used to create a
+  name-only person. Already assigned turns remain unchanged, cancelling makes
+  no persistent change, and a suggested mixed-voice group must first be
+  reviewed or kept as one person.
 - Build references only from clean central windows in longer interventions.
+  Spread each candidate batch across interventions and try a bounded number of
+  later batches when an earlier batch is inconsistent.
   Combine separate provider labels only when each has repeated, internally
   consistent clean speech and their centroids agree at 0.995 or better.
 - Compare VAD-confirmed intervention observations inside each provider label.
@@ -108,7 +118,8 @@ Recall stores its archive locally. During transcription, it sends audio directly
   the split automatically; the user chooses the interventions first.
 - Keep Unicode-normalized human names unique. Legacy duplicate-name profiles
   are shown for merge or rename and excluded from automatic matching.
-- Preview the temporary excerpt for a new voice, give it a name, or assign it to an existing named person.
+- Preview the temporary excerpt for a new voice or an unresolved meeting-local
+  group, then name or assign it.
 - Show provisional profiles as `Not auto-matched`; **Name person** enables
   recognition, while **Rename person** changes a human-readable name later.
 - Keep both voice patterns or replace an old pattern when assigning a changed voice.
@@ -117,10 +128,11 @@ Recall stores its archive locally. During transcription, it sends audio directly
   **People & Voices** manager, with separate searchable Profiles and exact
   conversation-scoped Unassigned views. Long person names wrap inside their
   cards instead of widening the Voices pane.
-- Preview the full impact before merging profiles or assigning unassigned
-  groups. Revalidate the affected conversations, create an integrity-checked
-  database backup, and apply transcript, recap, voiceprint, and sample changes
-  atomically.
+- Calculate the full impact automatically when the person or final name changes
+  before merging profiles or assigning unassigned groups. Confirmation stays
+  disabled until that exact selection has been checked. Revalidate the affected
+  conversations, create an integrity-checked database backup, and apply
+  transcript, recap, voiceprint, and sample changes atomically.
 - Filter historical conversations by a named person. Duplicate profiles with
   the same display name appear once, alphabetically, and the filter includes
   conversations attached to any of those profile IDs. Provisional `VOICE<n>`
@@ -174,12 +186,28 @@ Recall stores its archive locally. During transcription, it sends audio directly
   below 50 MB are retained in their original form.
 - Review unresolved participants before recapping, with an explicit
   **Recap anyway** override for meetings that cannot be fully attributed.
+- Manage recap instructions globally from **Recap types**, between **People &
+  Voices** and **Settings**. The protected Executive summary, Full summary, and
+  Actions types have fixed names, editable prompts, and per-type default
+  restoration. Custom names are required, may duplicate, and are limited to 20
+  Unicode characters after whitespace normalization.
+- Insert native-owned meeting variables into built-in or custom prompts from
+  the recap-type editor: `{{meeting_date}}` is `YYYY/MM/DD`,
+  `{{meeting_time}}` is `HH:mm`, and `{{meeting_datetime}}` is
+  `YYYY/MM/DD HH:mm UTC+/-HH:MM`. Recall derives them from the selected
+  conversation's persisted timestamp in the desktop's local timezone, matching
+  the date and time Recall displays. A later regeneration therefore uses that
+  conversation time rather than the time when the recap runs.
 - Generate a meeting title, executive summary, sectioned full summary,
   participant commitments, actions already reported as taken, and
   point-by-point agenda coverage through an explicit native OpenAI Responses
   API recap run in the user's preferred language. The holistic meeting analysis
   is separate from bounded per-intervention translation batches, so long
   meetings do not require one ever-growing structured response.
+- Run one selected custom recap from the Recap split menu without changing the
+  title, standard recap, transcript translations, or agenda coverage. Custom
+  runs receive the complete attributed transcript and current agenda and can
+  run before any standard recap exists.
 - View generated material in the meeting's original/dominant language or in the
   preferred language recorded with that recap. Every intervention receives one
   validated translation decision; applicable interventions show a complete
@@ -191,15 +219,33 @@ Recall stores its archive locally. During transcription, it sends audio directly
 - Keep summary/action evidence IDs as internal factuality metadata. Generated
   views and clipboard exports omit them.
 - Copy the transcript or generated material as plain text or Markdown.
+- Keep custom results as per-meeting snapshots of their stable type ID, name,
+  expanded prompt, Markdown, target language, model, source fingerprint, token
+  use, and generation time. Later type edits or deletion do not alter saved
+  tabs.
+- Render custom Markdown without HTML injection through DOM-created headings,
+  paragraphs, emphasis, lists, blockquotes, and code. Markdown copy preserves
+  the generated source; text copy removes formatting.
 - Mark a recap stale after transcript, speaker, or agenda changes; hide stale
   inline translations and preserve the last good recap until a replacement
-  validates and saves successfully. A later settings change does not relabel or
-  invalidate a recap already saved with its target language.
+  validates and saves successfully. Source-fingerprint validation and result
+  replacement share one database transaction, so a source edit cannot slip
+  between those steps. A later settings change does not relabel or invalidate a
+  recap already saved with its target language.
 - Read existing English-specific recap payloads as English-target recaps. After
   validating the old content fingerprint, Recall upgrades only their fingerprint
   metadata; it does not rewrite their stored generated payload.
 
 Recall never generates a recap automatically.
+
+Recap prompt variables are expanded natively for both standard built-in and
+custom runs immediately before the provider request. The editor obtains its
+insertion choices from the same native registry that owns expansion, rather
+than duplicating a JavaScript list. Unknown tokens remain literal so a typo or
+a future variable does not silently disappear, and shipped prompt templates are
+not rewritten. To add another safe, native-owned variable, extend that registry
+with its token, label, description, example, and resolver; the editor then
+offers it without a second UI inventory.
 
 ## First launch on macOS
 
@@ -344,7 +390,7 @@ can open a downloaded build without a Gatekeeper warning. See
 credentials, architecture choices, and the external-release checklist.
 
 The latest explicitly unsigned Apple-silicon preview is
-[Recall v0.2.3](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.3).
+[Recall v0.2.4](https://github.com/mvartanyan/recall-app/releases/tag/v0.2.4).
 
 Speaker-model smoke test with a mono WAV:
 
@@ -379,6 +425,9 @@ Model provenance and both checksums are recorded in models/README.md.
 - OpenAI credential: `openai-api-key` in the same directory, with the same
   local-only `0600` contract; never returned to JavaScript or stored in SQLite
 - Pre-recap migration backup: recall.pre-recap-v1.db
+- Pre-recap-types migration backup: recall.pre-recap-types-v1.db, created with
+  user-only permissions and verified with SQLite integrity checking before the
+  additive migration proceeds
 - Pre-processing-job migration backup: recall.pre-processing-v1.db
 - Pre-per-meeting-STT-context backup: recall.pre-stt-context-v1.db
 - Voice-recognition reset backup: a uniquely named
@@ -388,11 +437,16 @@ Model provenance and both checksums are recorded in models/README.md.
   whenever Recall opens the archive
 - Agenda originals and structured recap payloads: stored with the conversation
   in encrypted-capable SQLite fields
+- Recap-type prompt templates plus custom recap expanded-prompt and Markdown
+  snapshots: stored in encrypted-capable SQLite fields. Type IDs and saved
+  display names remain queryable metadata; deleting a custom type does not
+  delete saved meeting results, while deleting a conversation does
 - Active/failed processing recordings: the app-data `processing/` directory,
   with directory mode `0700` and WAV mode `0600`; deleted after successful
   final commit, successful retry, or explicit conversation deletion
 - Soniox uploads/transcriptions: deleted after final transcript retrieval on a best-effort basis
 - New-speaker preview: retained locally only while the profile remains an unnamed VOICE<n>; deleted on naming or assignment to a named profile
+- Meeting-local preview: retained only for an unresolved conversation-scoped voice group; deleted when the group is assigned, split, reset, or its conversation is deleted
 
 Transcript fields and embedding vectors have application-level AES-GCM support in the schema, but safe migration to encrypted-at-rest storage is not implemented. Existing databases therefore remain unencrypted unless they were already configured with the older password mode. Recall refuses the old destructive “enable encryption” path instead of recreating the database.
 
@@ -404,7 +458,9 @@ one request; translations use fixed-size batches and may therefore use several
 additional requests for a long transcript. Nothing is sent automatically. The
 request-level `store: false` setting is not itself a Zero Data Retention
 guarantee; the OpenAI account's applicable data controls and policy still
-govern provider handling.
+govern provider handling. Custom runs use the same stateless safeguards and a
+strict `target_language` plus `content_markdown` response contract. See the
+[official Responses API create reference](https://developers.openai.com/api/reference/cli/resources/responses/methods/create).
 
 To repeat first-run testing without deleting data, quit Recall and move the app-data directory aside:
 
@@ -427,9 +483,12 @@ Soniox assigns speaker labels within a recording. Recall handles persistent iden
 2. The bundled Silero VAD runs once over the mono recording. There is no RMS
    or energy-only fallback: if VAD is unavailable or finds no safe speech,
    Recall does not create a global profile.
-3. Recall examines the longest interventions first, rejects intervals that
-   overlap another provider speaker, trims turn boundaries, and extracts
-   centered VAD-confirmed windows of up to four seconds.
+3. Recall examines longer interventions first, rejects intervals that overlap
+   another provider speaker, trims turn boundaries, and extracts centered
+   VAD-confirmed windows of up to four seconds. Each bounded candidate batch is
+   distributed across different interventions before another window is taken
+   from one intervention. If the first batch is inconsistent, Recall can try up
+   to two later batches instead of letting one noisy turn decide the result.
 4. sherpa-onnx computes a 192-dimensional official WeSpeaker ECAPA-TDNN-512
    embedding for each clean window with the correct feature frontend.
 5. Candidate windows must form a consistent acoustic majority. Recall retains
@@ -438,7 +497,9 @@ Soniox assigns speaker labels within a recording. Recall handles persistent iden
    overlap do not create a reusable voiceprint.
 6. The recording-local provider label and its intervention provenance are
    still stored. If no safe global observation exists, it stays meeting-local:
-   no `VOICE<n>`, no preview, and no automatic-recognition target.
+   no `VOICE<n>` and no automatic-recognition target. A VAD-confirmed candidate
+   may be retained as a meeting-local preview for manual review only; it is not
+   a trusted voiceprint and is removed when that group is resolved.
 7. Recall compares a valid centroid only with reference voiceprints produced
    by the current pipeline and belonging to people the user has named. At least
    three seconds of VAD-confirmed speech is required.
